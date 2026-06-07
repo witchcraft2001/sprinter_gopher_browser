@@ -10,12 +10,17 @@
 
 ASM        := sjasmplus
 SRC        := src/main.asm
+# All sources main.asm pulls in, so editing any module/include forces a rebuild.
+DEPS       := $(wildcard src/*.asm src/include/*.inc)
 BUILD      := build
 EXE        := $(BUILD)/GOPHER.EXE
 LST        := $(BUILD)/GOPHER.lst
 
 BACKEND    ?= ESP
-INCDIRS    := -I src/include -I src/lib
+
+# Sprinter-WiFi network kit (ESP backend libs: isa/esplib/esp_tcp/netcfg/wcommon).
+NETKIT     ?= /Users/dmitry/dev/zx/sprinter/sprinter_wifi/network
+INCDIRS    := -I src/include -I src/lib -I $(NETKIT)/src/include -I $(NETKIT)/src/lib
 ASMFLAGS   := --nologo --fullpath -DBACKEND_$(BACKEND) $(INCDIRS)
 
 # Bootable DSS floppy template used to produce a runnable test image.
@@ -26,7 +31,7 @@ IMG          := distr/gopher.img
 
 all: $(EXE)
 
-$(EXE): $(SRC) | $(BUILD)
+$(EXE): $(SRC) $(DEPS) | $(BUILD)
 	$(ASM) $(ASMFLAGS) --lst=$(LST) --raw=$(EXE) $(SRC)
 	@echo "Built $(EXE) (backend: $(BACKEND))"
 

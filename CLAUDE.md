@@ -69,8 +69,100 @@ Toolchain: **sjasmplus**, output is a **DSS `.EXE`**. (Decision: assembly, not C
   WIN2-safe by design. (Supersedes the earlier "#55 wedges, use #8A" note.)
 - `file.asm` (DSS file API / `file://`) deferred to Phase 3 when it's first needed.
 
-Next: **Phase 2** — ESP network backend + `NET.CFG` behind the `NET.*` HAL; fetch
-a real gopher menu into the buffer (then Phase 3 wires it to this renderer).
+**Phase 2 (ESP network backend + real fetch) — done, awaiting on-target check.**
+- `src/net.asm` (MODULE NET, `IFDEF BACKEND_ESP`): `INIT` (ISA reset, UART find,
+  `REQUIRE_NET_UP`, NETCFG load/baud, UART init, AT/ATE0, `SETUP_UART_FLOW`,
+  CIPMUX=0), `CONNECT`→`TCP.OPEN`, `SEND`→`TCP.SEND_BUFFER`, `RECV`→`TCP.RECEIVE`,
+  `CLOSE`→`TCP.CLOSE`. Wraps the network-kit libs.
+- **Memory model changed for networking:** app now loads at `0x4100` (512-byte
+  header), stack `0x8000` (grows down through the WIN1 code page); a 16 KB
+  receive buffer `GOPHER_BUF` lives in a `GetMem`'d WIN2 page mapped with
+  `SetWin2` at startup (`INIT_RUNTIME_PAGE`). Lib BSS high-water ~`0x66xx`.
+- Enter now fetches `gopher.floodgap.com:70` root into `GOPHER_BUF` and dumps it
+  (filtered) to the console, then returns to the menu. (Phase 3 will parse the
+  buffer into menu entries and render it instead of dumping.)
+- **Build:** Makefile adds `-I $(NETKIT)/src/{include,lib}` (NETKIT =
+  `sprinter_wifi/network`). Include order matters: `netcfg_lib` **before**
+  `wcommon` (defines `_NETCFG`, which gates `SETUP_UART_FLOW`); `esplib` **last**
+  (its `RS_BUFF` anchors the lib BSS chain into post-image RAM). `wcommon`
+  requires the app to define `DEFAULT_TIMEOUT` globally.
+- **Run/test:** `tools/run_esp.sh` (ESP ISA card + bitb socket bridge + network
+  kit floppy as B:). Requires `NETUP` to have joined Wi-Fi first; needs the
+  user's ESP bridge for real internet. `tools/run.sh` (no ESP) still runs the
+  menu UI but Enter will report a network error.
+
+**Phase 3 (gopher engine — end-to-end browsing) — first on-target test done;
+re-test pending.** First MAME run rendered garbage: the **first doc page was never
+allocated** (empty-doc `APPEND` saw "0x4000 free" and skipped `.new_page`, so
+`MAP_PAGE` OUT'd `doc_phys[0]=0` → physical page 0 into WIN3). Fixed: `APPEND`
+now forces `.new_page` when `doc_npages==0`. Also added incremental nav + ESP
+shutdown-on-exit (below). Awaiting a re-test.
+- `src/doc.asm` (MODULE DOC): paged document buffer per §4a. Raw fetched bytes
+  live in a chain of up to 16 GetMem 16 KB pages (cap 256 KB → `doc_trunc`, no
+  crash). ISA window and one doc page **time-share WIN3**. Mapping a doc page is
+  the fast path the user requested and it **works on MAME/real HW**: DSS GetMem
+  (#3D) gives a block HANDLE; at alloc time BIOS **`EMM_FN5` (#C5)** (`A=handle,
+  HL=dest → writes the block's physical page bytes, #FF-terminated`) resolves it
+  into `doc_phys[]`; `MAP_PAGE` then maps via a single **`OUT (PAGE3=#E2), phys`**.
+  `RD_BYTE` re-OUTs every byte (the OUT is cheap), so a DSS/BIOS print that
+  clobbers WIN3 between bytes is harmless. (There is NO transparent CPU cache
+  issue — the Sprinter "cache" is opt-in SRAM in WIN0 only; my earlier
+  cache/SetWin3 reasoning was wrong. `EMM_FN4 #C4` is dead RTL `pagemem.asm`
+  code; we use `#C5`.) Position tracked as (page,offset) pairs (no 24-bit math).
+  `RESET`, `APPEND` (STAGE→pages, maps WIN3 + `LDIR`), page-aware reader
+  (`SEEK_LINE`/`NEXT_LINE`/`RD_BYTE`/`AT_END`), `COUNT_LINES`.
+  **`AT_END` preserves HL/DE** — `NEXT_LINE` keeps its `LINE_BUF` write pointer in
+  HL across the `AT_END` call; the original `AT_END` clobbered HL, so every copied
+  byte went to a junk address and `LINE_BUF` stayed empty (this — NOT the memory
+  syscalls — was the long-standing "garbage/blank rows" bug).
+- `LINE_BUF` lives in **WIN1** (the code image, `MAIN.LINE_BUF`), not the WIN2
+  scratch page: DSS PChars prints the row's display field straight from it.
+  (STAGE/REQ_BUF/HIST_DATA stay in the WIN2 GetMem page — they're plain memory,
+  never a PChars source.) Each visible line is copied into `LINE_BUF` **before**
+  any TERM/DSS call.
+- `src/main.asm` rewritten: gopher rows parsed (`PARSE_ROW`: type/display/
+  selector/host/port, TABs→NUL) and rendered straight from doc pages through the
+  30-row viewport. 16-bit line indices (long text OK). **Incremental nav restored**
+  (Phase-1 style, paged): single-step Up/Down recolour only the two changed rows
+  in place via BIOS `Set_Place`+`Print_Atr` (`RECOLOR_ROW`, no text re-read — the
+  selected row's type is cached in `sel_type` for correct de-highlight), or, at a
+  viewport edge, hardware-scroll the region (DSS `Scroll #55`, `SCROLL_VIEW`) and
+  draw only the one newly exposed row (`DRAW_NEW_SEL_ROW`). Page jumps (Left/Right)
+  full-redraw via `RENDER_VIEWPORT` (which re-caches `sel_type`).
+  Enter follows `0`/`1` links (NET connect/send/recv into a fresh doc); other
+  types report "not supported yet". Backspace = back. Built-in **home** menu
+  (`WELCOME_DOC`, gopher-format with real links) loaded at startup with no
+  network, so the UI is usable before the first fetch.
+- **On exit** (`QUIT`): if the ESP was ever initialised (`net_inited`), call
+  `NET.SHUTDOWN` (AT+CIPCLOSE + ATE0) to hand the card back in AT command mode so
+  the next program isn't blocked. We use CIPMODE=0 throughout (kit's +IPD path),
+  so no transparent-mode `+++` escape is needed (unlike SpecTalkZX's `esp_restore`).
+- **History:** stack of nav records `{kind,host,port,selector,type,sel,top}` in
+  the WIN2 page (`HIST_DATA`), cap 16, oldest dropped on overflow. **Back
+  re-fetches** the parent (network) or reloads home — a deliberate v1
+  simplification of §4a's "no-refetch keep-the-page-chain" model (only ONE doc
+  chain is alive at a time → far less memory/complexity; upgrade later).
+- **Memory model — model A (proven wget layout), NOT the flat §4a image.** All
+  code + small state + stack (top `0x8000`, down) live in WIN1; the big scratch
+  buffers (`STAGE`/`LINE_BUF`/`REQ_BUF`/`HIST_DATA`, addresses in `console.inc`)
+  live in a single GetMem page mapped at WIN2 (`0x8000`) via `INIT_RUNTIME_PAGE`.
+  `SetWin2` is safe **because no code lives in WIN2** (the §4a fear was code in
+  WIN2). Doc pages use WIN3 only (`OUT (#E2)` of a `EMM_FN5`-resolved page).
+- **Network errors** classified to friendly status-bar messages (init/connect/
+  send/empty); no program exit, no blocking "press a key". `NET.INIT` now calls
+  a CF-returning `CHECK_NET_UP` instead of `WCOMMON.REQUIRE_NET_UP` (which exits).
+  **Bring-up sped up:** `NET.INIT` runs once (`net_inited` flag) and is reused
+  for every subsequent `TCP.OPEN`, so only the first fetch pays the ~30 s cost.
+
+Next: **Phase 3 polish / Phase 4** —
+1. Type-7 **search** input (line editor → selector+TAB+query) and **binary
+   downloads** (`9`/`g`/`I`) to disk via the DSS file API (`file.asm`).
+2. Optional: upgrade history to the §4a **no-refetch** model (keep page chains
+   per level, cap 8, `FreeMem` oldest) once memory behaviour is confirmed.
+3. Optional: cursor skips non-selectable (`i`/`.`) rows on Up/Down.
+4. `file://`/`home://` via a fetcher/transport router (agon-snail idea); on
+   error offer **re-init ESP** (NETRESET/NETUP via `Dss.Exec`).
+5. Phase 4: NE2000 backend behind the same `NET.*` HAL.
 
 Reference repos are cloned at `/tmp/gopher-analysis/{moon-rabbit-zx,internet-nextplorer,agon-snail}`
 (re-clone if gone). Working dir: `/Users/dmitry/dev/zx/sprinter/sources/moonrabbit`.
@@ -146,6 +238,53 @@ The network card (ESP UART **or** NE2000) is on the **ISA bus mapped into WIN3**
 - Keep code, data, and stack in WIN1/WIN2 so swapping WIN3 is safe.
 - ESP UART is the TL16C550 at memory-mapped `0xC3E8` (when ISA open). RTL8019A
   registers are at its ISA base (e.g. `0xC300` for I/O base `0x300`).
+
+## 4a. Memory budget & layout (IMPORTANT — agreed Phase 2)
+
+Z80 sees four 16 KB windows; the ISA network card is fixed at **WIN3**. ISA and a
+document page never need to be mapped at the same instant, so they **time-share
+WIN3**. That frees WIN1+WIN2 entirely for program code/data/stack.
+
+| Window | Role | Rule |
+|--------|------|------|
+| WIN0 `0000–3FFF` | BIOS ROM (RST #08/#10) | not ours |
+| **WIN1+WIN2** `4000–BFFF` | **all code (low) + data + stack (`0xBFFF`, down)** | one flat load image; **never `SetWin2`** |
+| **WIN3** `C000–FFFF` | **ISA window OR one document page** (never both) | transient; map ISA for fetch bursts, map a doc page for copy-in/render |
+
+**Flat WIN1+WIN2 load.** Code at `0x4100` (512-byte header at `0x3F00`) growing
+up; data + stack high in WIN2, stack `0xBFFF`. The image **must cross `0x8000`**
+or DSS won't map the WIN2 page (pad/place data there to ensure it does). DSS maps
+both pages from the image itself. **Never `Dss.GetMem`+`SetWin2`** — it would swap
+a blank page over the code already loaded in WIN2 (SpecTalkZX PLATFORM.md). DSS
+does not disturb WIN1/WIN2 during API calls; stack in WIN2 is correct for DSS/BIOS.
+
+**Documents (no 16 KB limit).** A gopher document is a **chain of GetMem 1-page
+(16 KB) blocks** — a list of block-ids + total length + line count. Pages are
+allocated on demand as the document grows, capped at a **fixed 16 pages = 256 KB
+per doc** (beyond that the document is truncated with a marker, not a crash).
+  Map a doc page into WIN3 with **`OUT (PAGE3=#E2), phys`**, where `phys` was
+  resolved once at alloc time via BIOS `EMM_FN5 #C5` from the GetMem handle (this
+  is the loader/CD-driver idiom, works on MAME/real HW). No transparent-cache
+  concern — the Sprinter "cache" is opt-in SRAM in WIN0 only.
+- **Fetch:** `TCP.RECEIVE` into a small `STAGE` buffer (~2 KB, in WIN1/WIN2) while
+  ISA is mapped in WIN3; then map the current doc page (`OUT PAGE3`) and copy
+  `STAGE` into it, allocating a new page when it fills. (ISA and doc page take
+  turns in WIN3.)
+- **Read/render:** to read byte at offset O → page `O>>14`, `OUT (PAGE3),phys[page]`,
+  read `0xC000 + (O & 0x3FFF)`; lines may cross pages. Copy each visible line into
+  a line buffer (WIN1/WIN2), then TERM-print from it. **No DSS/BIOS call while a
+  doc page is mapped in WIN3** (copy the line out first). Line finding is by
+  forward scan (NEXTplorer style), page-aware.
+
+**History.** Stack of document descriptors `{page block-id list, total_len,
+line_count, host, port, selector, cursor, top}`. **Cap 8 levels**; on overflow or
+GetMem failure, free the oldest level's pages (`FreeMem`). Back/forward restore a
+descriptor and its view — *no re-fetch* (the link is slow). Cheap on 4 MB RAM.
+
+**Discipline.** Never `SetWin2`. WIN3 holds ISA *or* one doc page, never persistent
+data; never call DSS/BIOS while ISA or a doc page is mapped in WIN3. Only hold a
+doc pointer within one mapped page; re-map for the next page. Track all block-ids
+for `FreeMem`. Keep the flat image crossing `0x8000`.
 
 ## 5. Network HAL & the two backends
 
