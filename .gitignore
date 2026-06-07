@@ -1,0 +1,5 @@
+build/
+distr/*.img
+distr/*.zip
+.DS_Store
+*.lst
