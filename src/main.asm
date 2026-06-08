@@ -55,7 +55,9 @@ HR_SEL			EQU 73					; 200
 HR_TYPE			EQU 273					; 1
 HR_SELIDX		EQU 274					; 2
 HR_TOPIDX		EQU 276					; 2
-HR_SIZE			EQU 278
+HR_TITLE		EQU 278					; 64 (page title shown in the header)
+HR_SIZE			EQU 342
+TITLE_MAX		EQU 64
 
 	ORG LOAD_ADDR - 0x0200
 EXE_HEADER
@@ -80,8 +82,8 @@ START
 	JP		C, MEM_ERROR
 	CALL	DOC.RESET
 	CALL	TERM.CLS
+	CALL	LOAD_HOME				; sets DOC_TITLE before the header is drawn
 	CALL	DRAW_HEADER
-	CALL	LOAD_HOME
 	LD		HL, 0
 	LD		(sel_index), HL
 	LD		(top_index), HL
@@ -145,9 +147,11 @@ INIT_RUNTIME_PAGE
 	RET
 
 ; ------------------------------------------------------
-; Navigation. Single-step Up/Down update only the affected rows (recolour the
-; two changed rows in place, or hardware-scroll the viewport and draw the one
-; newly exposed row) instead of repainting all 30 rows. Page jumps full-redraw.
+; Navigation. An in-page Up/Down recolours only the two changed rows in place
+; (cheap, no repaint). An Up/Down at a viewport edge, and PgUp/PgDn, full-redraw
+; via RENDER_VIEWPORT (cheap now that SEEK_LINE is O(1)). We do NOT hardware-
+; scroll: DSS Scroll #55 wedges on the full-width region (it hung the browser on
+; long pages). Page jumps are blocked when the selection can't move (at top/end).
 ; ------------------------------------------------------
 ON_UP
 	LD		HL, (sel_index)
@@ -160,21 +164,22 @@ ON_UP
 	OR		A
 	SBC		HL, DE					; new_sel - top; CF=1 if new_sel < top
 	JR		C, .scroll
-	; still on screen: recolour old + new row
+	; still on screen: recolour old + new row only (cheap, no scroll)
 	CALL	DEHILITE_OLD
 	LD		HL, (new_sel)
 	LD		(sel_index), HL
 	CALL	HILITE_NEW
 	JP		MAINLOOP
 .scroll
-	; cursor was on the top row: scroll the viewport down, expose one row above
+	; cursor was on the top row: hardware-scroll the viewport down one line and
+	; draw the newly exposed top row.
 	CALL	DEHILITE_OLD
 	LD		HL, (top_index)
 	DEC		HL
 	LD		(top_index), HL
 	LD		HL, (new_sel)
 	LD		(sel_index), HL
-	LD		B, 2					; DSS Scroll: 2 = down
+	LD		B, 2					; BIOS Lp_Scroll_Up: 2 = down
 	CALL	SCROLL_VIEW
 	LD		A, 0					; new selected row appears at slot 0
 	CALL	DRAW_NEW_SEL_ROW
@@ -199,14 +204,14 @@ ON_DOWN
 	OR		A
 	SBC		HL, DE					; new_sel - bottom; CF=1 if visible
 	JR		C, .inpage
-	; cursor ran off the bottom: scroll the viewport up, expose one row below
+	; cursor ran off the bottom: hardware-scroll up one line, draw new bottom row
 	CALL	DEHILITE_OLD
 	LD		HL, (top_index)
 	INC		HL
 	LD		(top_index), HL
 	LD		HL, (new_sel)
 	LD		(sel_index), HL
-	LD		B, 1					; DSS Scroll: 1 = up
+	LD		B, 1					; BIOS Lp_Scroll_Up: 1 = up
 	CALL	SCROLL_VIEW
 	LD		A, VIEW_ROWS - 1		; new selected row appears at the bottom slot
 	CALL	DRAW_NEW_SEL_ROW
@@ -238,18 +243,6 @@ HILITE_NEW
 	LD		A, ATTR_HILITE
 	JP		RECOLOR_ROW
 
-; Draw the selected row in full at slot A (used for a freshly scrolled-in row),
-; highlighted, and cache its type.
-DRAW_NEW_SEL_ROW
-	LD		(r_slot), A
-	LD		A, 1
-	LD		(r_sel_flag), A
-	LD		BC, (sel_index)
-	CALL	DRAW_ROW_LINE
-	LD		A, (row_type)
-	LD		(sel_type), A
-	RET
-
 ; Set the attribute of all SCR_W cells of the row showing line HL (no text
 ; rewrite). A = attribute. Uses BIOS Set_Place + Print_Atr (WIN2-resident stack).
 RECOLOR_ROW
@@ -272,19 +265,54 @@ RECOLOR_ROW
 	EI
 	RET
 
-; Scroll the viewport region by one row. B = 1 (up) / 2 (down).
+; Hardware-scroll the 30-row viewport by one line. B = 1 (up) / 2 (down). Uses
+; BIOS Lp_Scroll_Up (#8A): B=dir, D=begin-line, E=line-count (per BIOS docs and
+; texteditor/SpecTalkZX). Interrupts OFF around it (the routine remaps VRAM and
+; must not be interrupted) - this is what hung the DSS Scroll #55 path.
 SCROLL_VIEW
-	LD		D, VIEW_TOP
-	LD		E, 0
-	LD		H, VIEW_ROWS
-	LD		L, SCR_W
-	XOR		A
-	LD		C, DSS_SCROLL
-	RST		DSS
+	LD		D, VIEW_TOP				; begin line (0-based first viewport row)
+	LD		E, VIEW_ROWS			; number of lines
+	LD		C, BIOS_SCROLL			; #8A
+	PUSH	IX
+	DI
+	RST		BIOS
+	EI
+	POP		IX
 	RET
 
-; A = natural (non-selected) attribute for gopher type A.
+; Draw the selected row in full at slot A (a freshly scrolled-in row), highlighted,
+; and cache its gopher type for the next de-highlight.
+DRAW_NEW_SEL_ROW
+	LD		(r_slot), A
+	LD		A, 1
+	LD		(r_sel_flag), A
+	LD		BC, (sel_index)
+	CALL	DRAW_ROW_LINE
+	LD		A, (row_type)
+	LD		(sel_type), A
+	RET
+
+; Draw the full row for line BC at slot r_slot with flag r_sel_flag.
+DRAW_ROW_LINE
+	CALL	DOC.SEEK_LINE
+	CALL	DOC.AT_END
+	JP		C, BLANK_ROW
+	CALL	DOC.NEXT_LINE
+	CALL	PARSE_ROW
+	JP		DRAW_ROW
+
+; A = natural (non-selected) attribute for gopher type A (in a menu). In a text
+; document every line is normal.
 ATTR_FOR_TYPE
+	PUSH	AF
+	LD		A, (DOC_TYPE_CUR)
+	CP		'1'
+	JR		Z, .menu
+	POP		AF
+	LD		A, ATTR_NORM
+	RET
+.menu
+	POP		AF
 	CP		'i'
 	JR		Z, .norm
 	CP		'.'
@@ -303,15 +331,6 @@ GET_ROW_TYPE
 	RET		C
 	JP		DOC.RD_BYTE
 
-; Draw the full row for line BC at slot r_slot with flag r_sel_flag.
-DRAW_ROW_LINE
-	CALL	DOC.SEEK_LINE
-	CALL	DOC.AT_END
-	JP		C, BLANK_ROW
-	CALL	DOC.NEXT_LINE
-	CALL	PARSE_ROW
-	JP		DRAW_ROW
-
 ON_PGDN
 	LD		DE, (DOC.doc_lines)
 	LD		A, D
@@ -325,9 +344,16 @@ ON_PGDN
 	OR		A
 	SBC		HL, DE					; target - (lines-1); CF=1 if target < lines-1
 	POP		HL
-	JR		C, .store
+	JR		C, .have
 	EX		DE, HL					; clamp to lines-1
-.store
+.have
+	; HL = new selection. Skip the redraw if it did not move (already at the end).
+	LD		DE, (sel_index)
+	PUSH	HL
+	OR		A
+	SBC		HL, DE
+	POP		HL
+	JP		Z, MAINLOOP
 	LD		(sel_index), HL
 	JP		REDRAW
 
@@ -336,9 +362,16 @@ ON_PGUP
 	LD		DE, VIEW_ROWS
 	OR		A
 	SBC		HL, DE
-	JR		NC, .store
+	JR		NC, .have
 	LD		HL, 0
-.store
+.have
+	; HL = new selection. Skip the redraw if it did not move (already at the top).
+	LD		DE, (sel_index)
+	PUSH	HL
+	OR		A
+	SBC		HL, DE
+	POP		HL
+	JP		Z, MAINLOOP
 	LD		(sel_index), HL
 	JP		REDRAW
 
@@ -376,6 +409,9 @@ CLAMP_SEL
 ; Enter: open the link on the selected row.
 ; ------------------------------------------------------
 ON_ENTER
+	LD		A, (DOC_TYPE_CUR)
+	CP		'1'
+	JP		NZ, MAINLOOP			; text document has no links
 	LD		BC, (sel_index)
 	CALL	DOC.SEEK_LINE
 	LD		HL, (sel_index)
@@ -402,7 +438,11 @@ ON_ENTER
 	LD		A, (HL)
 	OR		A
 	JP		Z, .unsupported			; no host on this row
-	CALL	PUSH_HIST				; remember the page we are leaving
+	CALL	PUSH_HIST				; remember the page we are leaving (incl. its title)
+	LD		HL, (p_disp)			; the clicked link's text becomes the new title
+	LD		DE, DOC_TITLE
+	LD		B, TITLE_MAX
+	CALL	STRCPYN
 	LD		HL, (p_host)
 	LD		DE, HOST_CUR
 	LD		B, 64
@@ -472,6 +512,10 @@ LOAD_HOME
 	LD		(cur_kind), A
 	LD		A, '1'
 	LD		(DOC_TYPE_CUR), A
+	LD		HL, MSG_TITLE			; default header title for the home page
+	LD		DE, DOC_TITLE
+	LD		B, TITLE_MAX
+	CALL	STRCPYN
 	LD		HL, 0
 	LD		(HOST_CUR), HL			; empty host marks the home page
 	LD		HL, WELCOME_DOC
@@ -662,15 +706,26 @@ BUILD_REQ
 ; LINE_BUF). TABs are replaced with NUL; absent fields point at an empty string.
 ; ------------------------------------------------------
 PARSE_ROW
+	LD		DE, EMPTYSTR
+	LD		(p_sel), DE
+	LD		(p_host), DE
+	LD		(p_port), DE
+	LD		A, (DOC_TYPE_CUR)
+	CP		'1'
+	JR		Z, .menu
+	; text document (type 0): the line is raw text, NO type byte and no TAB
+	; fields - the whole line is the display.
+	LD		HL, LINE_BUF
+	LD		(p_disp), HL
+	XOR		A
+	LD		(row_type), A			; 0 = plain text line (non-selectable)
+	RET
+.menu
 	LD		HL, LINE_BUF
 	LD		A, (HL)
 	LD		(row_type), A
 	INC		HL
 	LD		(p_disp), HL
-	LD		DE, EMPTYSTR
-	LD		(p_sel), DE
-	LD		(p_host), DE
-	LD		(p_port), DE
 	CALL	SCAN_FIELD				; end of display
 	RET		NC						; info line: no further fields
 	LD		(p_sel), HL
@@ -765,6 +820,15 @@ PUSH_HIST
 	EX		DE, HL
 	LD		HL, (top_index)
 	CALL	STORE_HL_DE
+	; title
+	LD		A, (hist_sp)
+	CALL	HREC_ADDR
+	LD		DE, HR_TITLE
+	ADD		HL, DE
+	EX		DE, HL
+	LD		HL, DOC_TITLE
+	LD		B, TITLE_MAX
+	CALL	STRCPYN
 	LD		A, (hist_sp)
 	INC		A
 	LD		(hist_sp), A
@@ -814,10 +878,17 @@ POP_HIST
 	CALL	LOAD_HL_FROM_HL
 	LD		(sel_index), HL
 	POP		HL
+	PUSH	HL
 	LD		DE, HR_TOPIDX
 	ADD		HL, DE
 	CALL	LOAD_HL_FROM_HL
 	LD		(top_index), HL
+	POP		HL
+	LD		DE, HR_TITLE
+	ADD		HL, DE
+	LD		DE, DOC_TITLE
+	LD		B, TITLE_MAX
+	CALL	STRCPYN
 	RET
 
 ; HL = HIST_DATA + A*HR_SIZE
@@ -923,7 +994,7 @@ DRAW_HEADER
 	LD		D, HEADER_ROW
 	LD		E, 1
 	CALL	TERM.LOCATE
-	LD		HL, MSG_TITLE
+	LD		HL, DOC_TITLE			; current page title (clicked link / home)
 	JP		TERM.PUTS
 
 ; ------------------------------------------------------
@@ -1017,22 +1088,27 @@ BLANK_ROW
 	LD		A, ' '
 	JP		TERM.FILL
 
-; Draw the parsed row at slot r_slot, highlighted if r_sel_flag.
+; Draw the parsed row at slot r_slot, highlighted if r_sel_flag. Menu rows get an
+; icon + text at col 2; text-document lines are printed whole from col 1.
 DRAW_ROW
 	LD		A, (r_sel_flag)
 	OR		A
-	JR		Z, .notsel
-	LD		A, ATTR_HILITE
-	JR		.haveattr
-.notsel
+	JR		NZ, .hi
+	; not selected: text doc and info/'.' menu rows are plain; links are bright
+	LD		A, (DOC_TYPE_CUR)
+	CP		'1'
+	JR		NZ, .norm				; text document -> normal attr
 	LD		A, (row_type)
 	CP		'i'
-	JR		Z, .info
+	JR		Z, .norm
 	CP		'.'
-	JR		Z, .info
+	JR		Z, .norm
 	LD		A, ATTR_LINK
 	JR		.haveattr
-.info
+.hi
+	LD		A, ATTR_HILITE
+	JR		.haveattr
+.norm
 	LD		A, ATTR_NORM
 .haveattr
 	LD		(r_attr), A
@@ -1047,7 +1123,20 @@ DRAW_ROW
 	LD		B, A
 	LD		A, ' '
 	CALL	TERM.FILL
-	; icon + display text at column 2
+	; text document: print the whole line from col 1 (no type byte / no icon)
+	LD		A, (DOC_TYPE_CUR)
+	CP		'1'
+	JR		Z, .menu
+	LD		A, (r_slot)
+	ADD		VIEW_TOP
+	LD		D, A
+	LD		E, 1
+	CALL	TERM.LOCATE
+	CALL	CLIP_DISP
+	LD		HL, (p_disp)
+	JP		TERM.PUTS
+.menu
+	; menu row: icon + space + display text at column 2
 	LD		A, (r_slot)
 	ADD		VIEW_TOP
 	LD		D, A
@@ -1142,6 +1231,9 @@ EMPTYSTR		DB 0
 HOST_CUR		DS 64, 0
 PORT_CUR		DS 8, 0
 SEL_CUR			DS 200, 0
+; Current page title shown in the header (the display text of the link we
+; followed; the home page sets a default). Saved/restored across history.
+DOC_TITLE		DS TITLE_MAX, 0
 
 ; One decoded gopher row (type + TAB-split fields). MUST be in WIN1 (here in the
 ; code image), not the WIN2 scratch page: DSS PChars prints the display field

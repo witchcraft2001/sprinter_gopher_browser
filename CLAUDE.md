@@ -130,14 +130,22 @@ shutdown-on-exit (below). Awaiting a re-test.
   any TERM/DSS call.
 - `src/main.asm` rewritten: gopher rows parsed (`PARSE_ROW`: type/display/
   selector/host/port, TABs→NUL) and rendered straight from doc pages through the
-  30-row viewport. 16-bit line indices (long text OK). **Incremental nav restored**
-  (Phase-1 style, paged): single-step Up/Down recolour only the two changed rows
-  in place via BIOS `Set_Place`+`Print_Atr` (`RECOLOR_ROW`, no text re-read — the
-  selected row's type is cached in `sel_type` for correct de-highlight), or, at a
-  viewport edge, hardware-scroll the region (DSS `Scroll #55`, `SCROLL_VIEW`) and
-  draw only the one newly exposed row (`DRAW_NEW_SEL_ROW`). Page jumps
-  (PgUp/PgDn, also Left/Right) full-redraw via `RENDER_VIEWPORT` (re-caches
-  `sel_type`). Key codes (positional, in D): PgUp `#59`, PgDn `#53`.
+  30-row viewport. **Menu vs text documents:** `DOC_TYPE_CUR` holds the gopher
+  type of the current doc. Type `1` = menu (parse type byte + TAB fields, icon +
+  display at col 2, links selectable). Type `0` = **plain text** — the line is raw
+  text with NO type byte/fields, so `PARSE_ROW`/`DRAW_ROW` print the WHOLE line
+  from col 1 (was stripping the first char as a "type"), all rows normal attr,
+  Enter does nothing. **Navigation:** an in-page Up/Down recolours only the two
+  changed rows via BIOS `Set_Place`+`Print_Atr` (`RECOLOR_ROW`; `sel_type` cached
+  for de-highlight). An Up/Down **at a viewport edge** hardware-scrolls one line:
+  **BIOS `Lp_Scroll_Up #8A` with DI/EI** (`B`=dir, `D`=begin-line, `E`=line-count,
+  per BIOS docs + texteditor/SpecTalkZX), then draws the one new row. **Use #8A,
+  NOT DSS `Scroll #55`** — #55 hung the browser on long pages; the proven apps all
+  use #8A with interrupts OFF (that was the missing piece). PgUp/PgDn full-redraw
+  via `RENDER_VIEWPORT` (cheap, O(1) SEEK) and are **blocked when the selection
+  can't move** (at top/end). Keys (positional, in D): PgUp `#59`, PgDn `#53`;
+  Left/Right also page. **Header** shows the current page title (`DOC_TITLE` = the
+  clicked link's display text; saved/restored in history `HR_TITLE`).
   Enter follows `0`/`1` links (NET connect/send/recv into a fresh doc); other
   types report "not supported yet". Backspace = back. Built-in **home** menu
   (`WELCOME_DOC`, gopher-format with real links) loaded at startup with no
