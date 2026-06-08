@@ -578,11 +578,13 @@ LOAD_HOME
 ; ------------------------------------------------------
 DO_FETCH
 	CALL	DOC.RESET
+	XOR		A
+	LD		(WCOMMON.CANCELLED), A	; clear any stale cancel flag before we start
 	CALL	SHOW_FETCHING
 	LD		A, (net_inited)
 	OR		A
 	JR		NZ, .haveinit
-	CALL	NET.INIT
+	CALL	NET.INIT				; AT/connect waits poll Esc/Ctrl+Z internally
 	JR		C, .e_init
 	LD		A, 1
 	LD		(net_inited), A
@@ -595,7 +597,7 @@ DO_FETCH
 	CALL	NET.SEND
 	JR		C, .e_send
 	CALL	RECV_LOOP				; appends every block into the document
-	JR		C, .e_cancel			; Esc pressed during the download
+	JR		C, .e_cancel			; cancelled mid-download
 	CALL	NET.CLOSE
 	CALL	DOC.COUNT_LINES
 	LD		HL, (DOC.doc_lines)
@@ -607,28 +609,30 @@ DO_FETCH
 .e_cancel
 	CALL	NET.CLOSE
 	LD		HL, ERR_CANCEL
-	LD		(last_err), HL
-	SCF
-	RET
+	JP		FETCH_ERR
 .e_init
 	LD		HL, ERR_INIT
-	LD		(last_err), HL
-	SCF
-	RET
+	JP		FETCH_ERR
 .e_conn
 	CALL	NET.CLOSE
 	LD		HL, ERR_CONN
-	LD		(last_err), HL
-	SCF
-	RET
+	JP		FETCH_ERR
 .e_send
 	CALL	NET.CLOSE
 	LD		HL, ERR_SEND
-	LD		(last_err), HL
-	SCF
-	RET
+	JP		FETCH_ERR
 .e_empty
 	LD		HL, ERR_EMPTY
+	JP		FETCH_ERR
+
+; HL = default error message; if a user cancel was flagged by the kit
+; (WCOMMON.CANCELLED, set on Esc/Ctrl+Z), report "Cancelled" instead. CF=1.
+FETCH_ERR
+	LD		A, (WCOMMON.CANCELLED)
+	OR		A
+	JR		Z, .set
+	LD		HL, ERR_CANCEL
+.set
 	LD		(last_err), HL
 	SCF
 	RET
@@ -650,16 +654,11 @@ RECV_LOOP
 	LD		HL, STAGE
 	LD		BC, STAGE_SIZE
 	LD		DE, RECV_TIMEOUT
-	CALL	NET.RECV
-	PUSH	AF						; save the receive result (CF) across the poll
+	CALL	NET.RECV				; its byte waits poll Esc/Ctrl+Z; CF on end/cancel
+	PUSH	AF
 	CALL	NET.RX_PAUSE			; drop RTS: ESP holds while we store + draw
-	CALL	KBD.SCAN				; poll Esc (ISA closed, RX held -> safe)
-	JR		Z, .nokey
-	CP		KEY_ESC
-	JR		Z, .cancel
-.nokey
 	POP		AF
-	JR		C, .end					; closed / timeout / error
+	JR		C, .end					; closed / timeout / error / cancelled
 	LD		A, B
 	OR		C
 	JR		Z, .end					; no more data
@@ -680,14 +679,12 @@ RECV_LOOP
 .noc
 	CALL	SHOW_PROGRESS
 	JR		.l
-.cancel
-	POP		AF						; discard saved receive result
-	CALL	NET.RX_RESUME
-	SCF								; CF=1 -> cancelled
-	RET
 .end
 	CALL	NET.RX_RESUME			; leave RX resumed for the CLOSE handshake
-	OR		A						; CF=0 -> normal end
+	LD		A, (WCOMMON.CANCELLED)	; CF=1 only if the user cancelled the download
+	OR		A
+	RET		Z						; normal end (CF=0)
+	SCF
 	RET
 
 ; Status-bar download progress: "Loading <n> bytes" (<1 KB) or "Loading <n> KB".
@@ -1216,7 +1213,10 @@ DRAW_ROW
 	LD		HL, (p_disp)
 	JP		TERM.PUTS
 
-; Truncate the display string so it fits the row (NUL at the cut point).
+; Truncate the display string so it fits the row (NUL at the cut point) and
+; sanitise it: replace any control byte (< 0x20, e.g. TAB / form-feed / bell) with
+; a space, so DSS PChars can't move the cursor / scroll and corrupt the header or
+; status row (text documents are printed whole, so they may carry such bytes).
 CLIP_DISP
 	LD		HL, (p_disp)
 	LD		B, SCR_W - 4
@@ -1224,6 +1224,10 @@ CLIP_DISP
 	LD		A, (HL)
 	OR		A
 	RET		Z
+	CP		0x20
+	JR		NC, .ok
+	LD		(HL), ' '				; control char -> space
+.ok
 	INC		HL
 	DJNZ	.l
 	LD		(HL), 0
@@ -1329,14 +1333,25 @@ ERR_CANCEL		DB "Cancelled.", 0
 WELCOME_DOC
 	DB "iMoon Rabbit - a gopher browser for the Sprinter", 13, 10
 	DB "i", 13, 10
-	DB "iUp/Down move the cursor, Enter opens a link,", 13, 10
-	DB "iLeft/Right page, Backspace goes back, Esc quits.", 13, 10
+	DB "iWe stand with Ukraine!", 13, 10
 	DB "i", 13, 10
-	DB "1Floodgap Systems gopher root", 9, 9, "gopher.floodgap.com", 9, "70", 13, 10
-	DB "1About the Floodgap gopher", 9, "/gopher", 9, "gopher.floodgap.com", 9, "70", 13, 10
-	DB "1SDF public access UNIX gopher", 9, 9, "sdf.org", 9, "70", 13, 10
+	DB "iControls:", 13, 10
+	DB "i  Up / Down     - move the cursor", 13, 10
+	DB "i  PgUp / PgDn    - page up / down (Left / Right too)", 13, 10
+	DB "i  Enter          - open the selected link", 13, 10
+	DB "i  Backspace      - go back", 13, 10
+	DB "i  Esc            - quit (cancels a running download)", 13, 10
 	DB "i", 13, 10
-	DB "iSelect a link above and press Enter to browse.", 13, 10
+	DB "iSome links to start exploring gopherspace:", 13, 10
+	DB "1Nihirash's gopher hole (lots of Speccy stuff)", 9, "/", 9, "nihirash.net", 9, "70", 13, 10
+	DB "1Virtual TR-DOS official gopher hole", 9, "/", 9, "vtrd.in", 9, "70", 13, 10
+	DB "1I-Logout.cz - phlog aggregator and more", 9, "/", 9, "i-logout.cz", 9, "70", 13, 10
+	DB "1Hacker News gate", 9, "/", 9, "hngopher.com", 9, "70", 13, 10
+	DB "1Reddit gate", 9, "/", 9, "gopherddit.com", 9, "70", 13, 10
+	DB "1Wikipedia gate", 9, "/", 9, "gopherpedia.com", 9, "70", 13, 10
+	DB "1SDF Public Access UNIX System", 9, "/", 9, "sdf.org", 9, "70", 13, 10
+	DB "1Floodgap Systems official gopher server", 9, "/", 9, "gopher.floodgap.com", 9, "70", 13, 10
+	DB "1Fade to black gopher space", 9, "/", 9, "fadeto.black", 9, "70", 13, 10
 WELCOME_END
 WELCOME_LEN		EQU WELCOME_END - WELCOME_DOC
 

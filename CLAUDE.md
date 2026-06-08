@@ -197,14 +197,22 @@ shutdown-on-exit (below). Awaiting a re-test.
    **search** (line-editor prompt → selector+TAB+query+CRLF) and **binary
    downloads** type `9`/`g`/`I` (and `s`/`;` etc.) saved to disk via the DSS file
    API (`file.asm`). Also `h` (URL/`URL:` links).
-3. **Cancel during the network phase.** Esc now cancels the *receive* (Loading)
-   phase (`RECV_LOOP`). Still need cancel during `NET.INIT`/`NET.CONNECT`
-   ("Fetching" — the ~30 s bring-up + TCP.OPEN), which are kit calls that don't
-   poll the keyboard; needs polling hooked into the kit's wait loops (or a
-   bounded-retry with Esc check between steps).
+3. **Cancel during the network phase — DONE.** Esc (also Ctrl+Z) cancels both
+   Fetching and Loading: the kit polls `WCOMMON.CHECK_CANCEL_IN_ISA` inside its
+   UART/TCP/RECEIVE byte-waits and sets `WCOMMON.CANCELLED`; we clear it at fetch
+   start, abort retries (`AT_RECOVER`/`CONNECT`) on cancel, and `FETCH_ERR` shows
+   "Cancelled". (Note: cancel during `WIFI.UART_FIND` at the very start of INIT is
+   not polled by the kit, so the first ~moment isn't cancellable — minor.)
 4. **Clock in the status bar** (DSS `SYSTIME #21`), refreshed in the main loop.
 5. **Ctrl+S** — save the current document to a file (DSS file API).
 6. **Ctrl+D** — add the current document (host/port/selector + title) to bookmarks.
+6a. **Home page from a file**: load `index.gph` next to the EXE at startup instead
+   of the built-in `WELCOME_DOC` (current built-in is seeded from nihirash's
+   moon-rabbit-zx `data/index.gph`). Falls back to built-in if the file is missing.
+6b. **Bookmarks file** next to the EXE (e.g. `bookmarks.gph`), opened by **Ctrl+B**
+   (or a link on the home page); Ctrl+D appends to it.
+6c. **Ctrl+G — open an arbitrary address**: a text-input prompt (host[:port][/sel])
+   then fetch it.
 7. **Empty doc after long Fetching** on a flaky fetch — investigate / harden
    (treat tiny/whitespace-only results as an error; better timeout classify).
 

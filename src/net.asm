@@ -53,11 +53,16 @@ TX_CMD
 	RET
 
 ; Send AT command HL; on failure reset the ESP + re-init the UART and retry once.
+; A user cancel (Esc/Ctrl+Z, kit sets WCOMMON.CANCELLED) aborts instead of retrying.
 AT_RECOVER
 	PUSH	HL
 	CALL	TX_CMD
 	POP		HL
 	RET		NC
+	LD		A, (WCOMMON.CANCELLED)
+	OR		A
+	SCF
+	RET		NZ						; cancelled -> abort
 	CALL	WIFI.ESP_RESET
 	CALL	WIFI.UART_SET_DEFAULT_DIVISOR
 	CALL	WIFI.UART_INIT
@@ -76,6 +81,10 @@ CONNECT
 	LD		DE, (c_port)
 	CALL	TCP.OPEN
 	RET		NC
+	LD		A, (WCOMMON.CANCELLED)
+	OR		A
+	SCF
+	RET		NZ						; cancelled during open -> abort, no retry
 	CALL	.prep
 	LD		HL, TCP_OPEN_RETRY_DELAY
 	CALL	UTIL.DELAY
