@@ -1,4 +1,4 @@
-# CLAUDE.md — Moon Rabbit (Gopher browser for Sprinter)
+# CLAUDE.md — Gopher browser for Sprinter (port of nihirash's Moon Rabbit)
 
 > Project guidance for AI agents and developers. Keep this file current as the
 > port progresses. See `plan.md` for the staged porting plan.
@@ -6,12 +6,16 @@
 ## 1. What this project is
 
 A **Gopher protocol browser for the Sprinter computer** (a Z80-based ZX Spectrum
-clone), running under **DSS** in the native **80×32 text mode**.
+clone), running under **DSS** in the native **80×32 text mode**. Displayed name is
+just **"Gopher"** ("Gopher browser for Sprinter") — NOT "Moon Rabbit"; the home
+page and docs credit the original it is based on (see below).
 
 It is a port of the **Moon Rabbit / Internet NEXTplorer** lineage of Z80 gopher
-browsers by *nihirash*. We take the most recent **pure‑Z80** core
-(`internet-nextplorer`) as the base, and adopt the cleaner architecture ideas
-from the newest `agon-snail` (transport/fetcher split, `file://` transport).
+browsers by *nihirash* — preserve that attribution in the home page, docs and
+license headers (do not present "Moon Rabbit" as this port's own name). We take
+the most recent **pure‑Z80** core (`internet-nextplorer`) as the base, and adopt
+the cleaner architecture ideas from the newest `agon-snail` (transport/fetcher
+split, `file://` transport).
 
 Networking reuses the existing Sprinter network kits behind a thin, compile-time
 switched HAL:
@@ -215,9 +219,19 @@ shutdown-on-exit (below). Awaiting a re-test.
    and via an **external program** (e.g. `Dss.Exec` the right viewer/player) —
    never inline. So: download (done) → confirm prompt → optionally launch external
    app (TODO).
+2b. **Download dir is next to the EXE — DONE.** `INIT_PATHS` (in START) does the
+   **`ChdirExeHome`** idiom (from `package-hub/pkglib/home_dir.asm`): DSS
+   **`AppInfo #47, B=1`** with the **buffer in HL** (the API does `EX DE,HL` —
+   passing it in DE writes to a junk address and the first attempt did exactly
+   that → downloads landed in the launch cwd, e.g. `C:\DOWNLOAD\`), returning the
+   EXE's home dir (incl. trailing `\`), then **`DSS_CHDIR`** into it. So the cwd
+   becomes the EXE's dir and the relative `DOWNLOAD\` paths land beside
+   `GOPHER.EXE`. Best-effort: if `AppInfo`/`CHDIR` is unavailable (older DSS) we
+   stay in the current dir. (`AppInfo B=2` = full path+name — reserved for the
+   appended-home-page reader, item 6a. Buffer size: `APPINFO_BUF_SIZE`=256.)
 2a. **Config file (`GOPHER.CFG` next to the EXE) for downloads/viewers.** A small
    text config, parsed at startup, that holds:
-   - **download directory path** — overrides the hard-coded `DOWNLOAD\` (so the
+   - **download directory path** — overrides the `<exedir>DOWNLOAD\` default (so the
      user can point it at e.g. a different drive/folder); create it if missing.
    - **type/extension → program map** — which DSS program opens which file type,
      used by the confirm-to-open-externally step (item 2). E.g. lines like
@@ -236,9 +250,23 @@ shutdown-on-exit (below). Awaiting a re-test.
 4. **Clock in the status bar** (DSS `SYSTIME #21`), refreshed in the main loop.
 5. **Ctrl+S** — save the current document to a file (DSS file API).
 6. **Ctrl+D** — add the current document (host/port/selector + title) to bookmarks.
-6a. **Home page from a file**: load `index.gph` next to the EXE at startup instead
-   of the built-in `WELCOME_DOC` (current built-in is seeded from nihirash's
-   moon-rabbit-zx `data/index.gph`). Falls back to built-in if the file is missing.
+6a. **Externalise the home page out of the code image** (frees ~1.2 KB; keeps the
+   home page editable). **Chosen mechanism: append it to the EXE at build time and
+   read it back at startup** (the loader idiom of fn/kode/tasm/spevosdk). Plan:
+   - **Build (Makefile):** after sjasmplus emits `GOPHER.EXE`, append the home-page
+     gopher text, then an 8-byte self-describing trailer `["GPH1"][len:dword]`.
+     A plain `--raw` EXE declares its load size in the header, so DSS loads only
+     the code image and IGNORES the appended bytes (they stay on disk).
+   - **Runtime:** `AppInfo #47 B=2` → the EXE's full path; `DSS_OPEN` it read-only;
+     `MOVE_FP SEEK_END` → size; seek `size-8`, read the trailer; verify `GPH1`;
+     seek `size-8-len`, read `len` bytes (loop into `STAGE` → `DOC.APPEND`) as the
+     home doc; `DSS_CLOSE`. Falls back to a tiny built-in `WELCOME_DOC` stub if the
+     open/trailer fails. (Alternative considered: a loader-style EXE keeping the
+     file open via `EXE_FM` at `(IX-3)` — rejected as riskier; reopen-by-path is
+     simpler and needs no EXE-header surgery. A separate `index.gph` companion file
+     is the other option but the user wants a single bundled EXE.)
+   NEEDS on-target verification that DSS ignores the appended bytes for a `--raw`
+   EXE and that `AppInfo` works on the target BIOS (item 2b validates AppInfo).
 6b. **Bookmarks file** next to the EXE (e.g. `bookmarks.gph`), opened by **Ctrl+B**
    (or a link on the home page); Ctrl+D appends to it.
 6c. **Ctrl+G — open an arbitrary address**: a text-input prompt (host[:port][/sel])
@@ -250,12 +278,25 @@ shutdown-on-exit (below). Awaiting a re-test.
    (`doc_complete`, `SHOW_LOADED`). Still want to auto-retry / resume truncated
    transfers (likely a `RECV_TIMEOUT` / kit early-stop issue on slow servers).
 
+12. **Startup network detection — DONE.** At launch (and on the home page) the
+   status bar shows "Wi-Fi not up - run NETUP first" when `NET.CHECK_NET_UP` (fast
+   env check, no UART) fails, so the user knows before clicking a link instead of
+   waiting through a failed `NET.INIT`. Mirrors SpecTalkZX `net_init` NET_NO_LINK.
+13. **Confirm on exit — DONE.** Esc at the menu now prompts "Quit Moon Rabbit? Y =
+   yes, any other key = no" (`CONFIRM_QUIT`); only Y/y quits. (Esc still cancels a
+   running fetch/download directly - that path doesn't reach the menu loop.)
+
 **Lower priority:**
 8. Cursor skips non-selectable (`i`/`.`) rows on Up/Down in menus.
 9. `file://`/`home://` via a fetcher/transport router (agon-snail idea); on a
    net error offer **re-init ESP** (NETRESET/NETUP via `Dss.Exec`).
 10. UTF-8 → CP866 recode for content (gopher servers vary).
 11. Phase 4: NE2000 backend behind the same `NET.*` HAL.
+14. **Long menu lines are truncated** (gopher display strings often exceed 80
+   cols). This is our renderer: `CLIP_DISP` caps the display field at `SCR_W-4`
+   (76 chars, a deliberate right margin that avoids the cursor-wrap-scroll bug),
+   one row per item, no wrap/horizontal-scroll - same as NEXTplorer. Enhancement:
+   horizontal-scroll the selected row, or wrap long lines onto continuation rows.
 
 Reference repos are cloned at `/tmp/gopher-analysis/{moon-rabbit-zx,internet-nextplorer,agon-snail}`
 (re-clone if gone). Working dir: `/Users/dmitry/dev/zx/sprinter/sources/moonrabbit`.

@@ -12,9 +12,8 @@
 DSS_CREATE_OVR	EQU 0x0A				; create/overwrite (DSS_CREATE #0A, proven by wget)
 NO_HANDLE		EQU 0xFF
 
-; Create the download directory. Errors (already exists) are ignored.
+; Create the directory whose ASCIIZ path is in HL. Errors (already exists) ignored.
 ENSURE_DIR
-	LD		HL, DL_DIR
 	LD		C, DSS_MKDIR
 	RST		DSS
 	RET
@@ -54,6 +53,5 @@ CLOSE
 	RET
 
 fh		DB NO_HANDLE
-DL_DIR	DB "DOWNLOAD", 0
 
 	ENDMODULE

@@ -1,6 +1,6 @@
 ; ======================================================
-; Moon Rabbit - Gopher browser for Sprinter (DSS, 80x32 text)
-; Base lineage: nihirash's Internet NEXTplorer (Z80) + agon-snail ideas.
+; Gopher browser for Sprinter (DSS, 80x32 text)
+; A port of nihirash's Moon Rabbit / Internet NEXTplorer (Z80) + agon-snail ideas.
 ;
 ; PHASE 3 - gopher engine (end-to-end browsing).
 ;   * Paged document buffer (src/doc.asm): fetched bytes live in a chain of
@@ -82,6 +82,7 @@ START
 	CALL	WCOMMON.INIT_VMODE			; record current mode so EXIT restores cleanly
 	CALL	INIT_RUNTIME_PAGE			; map a fresh WIN2 page for the scratch buffers
 	JP		C, MEM_ERROR
+	CALL	INIT_PATHS					; resolve the EXE dir for DOWNLOAD\ (AppInfo #47)
 	CALL	DOC.RESET
 	CALL	TERM.CLS
 	CALL	LOAD_HOME				; sets DOC_TITLE before the header is drawn
@@ -90,15 +91,14 @@ START
 	LD		(sel_index), HL
 	LD		(top_index), HL
 	CALL	RENDER_VIEWPORT
-	LD		HL, MSG_STATUS
-	CALL	SET_STATUS
+	CALL	SHOW_DOC_STATUS			; key help, or a "run NETUP" warning if no link
 
 MAINLOOP
 	CALL	KBD.SCAN
 	JR		Z, MAINLOOP
 
 	CP		KEY_ESC
-	JP		Z, QUIT
+	JP		Z, CONFIRM_QUIT
 	CP		KEY_ENTER
 	JP		Z, ON_ENTER
 	CP		KEY_BS
@@ -118,6 +118,24 @@ MAINLOOP
 	CP		KEY_PGDN
 	JP		Z, ON_PGDN
 	JR		MAINLOOP
+
+; Esc at the menu asks for confirmation (so a stray Esc doesn't drop the user out
+; of the browser). Y/y quits; any other key returns to browsing. The Esc that
+; opened this is debounced (INP_WAIT_RELEASE).
+CONFIRM_QUIT
+	LD		HL, MSG_CONFIRM_QUIT
+	CALL	SET_STATUS
+	CALL	INP_WAIT_RELEASE
+.poll
+	CALL	KBD.SCAN
+	JR		Z, .poll
+	CP		'Y'
+	JR		Z, QUIT
+	CP		'y'
+	JR		Z, QUIT
+	CALL	INP_WAIT_RELEASE
+	CALL	SHOW_DOC_STATUS			; restore the normal status line
+	JP		MAINLOOP
 
 QUIT
 	LD		A, (net_inited)			; if we ever brought the ESP up, hand it back
@@ -145,6 +163,23 @@ INIT_RUNTIME_PAGE
 	RET		C
 	LD		B, 0
 	LD		C, DSS_SETWIN2
+	RST		DSS
+	RET
+
+; Change the working directory to the one containing GOPHER.EXE: DSS AppInfo #47
+; B=1 returns the EXE's home directory (HL = buffer; path incl. trailing '\'),
+; then CHDIR into it. So relative paths like DOWNLOAD\ resolve next to the EXE
+; rather than in the launch cwd. (Idiom from package-hub's ChdirExeHome.) The
+; buffer MUST be passed in HL (the API does EX DE,HL internally). Best-effort:
+; if AppInfo or CHDIR is unavailable (older DSS) we stay in the current dir.
+INIT_PATHS
+	LD		HL, EXE_DIR
+	LD		B, APPINFO_DIR			; B=1: directory containing the EXE
+	LD		C, DSS_APPINFO
+	RST		DSS						; HL-buffer -> "<drive>:<path>\" ASCIIZ
+	RET		C						; not available -> leave cwd unchanged
+	LD		HL, EXE_DIR
+	LD		C, DSS_CHDIR
 	RST		DSS
 	RET
 
@@ -780,7 +815,14 @@ SHOW_DOC_STATUS
 	LD		A, (cur_kind)
 	OR		A
 	JP		NZ, SHOW_LOADED
+	; home page: warn up front if the network is not configured (NETUP not run),
+	; so the user knows before clicking a link - otherwise show the key help.
+	CALL	NET.CHECK_NET_UP		; fast env check (NET=WIFI / NET_ESP_HW), no UART
+	JR		C, .nonet
 	LD		HL, MSG_STATUS
+	JP		SET_STATUS
+.nonet
+	LD		HL, MSG_NONET
 	JP		SET_STATUS
 
 ; Clear the status row (ATTR_STATUS) and move the cursor to its column 1.
@@ -922,7 +964,8 @@ DOWNLOAD
 	CALL	BUILD_REQ_HL			; HL=REQ_BUF, BC=len
 	CALL	NET.SEND
 	JR		C, .e_send
-	CALL	FILE.ENSURE_DIR			; mkdir download (ignore "exists")
+	LD		HL, DL_DIRMK			; mkdir <exe-dir>\DOWNLOAD (ignore "exists")
+	CALL	FILE.ENSURE_DIR
 	LD		HL, DL_PATH
 	CALL	FILE.CREATE
 	JR		C, .e_file
@@ -1798,8 +1841,10 @@ DL_HOST			DS 64, 0
 DL_PORT			DS 8, 0
 DL_SEL			DS 200, 0
 DL_NAME			DS 16, 0				; derived 8.3 filename
-DL_PATH			DS 32, 0				; "DOWNLOAD\<name>" (passed to DSS file calls)
-DL_DIRPFX		DB "DOWNLOAD", 0x5C, 0	; path prefix (backslash separator)
+DL_PATH			DS 32, 0				; "DOWNLOAD\<name>" (relative to the EXE dir)
+DL_DIRMK		DB "DOWNLOAD", 0		; mkdir target (relative to the EXE dir)
+DL_DIRPFX		DB "DOWNLOAD", 0x5C, 0	; per-file path prefix (backslash separator)
+EXE_DIR			DS 256, 0				; AppInfo #47 output buffer (EXE home dir)
 DEF_DLNAME		DB "INDEX.BIN", 0		; fallback when the selector has no basename
 
 ; One decoded gopher row (type + TAB-split fields). MUST be in WIN1 (here in the
@@ -1811,8 +1856,10 @@ LINE_BUF_END	EQU LINE_BUF + 510
 ; ------------------------------------------------------
 ; Text.
 ; ------------------------------------------------------
-MSG_TITLE		DB "Moon Rabbit - gopher browser for Sprinter", 0
+MSG_TITLE		DB "Gopher browser for Sprinter", 0
 MSG_STATUS		DB "Up/Down move  PgUp/PgDn page  Enter open  Backspace back  Esc quit", 0
+MSG_NONET		DB "Wi-Fi not up - run NETUP first (you can still browse the home page)", 0
+MSG_CONFIRM_QUIT DB "Quit?  Y = yes,  any other key = no", 0
 MSG_FETCHING	DB "Fetching...", 0
 MSG_LOADING		DB "Loading ", 0
 MSG_LOADED		DB "Loaded ", 0
@@ -1836,7 +1883,8 @@ ERR_CANCEL		DB "Cancelled.", 0
 ; Built-in home page (gopher menu format; links are real network selectors).
 ; ------------------------------------------------------
 WELCOME_DOC
-	DB "iMoon Rabbit - a gopher browser for the Sprinter", 13, 10
+	DB "iGopher browser for the Sprinter", 13, 10
+	DB "iBased on Moon Rabbit / Internet NEXTplorer by nihirash", 13, 10
 	DB "i", 13, 10
 	DB "iControls:", 13, 10
 	DB "i  Up / Down     - move the cursor", 13, 10

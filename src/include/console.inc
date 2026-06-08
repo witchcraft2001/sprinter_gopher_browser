@@ -8,6 +8,12 @@
 	IFNDEF	_CONSOLE_INC
 	DEFINE	_CONSOLE_INC
 
+; --- DSS application info (C=#47; B selects: 0=cmdline params, 1=EXE home dir
+;     (path up to & incl. the last '\'), 2=EXE full path+name). DE=dest buffer. ---
+DSS_APPINFO			EQU 0x47
+APPINFO_DIR			EQU 1				; B=1: directory containing the EXE
+APPINFO_FULLPATH	EQU 2				; B=2: full path + filename of the EXE
+
 ; --- DSS console functions (C before RST #10) ---
 DSS_LOCATE			EQU 0x52			; D=row E=col (0-based)
 DSS_CURSOR			EQU 0x53			; -> D=row E=col
