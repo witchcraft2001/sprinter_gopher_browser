@@ -331,49 +331,96 @@ GET_ROW_TYPE
 	RET		C
 	JP		DOC.RD_BYTE
 
+; Page down: move the viewport top down by one page (clamped so the last page is
+; full), keeping the cursor at the same screen slot.
 ON_PGDN
-	LD		DE, (DOC.doc_lines)
-	LD		A, D
-	OR		E
+	LD		HL, (DOC.doc_lines)
+	LD		A, H
+	OR		L
 	JP		Z, MAINLOOP				; empty doc
-	DEC		DE						; DE = lines-1 (clamp target)
-	LD		HL, (sel_index)
-	LD		BC, VIEW_ROWS
-	ADD		HL, BC					; HL = sel + page
+	LD		HL, (top_index)
+	LD		DE, VIEW_ROWS
+	ADD		HL, DE					; top + VIEW_ROWS
+	LD		(pg_tmp), HL
+	CALL	MAX_TOP					; HL = max top (lines - VIEW_ROWS, >= 0)
+	LD		DE, (pg_tmp)
 	PUSH	HL
 	OR		A
-	SBC		HL, DE					; target - (lines-1); CF=1 if target < lines-1
-	POP		HL
-	JR		C, .have
-	EX		DE, HL					; clamp to lines-1
-.have
-	; HL = new selection. Skip the redraw if it did not move (already at the end).
-	LD		DE, (sel_index)
-	PUSH	HL
-	OR		A
-	SBC		HL, DE
-	POP		HL
-	JP		Z, MAINLOOP
-	LD		(sel_index), HL
-	JP		REDRAW
+	SBC		HL, DE					; max_top - (top+page); CF=1 if max_top < that
+	POP		HL						; HL = max_top
+	JR		C, .use					; clamp to max_top
+	LD		HL, (pg_tmp)			; top+page is within range
+.use
+	JP		PAGE_NAV				; HL = new top
 
+; Page up: move the viewport top up by one page (floor 0), same cursor slot.
 ON_PGUP
-	LD		HL, (sel_index)
+	LD		HL, (DOC.doc_lines)
+	LD		A, H
+	OR		L
+	JP		Z, MAINLOOP
+	LD		HL, (top_index)
+	LD		DE, VIEW_ROWS
+	OR		A
+	SBC		HL, DE					; top - VIEW_ROWS
+	JR		NC, PAGE_NAV
+	LD		HL, 0
+	JP		PAGE_NAV
+
+; HL = max(0, doc_lines - VIEW_ROWS).
+MAX_TOP
+	LD		HL, (DOC.doc_lines)
 	LD		DE, VIEW_ROWS
 	OR		A
 	SBC		HL, DE
-	JR		NC, .have
+	RET		NC
 	LD		HL, 0
-.have
-	; HL = new selection. Skip the redraw if it did not move (already at the top).
-	LD		DE, (sel_index)
+	RET
+
+; PAGE_NAV: HL = the desired new top_index. Keeps the cursor at its current slot
+; (sel - top), clamps the new selection to lines-1, and renders. Does nothing if
+; neither top nor selection actually changed (already at the boundary).
+PAGE_NAV
+	LD		(pg_ntop), HL
+	; slot = sel - top
+	LD		HL, (sel_index)
+	LD		DE, (top_index)
+	OR		A
+	SBC		HL, DE					; HL = slot
+	; new_sel = new_top + slot
+	LD		DE, (pg_ntop)
+	ADD		HL, DE
+	; clamp to lines-1
+	LD		DE, (DOC.doc_lines)
+	DEC		DE
 	PUSH	HL
 	OR		A
-	SBC		HL, DE
+	SBC		HL, DE					; new_sel - (lines-1); CF=1 if in range
 	POP		HL
+	JR		C, .sok
+	EX		DE, HL					; clamp to lines-1
+.sok
+	LD		(pg_nsel), HL
+	; block if nothing changed
+	LD		HL, (pg_ntop)
+	LD		DE, (top_index)
+	OR		A
+	SBC		HL, DE
+	JR		NZ, .go
+	LD		HL, (pg_nsel)
+	LD		DE, (sel_index)
+	OR		A
+	SBC		HL, DE
 	JP		Z, MAINLOOP
+.go
+	LD		HL, (pg_ntop)
+	LD		(top_index), HL
+	LD		HL, (pg_nsel)
 	LD		(sel_index), HL
 	JP		REDRAW
+pg_tmp	DW 0
+pg_ntop	DW 0
+pg_nsel	DW 0
 
 REDRAW
 	CALL	RENDER_VIEWPORT
@@ -548,6 +595,7 @@ DO_FETCH
 	CALL	NET.SEND
 	JR		C, .e_send
 	CALL	RECV_LOOP				; appends every block into the document
+	JR		C, .e_cancel			; Esc pressed during the download
 	CALL	NET.CLOSE
 	CALL	DOC.COUNT_LINES
 	LD		HL, (DOC.doc_lines)
@@ -555,6 +603,12 @@ DO_FETCH
 	OR		L
 	JR		Z, .e_empty
 	OR		A
+	RET
+.e_cancel
+	CALL	NET.CLOSE
+	LD		HL, ERR_CANCEL
+	LD		(last_err), HL
+	SCF
 	RET
 .e_init
 	LD		HL, ERR_INIT
@@ -597,8 +651,13 @@ RECV_LOOP
 	LD		BC, STAGE_SIZE
 	LD		DE, RECV_TIMEOUT
 	CALL	NET.RECV
-	PUSH	AF
+	PUSH	AF						; save the receive result (CF) across the poll
 	CALL	NET.RX_PAUSE			; drop RTS: ESP holds while we store + draw
+	CALL	KBD.SCAN				; poll Esc (ISA closed, RX held -> safe)
+	JR		Z, .nokey
+	CP		KEY_ESC
+	JR		Z, .cancel
+.nokey
 	POP		AF
 	JR		C, .end					; closed / timeout / error
 	LD		A, B
@@ -621,8 +680,14 @@ RECV_LOOP
 .noc
 	CALL	SHOW_PROGRESS
 	JR		.l
+.cancel
+	POP		AF						; discard saved receive result
+	CALL	NET.RX_RESUME
+	SCF								; CF=1 -> cancelled
+	RET
 .end
 	CALL	NET.RX_RESUME			; leave RX resumed for the CLOSE handshake
+	OR		A						; CF=0 -> normal end
 	RET
 
 ; Status-bar download progress: "Loading <n> bytes" (<1 KB) or "Loading <n> KB".
@@ -1256,6 +1321,7 @@ ERR_INIT		DB "Network init failed - run NETUP first.", 0
 ERR_CONN		DB "Connect failed (check host / port / Wi-Fi).", 0
 ERR_SEND		DB "Send failed.", 0
 ERR_EMPTY		DB "No data received.", 0
+ERR_CANCEL		DB "Cancelled.", 0
 
 ; ------------------------------------------------------
 ; Built-in home page (gopher menu format; links are real network selectors).

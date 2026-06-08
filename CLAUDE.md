@@ -187,15 +187,33 @@ shutdown-on-exit (below). Awaiting a re-test.
   `doc_lines` (total, from `COUNT_LINES`) is available for a future scroll
   position indicator.
 
-Next: **Phase 3 polish / Phase 4** —
-1. Type-7 **search** input (line editor → selector+TAB+query) and **binary
-   downloads** (`9`/`g`/`I`) to disk via the DSS file API (`file.asm`).
-2. Optional: upgrade history to the §4a **no-refetch** model (keep page chains
-   per level, cap 8, `FreeMem` oldest) once memory behaviour is confirmed.
-3. Optional: cursor skips non-selectable (`i`/`.`) rows on Up/Down.
-4. `file://`/`home://` via a fetcher/transport router (agon-snail idea); on
-   error offer **re-init ESP** (NETRESET/NETUP via `Dss.Exec`).
-5. Phase 4: NE2000 backend behind the same `NET.*` HAL.
+## TODO (Phase 3 polish / Phase 4) — agreed on-target
+
+**High value / requested:**
+1. **Doc caching for instant Back.** Back currently RE-FETCHES (slow). Keep the
+   loaded pages in memory (§4a no-refetch: page chains per history level, cap 8,
+   `FreeMem` oldest) — or spool each doc to a temp file — so Back is instant.
+2. **Unsupported gopher item types** (currently "not supported yet"): type `7`
+   **search** (line-editor prompt → selector+TAB+query+CRLF) and **binary
+   downloads** type `9`/`g`/`I` (and `s`/`;` etc.) saved to disk via the DSS file
+   API (`file.asm`). Also `h` (URL/`URL:` links).
+3. **Cancel during the network phase.** Esc now cancels the *receive* (Loading)
+   phase (`RECV_LOOP`). Still need cancel during `NET.INIT`/`NET.CONNECT`
+   ("Fetching" — the ~30 s bring-up + TCP.OPEN), which are kit calls that don't
+   poll the keyboard; needs polling hooked into the kit's wait loops (or a
+   bounded-retry with Esc check between steps).
+4. **Clock in the status bar** (DSS `SYSTIME #21`), refreshed in the main loop.
+5. **Ctrl+S** — save the current document to a file (DSS file API).
+6. **Ctrl+D** — add the current document (host/port/selector + title) to bookmarks.
+7. **Empty doc after long Fetching** on a flaky fetch — investigate / harden
+   (treat tiny/whitespace-only results as an error; better timeout classify).
+
+**Lower priority:**
+8. Cursor skips non-selectable (`i`/`.`) rows on Up/Down in menus.
+9. `file://`/`home://` via a fetcher/transport router (agon-snail idea); on a
+   net error offer **re-init ESP** (NETRESET/NETUP via `Dss.Exec`).
+10. UTF-8 → CP866 recode for content (gopher servers vary).
+11. Phase 4: NE2000 backend behind the same `NET.*` HAL.
 
 Reference repos are cloned at `/tmp/gopher-analysis/{moon-rabbit-zx,internet-nextplorer,agon-snail}`
 (re-clone if gone). Working dir: `/Users/dmitry/dev/zx/sprinter/sources/moonrabbit`.
