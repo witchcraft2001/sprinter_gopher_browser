@@ -198,13 +198,35 @@ shutdown-on-exit (below). Awaiting a re-test.
    Cap 8 levels; pages stay GetMem-allocated while cached.
 2. **Unsupported gopher item types** (currently "not supported yet"): type `7`
    **search — DONE** (`INPUT_LINE` status-row prompt → `SEL_CUR = selector + TAB +
-   query`, fetched and rendered as a type-1 menu). Still TODO: **binary
-   downloads** type `9`/`g`/`I` (and `s`/`;` etc.). Also `h` (URL/`URL:` links).
-   **Media policy (agreed):** binary/media items are **saved to a `download/`
-   directory** (next to the EXE) via the DSS file API (`file.asm`); the browser
-   does NOT auto-open them. Opening is **on explicit confirmation only**, and via
-   an **external program** (e.g. `Dss.Exec` the right viewer/player) — never
-   inline. So: download → confirm prompt → optionally launch external app.
+   query`, fetched and rendered as a type-1 menu). **Binary downloads — DONE**
+   (types `9`/`5`/`g`/`I`/`s`/`;`/`d`/`p` via `IS_BIN_TYPE`): `DOWNLOAD` streams the
+   selector straight to a file in `DOWNLOAD\` (`src/file.asm` = DSS Create `#0A`/
+   Write `#14`/Close `#12`/MkDir `#1B`; backslash 8.3 paths) **without touching the
+   current document or history** (dedicated `DL_HOST/DL_PORT/DL_SEL` buffers).
+   Filename derived from the selector basename, sanitised to 8.3 (`MAKE_DLNAME` +
+   `SANITIZE_CH`, fallback `INDEX.BIN`); status shows running/final size ("Saving/
+   Saved N KB to DOWNLOAD\NAME"); Esc cancels (kit `CANCELLED`); disk-full → ERR_DISK.
+   `DL_RECV_LOOP` mirrors `RECV_LOOP`'s RTS flow-control bracketing, `FILE.WRITE`
+   from `STAGE` (WIN2) after `NET.RX_PAUSE` closes ISA. Still TODO: `h` (URL/`URL:`
+   links); the **confirm-to-open-externally** step below.
+   **Media policy (agreed):** binary/media items are **saved to a `DOWNLOAD\`
+   directory** (next to the EXE) via the DSS file API (`file.asm`) — DONE; the
+   browser does NOT auto-open them. Opening is **on explicit confirmation only**,
+   and via an **external program** (e.g. `Dss.Exec` the right viewer/player) —
+   never inline. So: download (done) → confirm prompt → optionally launch external
+   app (TODO).
+2a. **Config file (`GOPHER.CFG` next to the EXE) for downloads/viewers.** A small
+   text config, parsed at startup, that holds:
+   - **download directory path** — overrides the hard-coded `DOWNLOAD\` (so the
+     user can point it at e.g. a different drive/folder); create it if missing.
+   - **type/extension → program map** — which DSS program opens which file type,
+     used by the confirm-to-open-externally step (item 2). E.g. lines like
+     `tap=TRDEMU.EXE`, `scr=VIEWER.EXE`, `gif=GIFVIEW.EXE`, plus optional defaults
+     by gopher item type (`I`, `s`, `;`, `9`). On confirm, look up the downloaded
+     file's extension (or item type), `Dss.Exec` the mapped program with the path.
+   Format: simple `key=value` per line, `#`/`;` comments, ASCIIZ; reuse the
+   NET.CFG-style parser idea. Falls back to built-in defaults (`DOWNLOAD\`, no
+   viewers) if the file is missing or a key is absent.
 3. **Cancel during the network phase — DONE.** Esc (also Ctrl+Z) cancels both
    Fetching and Loading: the kit polls `WCOMMON.CHECK_CANCEL_IN_ISA` inside its
    UART/TCP/RECEIVE byte-waits and sets `WCOMMON.CANCELLED`; we clear it at fetch

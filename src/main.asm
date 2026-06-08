@@ -477,11 +477,15 @@ ON_ENTER
 	JR		Z, .follow
 	CP		'7'
 	JR		Z, .search
+	LD		A, (row_type)
+	CALL	IS_BIN_TYPE				; 9/5/g/I/s/;/d/p -> downloadable
+	JP		Z, .download
+	LD		A, (row_type)
 	CP		'i'
 	JP		Z, MAINLOOP
 	CP		'.'
 	JP		Z, MAINLOOP
-	JP		.unsupported			; binary/other types - later phase
+	JP		.unsupported			; h (URL) and other types - later phase
 .follow
 	LD		HL, (p_host)
 	LD		A, (HL)
@@ -539,6 +543,34 @@ ON_ENTER
 .unsupported
 	LD		HL, MSG_UNSUPPORTED
 	CALL	SET_STATUS
+	JP		MAINLOOP
+.download
+	; binary/media item: stream it to download\<name>, leaving the current
+	; document (and history) untouched. Uses dedicated DL_* buffers so HOST_CUR/
+	; SEL_CUR (the live page's nav) are not disturbed.
+	LD		HL, (p_host)
+	LD		A, (HL)
+	OR		A
+	JP		Z, .unsupported			; no host on this row
+	LD		HL, (p_host)
+	LD		DE, DL_HOST
+	LD		B, 64
+	CALL	STRCPYN
+	LD		HL, (p_port)
+	LD		DE, DL_PORT
+	LD		B, 8
+	CALL	STRCPYN
+	LD		HL, (p_sel)
+	LD		DE, DL_SEL
+	LD		B, 200
+	CALL	STRCPYN
+	CALL	MAKE_DLNAME				; DL_SEL -> DL_NAME (8.3) and DL_PATH
+	CALL	DOWNLOAD				; CF=1 on error (last_err set)
+	JR		C, .dlfail
+	CALL	SHOW_SAVED
+	JP		MAINLOOP
+.dlfail
+	CALL	SHOW_ERROR
 	JP		MAINLOOP
 
 ; Copy the parsed row's link fields into the current nav (used by .follow).
@@ -771,6 +803,8 @@ PUT_SIZE
 	CALL	DOC.SIZE				; HL = low 16, A = high 8
 	LD		(recv_lo), HL
 	LD		(recv_hi), A
+; Format the 24-bit size in recv_lo/recv_hi at the cursor (used by downloads too).
+PUT_SIZE_RV
 	LD		A, (recv_hi)
 	OR		A
 	JR		NZ, .kb					; >= 64 KB -> KB
@@ -814,6 +848,8 @@ PUT_SIZE
 ; Build the gopher request (SEL_CUR + CRLF) in REQ_BUF. Out: HL=REQ_BUF, BC=len.
 BUILD_REQ
 	LD		HL, SEL_CUR
+; Build a request from the selector at HL. Out: HL=REQ_BUF, BC=len.
+BUILD_REQ_HL
 	LD		DE, REQ_BUF
 	CALL	COPYZ					; copies without the NUL; DE left at end
 	LD		A, 13
@@ -829,6 +865,274 @@ BUILD_REQ
 	LD		B, H
 	LD		C, L
 	LD		HL, REQ_BUF
+	RET
+
+; ------------------------------------------------------
+; Binary / media downloads.
+; ------------------------------------------------------
+; A = gopher item type. Out: ZF=1 if it is a downloadable binary/media type.
+; (9 binary, 5 DOS archive, g GIF, I image, s sound, ; video, d document, p PNG.)
+IS_BIN_TYPE
+	PUSH	BC
+	PUSH	HL
+	LD		C, A
+	LD		HL, BIN_TYPES
+.l
+	LD		A, (HL)
+	OR		A
+	JR		Z, .no
+	CP		C
+	JR		Z, .yes
+	INC		HL
+	JR		.l
+.yes
+	XOR		A						; ZF=1
+	JR		.done
+.no
+	OR		1						; ZF=0
+.done
+	POP		HL
+	POP		BC
+	RET
+BIN_TYPES		DB "95gIs;dp", 0
+
+; Stream DL_SEL from DL_HOST:DL_PORT into the file DL_PATH. The running and final
+; size accumulate into recv_lo/recv_hi (the document is not touched). CF=0 ok,
+; CF=1 on error (last_err set; FETCH_ERR maps a user cancel to "Cancelled").
+DOWNLOAD
+	XOR		A
+	LD		(WCOMMON.CANCELLED), A	; clear any stale cancel flag
+	LD		HL, 0
+	LD		(recv_lo), HL
+	LD		(recv_hi), A			; zero the byte counter
+	CALL	SHOW_FETCHING
+	LD		A, (net_inited)
+	OR		A
+	JR		NZ, .haveinit
+	CALL	NET.INIT
+	JR		C, .e_init
+	LD		A, 1
+	LD		(net_inited), A
+.haveinit
+	LD		HL, DL_HOST
+	LD		DE, DL_PORT
+	CALL	NET.CONNECT
+	JR		C, .e_conn
+	LD		HL, DL_SEL
+	CALL	BUILD_REQ_HL			; HL=REQ_BUF, BC=len
+	CALL	NET.SEND
+	JR		C, .e_send
+	CALL	FILE.ENSURE_DIR			; mkdir download (ignore "exists")
+	LD		HL, DL_PATH
+	CALL	FILE.CREATE
+	JR		C, .e_file
+	CALL	DL_RECV_LOOP			; writes blocks to the file; CF=1 on cancel/disk
+	PUSH	AF
+	CALL	FILE.CLOSE
+	CALL	NET.CLOSE
+	POP		AF
+	RET		NC						; success (CF=0)
+	LD		A, (WCOMMON.CANCELLED)
+	OR		A
+	JR		NZ, .e_cancel			; cancelled mid-download
+	LD		HL, ERR_DISK			; otherwise a disk write failed
+	JP		FETCH_ERR
+.e_cancel
+	LD		HL, ERR_CANCEL
+	JP		FETCH_ERR
+.e_init
+	LD		HL, ERR_INIT
+	JP		FETCH_ERR
+.e_conn
+	CALL	NET.CLOSE
+	LD		HL, ERR_CONN
+	JP		FETCH_ERR
+.e_send
+	CALL	NET.CLOSE
+	LD		HL, ERR_SEND
+	JP		FETCH_ERR
+.e_file
+	CALL	NET.CLOSE
+	LD		HL, ERR_DISK
+	JP		FETCH_ERR
+
+; Receive blocks into STAGE and write them to the open file until the connection
+; closes/times out, or the user cancels, or a write fails. Mirrors RECV_LOOP's
+; RTS-flow-control bracketing. Out: CF=0 normal end, CF=1 cancel/disk error.
+DL_RECV_LOOP
+.l
+	CALL	NET.RX_RESUME			; raise RTS: let the ESP stream
+	LD		HL, STAGE
+	LD		BC, STAGE_SIZE
+	LD		DE, RECV_TIMEOUT
+	CALL	NET.RECV
+	PUSH	AF
+	CALL	NET.RX_PAUSE			; drop RTS while we write + draw
+	POP		AF
+	JR		C, .end					; closed / timeout / error / cancelled
+	LD		A, B
+	OR		C
+	JR		Z, .end					; no more data
+	PUSH	BC						; BC = bytes received
+	LD		HL, STAGE
+	CALL	FILE.WRITE				; HL=buf, BC=len
+	POP		BC
+	JR		C, .werr				; disk write failed -> abort
+	CALL	DL_ADD					; recv_lo/recv_hi += BC
+	CALL	DL_PROGRESS
+	JR		.l
+.end
+	CALL	NET.RX_RESUME			; resume for the CLOSE handshake
+	LD		A, (WCOMMON.CANCELLED)	; CF=1 only if the user cancelled
+	OR		A
+	RET		Z						; normal end (CF=0)
+	SCF
+	RET
+.werr
+	CALL	NET.RX_RESUME
+	SCF								; CF=1, CANCELLED=0 -> caller reports disk error
+	RET
+
+; recv_lo/recv_hi += BC (24-bit running total).
+DL_ADD
+	LD		HL, (recv_lo)
+	ADD		HL, BC
+	LD		(recv_lo), HL
+	RET		NC
+	LD		A, (recv_hi)
+	INC		A
+	LD		(recv_hi), A
+	RET
+
+; Status-bar download progress: "Saving <n> bytes/KB".
+DL_PROGRESS
+	CALL	STATUS_HOME
+	LD		HL, MSG_SAVING
+	CALL	TERM.PUTS
+	JP		PUT_SIZE_RV				; formats recv_lo/recv_hi at the cursor
+
+; Final status after a successful download: "Saved <n> KB to <path>".
+SHOW_SAVED
+	CALL	STATUS_HOME
+	LD		HL, MSG_SAVED
+	CALL	TERM.PUTS
+	CALL	PUT_SIZE_RV
+	LD		HL, MSG_TO
+	CALL	TERM.PUTS
+	LD		HL, DL_PATH
+	JP		TERM.PUTS
+
+; Derive an 8.3 filename from the selector DL_SEL into DL_NAME, then build
+; DL_PATH = "DOWNLOAD\<name>". Non-FAT chars are sanitised; an empty basename
+; falls back to a default. Trashes A/BC/DE/HL.
+MAKE_DLNAME
+	; 1) find the basename start (after the last '/' or '\') in DE.
+	LD		HL, DL_SEL
+	LD		D, H
+	LD		E, L
+.fb
+	LD		A, (HL)
+	OR		A
+	JR		Z, .fbdone
+	CP		'/'
+	JR		Z, .sep
+	CP		'\'
+	JR		Z, .sep
+	INC		HL
+	JR		.fb
+.sep
+	INC		HL
+	LD		D, H
+	LD		E, L					; basename start = char after the separator
+	JR		.fb
+.fbdone
+	LD		A, (DE)
+	OR		A
+	JP		Z, .default				; empty basename
+	; 2) copy up to 8 name chars (until '.' or end) into DL_NAME.
+	EX		DE, HL					; HL = src basename
+	LD		DE, DL_NAME				; dst
+	LD		B, 8
+.nloop
+	LD		A, (HL)
+	OR		A
+	JR		Z, .namedone			; end, no extension
+	CP		'.'
+	JR		Z, .extstart
+	CALL	SANITIZE_CH
+	LD		(DE), A
+	INC		DE
+	INC		HL
+	DJNZ	.nloop
+	; name longer than 8: skip the rest until '.' or end
+.skipname
+	LD		A, (HL)
+	OR		A
+	JR		Z, .namedone
+	CP		'.'
+	JR		Z, .extstart
+	INC		HL
+	JR		.skipname
+.extstart
+	INC		HL						; skip the '.'
+	LD		A, (HL)
+	OR		A
+	JR		Z, .namedone			; trailing dot, no extension
+	LD		A, '.'
+	LD		(DE), A
+	INC		DE
+	LD		B, 3
+.eloop
+	LD		A, (HL)
+	OR		A
+	JR		Z, .namedone
+	CALL	SANITIZE_CH
+	LD		(DE), A
+	INC		DE
+	INC		HL
+	DJNZ	.eloop
+.namedone
+	XOR		A
+	LD		(DE), A					; NUL-terminate DL_NAME
+	JR		.buildpath
+.default
+	LD		HL, DEF_DLNAME
+	LD		DE, DL_NAME
+	LD		B, 16
+	CALL	STRCPYN
+.buildpath
+	LD		HL, DL_DIRPFX			; "DOWNLOAD\"
+	LD		DE, DL_PATH
+	CALL	COPYZ					; DE -> end (no NUL)
+	LD		HL, DL_NAME
+	CALL	COPYZ
+	XOR		A
+	LD		(DE), A					; NUL-terminate DL_PATH
+	RET
+
+; Map A to a FAT-safe uppercase filename char (A-Z 0-9 - _ kept, else '_').
+SANITIZE_CH
+	CP		'a'
+	JR		C, .chk
+	CP		'z' + 1
+	JR		NC, .chk
+	SUB		0x20					; to uppercase
+.chk
+	CP		'0'
+	JR		C, .bad
+	CP		'9' + 1
+	JR		C, .good
+	CP		'A'
+	JR		C, .bad
+	CP		'Z' + 1
+	JR		C, .good
+	CP		'-'
+	RET		Z
+	CP		'_'
+	RET		Z
+.bad
+	LD		A, '_'
+.good
 	RET
 
 ; ------------------------------------------------------
@@ -1488,6 +1792,16 @@ DOC_TITLE		DS TITLE_MAX, 0
 SEARCH_MAX		EQU 64
 SEARCH_BUF		DS SEARCH_MAX, 0
 
+; Binary/media download target (kept separate from the live page's nav so a
+; download does not disturb the current document or history).
+DL_HOST			DS 64, 0
+DL_PORT			DS 8, 0
+DL_SEL			DS 200, 0
+DL_NAME			DS 16, 0				; derived 8.3 filename
+DL_PATH			DS 32, 0				; "DOWNLOAD\<name>" (passed to DSS file calls)
+DL_DIRPFX		DB "DOWNLOAD", 0x5C, 0	; path prefix (backslash separator)
+DEF_DLNAME		DB "INDEX.BIN", 0		; fallback when the selector has no basename
+
 ; One decoded gopher row (type + TAB-split fields). MUST be in WIN1 (here in the
 ; code image), not the WIN2 scratch page: DSS PChars prints the display field
 ; straight from this buffer, and a WIN2 source prints as garbage.
@@ -1507,11 +1821,15 @@ SUFFIX_B		DB " bytes", 0
 SUFFIX_KB		DB " KB", 0
 MSG_UNSUPPORTED	DB "That item type is not supported yet.", 0
 MSG_SEARCH		DB "Search (Enter=go  Esc=cancel): ", 0
+MSG_SAVING		DB "Saving ", 0
+MSG_SAVED		DB "Saved ", 0
+MSG_TO			DB " to ", 0
 MSG_MEM_ERR		DB "Cannot allocate work page.", 0
 ERR_INIT		DB "Network init failed - run NETUP first.", 0
 ERR_CONN		DB "Connect failed (check host / port / Wi-Fi).", 0
 ERR_SEND		DB "Send failed.", 0
 ERR_EMPTY		DB "No data received.", 0
+ERR_DISK		DB "Disk write failed (out of space?).", 0
 ERR_CANCEL		DB "Cancelled.", 0
 
 ; ------------------------------------------------------
@@ -1546,6 +1864,7 @@ WELCOME_LEN		EQU WELCOME_END - WELCOME_DOC
 	INCLUDE "kbd.asm"
 	INCLUDE "doc.asm"
 	INCLUDE "net.asm"
+	INCLUDE "file.asm"
 
 	INCLUDE "netcfg_lib.asm"			; defines _NETCFG (needed by wcommon)
 	INCLUDE "wcommon.asm"
