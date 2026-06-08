@@ -251,9 +251,15 @@ shutdown-on-exit (below). Awaiting a re-test.
 5. **Ctrl+S** — save the current document to a file (DSS file API).
 6. **Ctrl+D** — add the current document (host/port/selector + title) to bookmarks.
 6a. **Home page externalised out of the code image — DONE** (frees ~1.2 KB; the
-   home page is now editable in `data/index.gph`). **Mechanism: GOPHER.EXE is a
-   *loader EXE* with the home page appended past the image** (the fn/kode/tasm/
-   spevosdk idiom). Key correction over the first plan: a `--raw` EXE does NOT
+   home page is now editable in `data/index.gph`). **Priority at startup
+   (`LOAD_HOME`): external `INDEX.GPH` in the EXE dir → appended-to-EXE copy →
+   tiny built-in stub.** `LOAD_HOME_DISK` opens a relative `INDEX.GPH` (we chdir'd
+   into the EXE dir, so it resolves next to GOPHER.EXE) read-only and, if present
+   and non-empty, loads it — letting the user override the home page WITHOUT
+   rebuilding. The shared chunked reader is `READ_INTO_DOC` (A=handle, `hf_rem`
+   bytes → `DOC.APPEND`). The appended copy is the bundled default:
+   **GOPHER.EXE is a *loader EXE* with the home page appended past the image** (the
+   fn/kode/tasm/spevosdk idiom). Key correction over the first plan: a `--raw` EXE does NOT
    ignore appended bytes — the no-loader DSS path (`Execute.ASM .RET_1`) reads to
    EOF and CLOSES the file. So instead we set the **`LOADER` header word at offset
    `0x08`** = `IMAGE_END - LOAD_ADDR` (sjasmplus, ~`0x2DAB`); DSS then loads exactly

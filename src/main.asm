@@ -688,7 +688,11 @@ LOAD_HOME
 	CALL	STRCPYN
 	LD		HL, 0
 	LD		(HOST_CUR), HL			; empty host marks the home page
-	CALL	LOAD_HOME_FILE			; the home page appended to GOPHER.EXE
+	; priority: an external INDEX.GPH next to the EXE (user override) wins over the
+	; copy appended to GOPHER.EXE, which wins over the tiny built-in stub.
+	CALL	LOAD_HOME_DISK			; external INDEX.GPH in the EXE directory
+	JR		NC, .counted
+	CALL	LOAD_HOME_FILE			; the copy appended to GOPHER.EXE
 	JR		NC, .counted
 	LD		HL, WELCOME_DOC			; fallback: tiny built-in stub
 	LD		BC, WELCOME_LEN
@@ -698,11 +702,54 @@ LOAD_HOME
 	OR		A
 	RET
 
+; Try to load an external INDEX.GPH from the EXE directory (we chdir'd there at
+; startup, so a relative name resolves next to GOPHER.EXE). This lets the user
+; override the home page without rebuilding. Out: CF=0 loaded (>0 B), CF=1 absent/
+; empty.
+HOME_FILE		DB "INDEX.GPH", 0
+LOAD_HOME_DISK
+	LD		HL, HOME_FILE
+	LD		A, FM_READ
+	LD		C, DSS_OPEN_FILE
+	RST		DSS						; HL=name, A=mode -> A=handle, CF=1 not found
+	RET		C
+	LD		(disk_fm), A
+	LD		B, SEEK_END
+	LD		HL, 0
+	LD		IX, 0
+	LD		C, DSS_MOVE_FP
+	RST		DSS						; HL:IX = size
+	PUSH	IX
+	POP		HL						; HL = size low 16 (assume < 64 KB)
+	LD		A, H
+	OR		L
+	JR		Z, .empty				; empty file -> fall back to the appended copy
+	LD		(hf_rem), HL
+	LD		A, (disk_fm)			; rewind to the start
+	LD		B, 0					; SEEK_SET
+	LD		HL, 0
+	LD		IX, 0
+	LD		C, DSS_MOVE_FP
+	RST		DSS
+	LD		A, (disk_fm)
+	CALL	READ_INTO_DOC			; hf_rem bytes -> doc
+	LD		A, (disk_fm)
+	LD		C, DSS_CLOSE_FILE
+	RST		DSS
+	OR		A						; CF=0
+	RET
+.empty
+	LD		A, (disk_fm)
+	LD		C, DSS_CLOSE_FILE
+	RST		DSS
+	SCF
+	RET
+
 ; Read the home page that the Makefile appended to GOPHER.EXE into the current doc.
 ; A loader EXE leaves its own file open (FM captured from (IX-3) into home_fm at
 ; START); the appended bytes begin at file offset HOME_OFFSET = 0x200 + image size.
-; We SEEK_END for the file size, take the tail (size - HOME_OFFSET) and read it in
-; STAGE-sized chunks. Out: CF=0 loaded (>0 B), CF=1 = no handle / nothing appended.
+; We SEEK_END for the file size, take the tail (size - HOME_OFFSET) and read it.
+; Out: CF=0 loaded (>0 B), CF=1 = no handle / nothing appended.
 HOME_OFFSET		EQU 0x200 + IMAGE_END - LOAD_ADDR
 LOAD_HOME_FILE
 	LD		A, (home_fm)
@@ -727,22 +774,35 @@ LOAD_HOME_FILE
 	LD		IX, HOME_OFFSET
 	LD		C, DSS_MOVE_FP
 	RST		DSS
+	LD		A, (home_fm)
+	CALL	READ_INTO_DOC
+	OR		A						; CF=0 (loaded; leave the EXE file open)
+	RET
+.fail
+	SCF
+	RET
+
+; Read (hf_rem) bytes from the open file handle in A into the current document, in
+; STAGE-sized chunks (STAGE is WIN2; DOC.APPEND time-shares WIN3, no ISA involved).
+; Assumes the file is already positioned at the first byte to read.
+READ_INTO_DOC
+	LD		(rid_fm), A
 .rl
 	LD		HL, (hf_rem)
 	LD		A, H
 	OR		L
-	JR		Z, .ok
+	RET		Z						; done
 	LD		DE, STAGE_SIZE			; chunk = min(remaining, STAGE_SIZE)
 	OR		A
-	SBC		HL, DE					; rem - STAGE_SIZE
+	SBC		HL, DE
 	JR		NC, .full
 	LD		DE, (hf_rem)			; remaining < STAGE_SIZE -> last chunk
 .full
 	PUSH	DE
 	LD		HL, STAGE
-	LD		A, (home_fm)
+	LD		A, (rid_fm)
 	LD		C, DSS_READ_FILE
-	RST		DSS						; read DE bytes into STAGE (WIN2)
+	RST		DSS						; read DE bytes into STAGE
 	POP		DE
 	PUSH	DE
 	LD		HL, STAGE
@@ -755,13 +815,9 @@ LOAD_HOME_FILE
 	SBC		HL, DE
 	LD		(hf_rem), HL
 	JR		.rl
-.ok
-	OR		A						; CF=0 (loaded)
-	RET
-.fail
-	SCF
-	RET
 hf_rem			DW 0
+disk_fm			DB 0
+rid_fm			DB 0
 
 ; ------------------------------------------------------
 ; Fetch HOST_CUR/SEL_CUR/PORT_CUR into a fresh document. CF=1 on error
