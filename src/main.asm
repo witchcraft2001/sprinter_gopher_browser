@@ -65,20 +65,26 @@ TITLE_MAX		EQU 64
 EXE_HEADER
 	DB "EXE"
 	DB EXE_VERSION
-	DW 0x0200
+	DW 0x0200						; +0x04 (dword) header size = 512
+	DW 0
+	; +0x08 (word) LOADER size: make this a *loader EXE* by declaring our whole
+	; code image as the loader. DSS then loads exactly this many body bytes and
+	; leaves the EXE file OPEN (FM at (IX-3), file position right after the image),
+	; so we can read the home page appended past the image (see LOAD_HOME_FILE).
+	DW IMAGE_END - LOAD_ADDR
 	DW 0
 	DW 0
 	DW 0
-	DW 0
-	DW 0
-	DW START
-	DW START
-	DW STACK_TOP
+	DW START						; +0x10 load address
+	DW START						; +0x12 entry point
+	DW STACK_TOP					; +0x14 stack
 	DS 490, 0
 
 	ORG LOAD_ADDR
 
 START
+	LD		A, (IX-3)					; EXE file handle - DSS leaves a loader EXE open,
+	LD		(home_fm), A				; FM at (IX-3); used to read the appended home page
 	CALL	WCOMMON.INIT_VMODE			; record current mode so EXIT restores cleanly
 	CALL	INIT_RUNTIME_PAGE			; map a fresh WIN2 page for the scratch buffers
 	JP		C, MEM_ERROR
@@ -682,12 +688,80 @@ LOAD_HOME
 	CALL	STRCPYN
 	LD		HL, 0
 	LD		(HOST_CUR), HL			; empty host marks the home page
-	LD		HL, WELCOME_DOC
+	CALL	LOAD_HOME_FILE			; the home page appended to GOPHER.EXE
+	JR		NC, .counted
+	LD		HL, WELCOME_DOC			; fallback: tiny built-in stub
 	LD		BC, WELCOME_LEN
 	CALL	DOC.APPEND
+.counted
 	CALL	DOC.COUNT_LINES
 	OR		A
 	RET
+
+; Read the home page that the Makefile appended to GOPHER.EXE into the current doc.
+; A loader EXE leaves its own file open (FM captured from (IX-3) into home_fm at
+; START); the appended bytes begin at file offset HOME_OFFSET = 0x200 + image size.
+; We SEEK_END for the file size, take the tail (size - HOME_OFFSET) and read it in
+; STAGE-sized chunks. Out: CF=0 loaded (>0 B), CF=1 = no handle / nothing appended.
+HOME_OFFSET		EQU 0x200 + IMAGE_END - LOAD_ADDR
+LOAD_HOME_FILE
+	LD		A, (home_fm)
+	CP		FILE.NO_HANDLE
+	JR		Z, .fail				; not a loader EXE / older DSS -> use the stub
+	LD		B, SEEK_END
+	LD		HL, 0
+	LD		IX, 0
+	LD		C, DSS_MOVE_FP
+	RST		DSS						; HL:IX = file size
+	PUSH	IX
+	POP		HL						; HL = size low 16 (home page keeps the file < 64 KB)
+	LD		DE, HOME_OFFSET
+	OR		A
+	SBC		HL, DE					; HL = appended byte count
+	JR		Z, .fail
+	JR		C, .fail
+	LD		(hf_rem), HL
+	LD		A, (home_fm)			; seek to the start of the appended data
+	LD		B, 0					; SEEK_SET
+	LD		HL, 0
+	LD		IX, HOME_OFFSET
+	LD		C, DSS_MOVE_FP
+	RST		DSS
+.rl
+	LD		HL, (hf_rem)
+	LD		A, H
+	OR		L
+	JR		Z, .ok
+	LD		DE, STAGE_SIZE			; chunk = min(remaining, STAGE_SIZE)
+	OR		A
+	SBC		HL, DE					; rem - STAGE_SIZE
+	JR		NC, .full
+	LD		DE, (hf_rem)			; remaining < STAGE_SIZE -> last chunk
+.full
+	PUSH	DE
+	LD		HL, STAGE
+	LD		A, (home_fm)
+	LD		C, DSS_READ_FILE
+	RST		DSS						; read DE bytes into STAGE (WIN2)
+	POP		DE
+	PUSH	DE
+	LD		HL, STAGE
+	LD		B, D
+	LD		C, E
+	CALL	DOC.APPEND				; append the chunk to the doc
+	POP		DE
+	LD		HL, (hf_rem)
+	OR		A
+	SBC		HL, DE
+	LD		(hf_rem), HL
+	JR		.rl
+.ok
+	OR		A						; CF=0 (loaded)
+	RET
+.fail
+	SCF
+	RET
+hf_rem			DW 0
 
 ; ------------------------------------------------------
 ; Fetch HOST_CUR/SEL_CUR/PORT_CUR into a fresh document. CF=1 on error
@@ -1813,6 +1887,7 @@ hist_sp			DB 0
 cur_kind		DB 0					; 0=home, 1=network
 DOC_TYPE_CUR	DB '1'
 net_inited		DB 0
+home_fm			DB 0xFF					; open EXE file handle (from (IX-3) at START)
 last_err		DW 0
 recv_lo			DW 0					; bytes received this fetch (low 16)
 recv_hi			DB 0					; bytes received this fetch (high 8) -> 24-bit
@@ -1880,29 +1955,18 @@ ERR_DISK		DB "Disk write failed (out of space?).", 0
 ERR_CANCEL		DB "Cancelled.", 0
 
 ; ------------------------------------------------------
-; Built-in home page (gopher menu format; links are real network selectors).
+; Built-in fallback home page (used only if the INDEX.GPH appended to GOPHER.EXE
+; can't be read - e.g. an older DSS that closes the EXE, or a stripped EXE). The
+; real home page lives in data/index.gph and is appended by the Makefile.
 ; ------------------------------------------------------
 WELCOME_DOC
-	DB "iGopher browser for the Sprinter", 13, 10
+	DB "iGopher browser for Sprinter", 13, 10
 	DB "iBased on Moon Rabbit / Internet NEXTplorer by nihirash", 13, 10
 	DB "i", 13, 10
-	DB "iControls:", 13, 10
-	DB "i  Up / Down     - move the cursor", 13, 10
-	DB "i  PgUp / PgDn    - page up / down (Left / Right too)", 13, 10
-	DB "i  Enter          - open the selected link", 13, 10
-	DB "i  Backspace      - go back", 13, 10
-	DB "i  Esc            - quit (cancels a running download)", 13, 10
+	DB "i(Appended home page INDEX.GPH not found - using the built-in stub.)", 13, 10
 	DB "i", 13, 10
-	DB "iSome links to start exploring gopherspace:", 13, 10
-	DB "1Nihirash's gopher hole (lots of Speccy stuff)", 9, "/", 9, "nihirash.net", 9, "70", 13, 10
-	DB "1Virtual TR-DOS official gopher hole", 9, "/", 9, "vtrd.in", 9, "70", 13, 10
-	DB "1I-Logout.cz - phlog aggregator and more", 9, "/", 9, "i-logout.cz", 9, "70", 13, 10
-	DB "1Hacker News gate", 9, "/", 9, "hngopher.com", 9, "70", 13, 10
-	DB "1Reddit gate", 9, "/", 9, "gopherddit.com", 9, "70", 13, 10
-	DB "1Wikipedia gate", 9, "/", 9, "gopherpedia.com", 9, "70", 13, 10
-	DB "1SDF Public Access UNIX System", 9, "/", 9, "sdf.org", 9, "70", 13, 10
 	DB "1Floodgap Systems official gopher server", 9, "/", 9, "gopher.floodgap.com", 9, "70", 13, 10
-	DB "1Fade to black gopher space", 9, "/", 9, "fadeto.black", 9, "70", 13, 10
+	DB "1Nihirash's gopher hole", 9, "/", 9, "nihirash.net", 9, "70", 13, 10
 WELCOME_END
 WELCOME_LEN		EQU WELCOME_END - WELCOME_DOC
 
@@ -1920,5 +1984,9 @@ WELCOME_LEN		EQU WELCOME_END - WELCOME_DOC
 	INCLUDE "isa.asm"
 	INCLUDE "esp_tcp.asm"
 	INCLUDE "esplib.asm"				; anchors the lib BSS chain; keep last
+
+; End of the emitted image. The EXE header's LOADER field = IMAGE_END - LOAD_ADDR,
+; and the Makefile appends INDEX.GPH starting at file offset 0x200 + that size.
+IMAGE_END
 
 	END MAIN.START

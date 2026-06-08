@@ -12,6 +12,10 @@ ASM        := sjasmplus
 SRC        := src/main.asm
 # All sources main.asm pulls in, so editing any module/include forces a rebuild.
 DEPS       := $(wildcard src/*.asm src/include/*.inc)
+# Home page: appended verbatim past the EXE image (the header's LOADER field makes
+# GOPHER.EXE a loader EXE, so DSS leaves the file open and the program reads this
+# tail back at startup -- see LOAD_HOME_FILE). Editing it forces a rebuild.
+HOMEPAGE   := data/index.gph
 BUILD      := build
 EXE        := $(BUILD)/GOPHER.EXE
 LST        := $(BUILD)/GOPHER.lst
@@ -31,9 +35,10 @@ IMG          := distr/gopher.img
 
 all: $(EXE)
 
-$(EXE): $(SRC) $(DEPS) | $(BUILD)
+$(EXE): $(SRC) $(DEPS) $(HOMEPAGE) | $(BUILD)
 	$(ASM) $(ASMFLAGS) --lst=$(LST) --raw=$(EXE) $(SRC)
-	@echo "Built $(EXE) (backend: $(BACKEND))"
+	cat "$(HOMEPAGE)" >> "$(EXE)"
+	@echo "Built $(EXE) (backend: $(BACKEND)) + home page $$(wc -c < $(HOMEPAGE)) B"
 
 $(BUILD):
 	@mkdir -p $(BUILD)

@@ -250,23 +250,27 @@ shutdown-on-exit (below). Awaiting a re-test.
 4. **Clock in the status bar** (DSS `SYSTIME #21`), refreshed in the main loop.
 5. **Ctrl+S** — save the current document to a file (DSS file API).
 6. **Ctrl+D** — add the current document (host/port/selector + title) to bookmarks.
-6a. **Externalise the home page out of the code image** (frees ~1.2 KB; keeps the
-   home page editable). **Chosen mechanism: append it to the EXE at build time and
-   read it back at startup** (the loader idiom of fn/kode/tasm/spevosdk). Plan:
-   - **Build (Makefile):** after sjasmplus emits `GOPHER.EXE`, append the home-page
-     gopher text, then an 8-byte self-describing trailer `["GPH1"][len:dword]`.
-     A plain `--raw` EXE declares its load size in the header, so DSS loads only
-     the code image and IGNORES the appended bytes (they stay on disk).
-   - **Runtime:** `AppInfo #47 B=2` → the EXE's full path; `DSS_OPEN` it read-only;
-     `MOVE_FP SEEK_END` → size; seek `size-8`, read the trailer; verify `GPH1`;
-     seek `size-8-len`, read `len` bytes (loop into `STAGE` → `DOC.APPEND`) as the
-     home doc; `DSS_CLOSE`. Falls back to a tiny built-in `WELCOME_DOC` stub if the
-     open/trailer fails. (Alternative considered: a loader-style EXE keeping the
-     file open via `EXE_FM` at `(IX-3)` — rejected as riskier; reopen-by-path is
-     simpler and needs no EXE-header surgery. A separate `index.gph` companion file
-     is the other option but the user wants a single bundled EXE.)
-   NEEDS on-target verification that DSS ignores the appended bytes for a `--raw`
-   EXE and that `AppInfo` works on the target BIOS (item 2b validates AppInfo).
+6a. **Home page externalised out of the code image — DONE** (frees ~1.2 KB; the
+   home page is now editable in `data/index.gph`). **Mechanism: GOPHER.EXE is a
+   *loader EXE* with the home page appended past the image** (the fn/kode/tasm/
+   spevosdk idiom). Key correction over the first plan: a `--raw` EXE does NOT
+   ignore appended bytes — the no-loader DSS path (`Execute.ASM .RET_1`) reads to
+   EOF and CLOSES the file. So instead we set the **`LOADER` header word at offset
+   `0x08`** = `IMAGE_END - LOAD_ADDR` (sjasmplus, ~`0x2DAB`); DSS then loads exactly
+   the image via the `PRELOAD`/`_RET_2` path and leaves the EXE **open** (FM at
+   `(IX-3)`, FP right after the image). `IMAGE_END` is a label after the last
+   `INCLUDE`. The file is `[512 hdr][image LOADER bytes][INDEX.GPH]`; appended data
+   starts at file offset `HOME_OFFSET = 0x200 + LOADER`.
+   - **Build (Makefile):** `cat data/index.gph >> build/GOPHER.EXE` after sjasmplus
+     (CRLF + real TABs; `NEXT_LINE` tolerates CRLF or LF).
+   - **Runtime (`LOAD_HOME_FILE`):** capture `home_fm` = `(IX-3)` as the FIRST
+     instruction in START (before IX is clobbered); `MOVE_FP SEEK_END` → size;
+     `len = size - HOME_OFFSET`; `MOVE_FP SEEK_SET HOME_OFFSET`; loop
+     `DSS_READ_FILE`→`STAGE`→`DOC.APPEND`. `LOAD_HOME` falls back to a tiny built-in
+     `WELCOME_DOC` stub if `home_fm`=`0xFF`/`len<=0` (older DSS that closes the EXE,
+     or a non-loader build). PRELOAD sizes memory by `LOADER`, NOT file length, so
+     appending doesn't change allocation. NEEDS on-target check that the loader
+     path works on BIOS v3.06 and FM stays open.
 6b. **Bookmarks file** next to the EXE (e.g. `bookmarks.gph`), opened by **Ctrl+B**
    (or a link on the home page); Ctrl+D appends to it.
 6c. **Ctrl+G — open an arbitrary address**: a text-input prompt (host[:port][/sel])
