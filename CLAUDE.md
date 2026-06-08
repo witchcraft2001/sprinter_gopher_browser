@@ -190,13 +190,21 @@ shutdown-on-exit (below). Awaiting a re-test.
 ## TODO (Phase 3 polish / Phase 4) — agreed on-target
 
 **High value / requested:**
-1. **Doc caching for instant Back.** Back currently RE-FETCHES (slow). Keep the
-   loaded pages in memory (§4a no-refetch: page chains per history level, cap 8,
-   `FreeMem` oldest) — or spool each doc to a temp file — so Back is instant.
+1. **Doc caching for instant Back — DONE.** Each history record carries a 40-byte
+   copy of the DOC descriptor (`HR_DOCSTATE`: block-ids + phys pages + metadata);
+   follow = `PUSH_HIST` (`DOC.SAVE_STATE`) + `DOC.NEW` (detach, don't free); Back =
+   `DOC.RESET` (free current) + `POP_HIST` (`DOC.LOAD_STATE`, restores the cached
+   pages, no re-fetch); overflow frees the oldest level's pages (`DOC.FREE_STATE`).
+   Cap 8 levels; pages stay GetMem-allocated while cached.
 2. **Unsupported gopher item types** (currently "not supported yet"): type `7`
-   **search** (line-editor prompt → selector+TAB+query+CRLF) and **binary
-   downloads** type `9`/`g`/`I` (and `s`/`;` etc.) saved to disk via the DSS file
-   API (`file.asm`). Also `h` (URL/`URL:` links).
+   **search — DONE** (`INPUT_LINE` status-row prompt → `SEL_CUR = selector + TAB +
+   query`, fetched and rendered as a type-1 menu). Still TODO: **binary
+   downloads** type `9`/`g`/`I` (and `s`/`;` etc.). Also `h` (URL/`URL:` links).
+   **Media policy (agreed):** binary/media items are **saved to a `download/`
+   directory** (next to the EXE) via the DSS file API (`file.asm`); the browser
+   does NOT auto-open them. Opening is **on explicit confirmation only**, and via
+   an **external program** (e.g. `Dss.Exec` the right viewer/player) — never
+   inline. So: download → confirm prompt → optionally launch external app.
 3. **Cancel during the network phase — DONE.** Esc (also Ctrl+Z) cancels both
    Fetching and Loading: the kit polls `WCOMMON.CHECK_CANCEL_IN_ISA` inside its
    UART/TCP/RECEIVE byte-waits and sets `WCOMMON.CANCELLED`; we clear it at fetch
@@ -215,6 +223,10 @@ shutdown-on-exit (below). Awaiting a re-test.
    then fetch it.
 7. **Empty doc after long Fetching** on a flaky fetch — investigate / harden
    (treat tiny/whitespace-only results as an error; better timeout classify).
+   PARTIALLY DONE: the status bar now shows the loaded size and flags
+   "- INCOMPLETE" when the gopher "." terminator was never received
+   (`doc_complete`, `SHOW_LOADED`). Still want to auto-retry / resume truncated
+   transfers (likely a `RECV_TIMEOUT` / kit early-stop issue on slow servers).
 
 **Lower priority:**
 8. Cursor skips non-selectable (`i`/`.`) rows on Up/Down in menus.

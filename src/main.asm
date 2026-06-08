@@ -45,8 +45,9 @@ VIEW_TOP		EQU 1
 VIEW_ROWS		EQU 30
 STATUS_ROW		EQU 31
 
-; --- history ---
-HIST_MAX		EQU 16
+; --- history --- each level caches the whole document (page chain) so Back is
+; instant (no re-fetch). Cap 8 levels; the oldest is freed on overflow.
+HIST_MAX		EQU 8
 ; history record field offsets (see HIST_DATA in console.inc)
 HR_KIND			EQU 0					; 1: 0=home, 1=network
 HR_HOST			EQU 1					; 64
@@ -56,7 +57,8 @@ HR_TYPE			EQU 273					; 1
 HR_SELIDX		EQU 274					; 2
 HR_TOPIDX		EQU 276					; 2
 HR_TITLE		EQU 278					; 64 (page title shown in the header)
-HR_SIZE			EQU 342
+HR_DOCSTATE		EQU 342					; 40 (DOC.SAVE_STATE: page chain + metadata)
+HR_SIZE			EQU 382
 TITLE_MAX		EQU 64
 
 	ORG LOAD_ADDR - 0x0200
@@ -148,10 +150,10 @@ INIT_RUNTIME_PAGE
 
 ; ------------------------------------------------------
 ; Navigation. An in-page Up/Down recolours only the two changed rows in place
-; (cheap, no repaint). An Up/Down at a viewport edge, and PgUp/PgDn, full-redraw
-; via RENDER_VIEWPORT (cheap now that SEEK_LINE is O(1)). We do NOT hardware-
-; scroll: DSS Scroll #55 wedges on the full-width region (it hung the browser on
-; long pages). Page jumps are blocked when the selection can't move (at top/end).
+; (cheap, no repaint). An Up/Down at a viewport edge hardware-scrolls one line via
+; BIOS Lp_Scroll_Up #8A + DI (SCROLL_VIEW), then draws the one newly exposed row.
+; PgUp/PgDn full-redraw via RENDER_VIEWPORT (cheap now SEEK_LINE is O(1)) and are
+; blocked when the selection can't move (at top/end).
 ; ------------------------------------------------------
 ON_UP
 	LD		HL, (sel_index)
@@ -474,7 +476,7 @@ ON_ENTER
 	CP		'0'
 	JR		Z, .follow
 	CP		'7'
-	JP		Z, .unsupported			; search input - later phase
+	JR		Z, .search
 	CP		'i'
 	JP		Z, MAINLOOP
 	CP		'.'
@@ -485,8 +487,63 @@ ON_ENTER
 	LD		A, (HL)
 	OR		A
 	JP		Z, .unsupported			; no host on this row
-	CALL	PUSH_HIST				; remember the page we are leaving (incl. its title)
-	LD		HL, (p_disp)			; the clicked link's text becomes the new title
+	CALL	PUSH_HIST				; cache the page we are leaving (nav + its doc pages)
+	CALL	DOC.NEW					; detach those pages; start a fresh empty doc
+	CALL	COPY_NAV_FROM_ROW		; title/host/port/selector/type from the parsed row
+	JP		GOTO_FETCH
+.search
+	; type 7: ask for a query, send "<selector> TAB <query>", show the menu result
+	LD		HL, (p_host)
+	LD		A, (HL)
+	OR		A
+	JP		Z, .unsupported			; no host on this row
+	LD		HL, MSG_SEARCH
+	LD		DE, SEARCH_BUF
+	LD		B, SEARCH_MAX
+	CALL	INPUT_LINE
+	JR		C, .search_cancel		; Esc -> abort
+	CALL	PUSH_HIST
+	CALL	DOC.NEW
+	LD		HL, (p_disp)			; title = the search item's text
+	LD		DE, DOC_TITLE
+	LD		B, TITLE_MAX
+	CALL	STRCPYN
+	LD		HL, (p_host)
+	LD		DE, HOST_CUR
+	LD		B, 64
+	CALL	STRCPYN
+	LD		HL, (p_port)
+	LD		DE, PORT_CUR
+	LD		B, 8
+	CALL	STRCPYN
+	; SEL_CUR = <original selector> TAB <query>
+	LD		HL, (p_sel)
+	LD		DE, SEL_CUR
+	CALL	COPYZ					; copy selector (no NUL); DE -> end
+	LD		A, 9
+	LD		(DE), A					; TAB
+	INC		DE
+	LD		HL, SEARCH_BUF
+	CALL	COPYZ					; append query; DE -> end
+	XOR		A
+	LD		(DE), A					; NUL-terminate
+	LD		A, '1'					; search results are a gopher menu
+	LD		(DOC_TYPE_CUR), A
+	LD		A, 1
+	LD		(cur_kind), A
+	JP		GOTO_FETCH
+.search_cancel
+	LD		HL, MSG_STATUS			; restore the help line over the prompt
+	CALL	SET_STATUS
+	JP		MAINLOOP
+.unsupported
+	LD		HL, MSG_UNSUPPORTED
+	CALL	SET_STATUS
+	JP		MAINLOOP
+
+; Copy the parsed row's link fields into the current nav (used by .follow).
+COPY_NAV_FROM_ROW
+	LD		HL, (p_disp)
 	LD		DE, DOC_TITLE
 	LD		B, TITLE_MAX
 	CALL	STRCPYN
@@ -506,49 +563,42 @@ ON_ENTER
 	LD		(DOC_TYPE_CUR), A
 	LD		A, 1
 	LD		(cur_kind), A
+	RET
+
+; Fetch the current nav into the fresh (DOC.NEW'd) document and show it; on error
+; drop the partial doc and restore the cached previous page. Assumes PUSH_HIST +
+; DOC.NEW were already done and HOST_CUR/PORT_CUR/SEL_CUR/title/type/kind are set.
+GOTO_FETCH
 	CALL	DO_FETCH
-	JR		C, .ferr
+	JR		C, .err
 	LD		HL, 0
 	LD		(sel_index), HL
 	LD		(top_index), HL
 	CALL	REDRAW_FULL
-	LD		HL, MSG_STATUS
-	CALL	SET_STATUS
+	CALL	SHOW_DOC_STATUS
 	JP		MAINLOOP
-.ferr
-	; fetch wiped the doc; revert the nav we just pushed and reload it
-	CALL	POP_HIST
-	CALL	NAV_RELOAD
+.err
+	CALL	DOC.RESET
+	CALL	POP_HIST				; restores the previous doc's pages (no re-fetch)
 	CALL	CLAMP_SEL
 	CALL	REDRAW_FULL
 	CALL	SHOW_ERROR
 	JP		MAINLOOP
-.unsupported
-	LD		HL, MSG_UNSUPPORTED
-	CALL	SET_STATUS
-	JP		MAINLOOP
 
 ; ------------------------------------------------------
-; Backspace: return to the previous page (re-fetch from its nav record).
+; Backspace: return to the previous page. The previous document is cached in
+; history (its page chain), so this is instant - no network re-fetch.
 ; ------------------------------------------------------
 ON_BACK
 	LD		A, (hist_sp)
 	OR		A
 	JP		Z, MAINLOOP
-	CALL	POP_HIST
-	CALL	NAV_RELOAD
+	CALL	DOC.RESET				; free the current document's pages
+	CALL	POP_HIST				; restore the cached previous doc (pages + view)
 	CALL	CLAMP_SEL
 	CALL	REDRAW_FULL
-	LD		HL, MSG_STATUS
-	CALL	SET_STATUS
+	CALL	SHOW_DOC_STATUS
 	JP		MAINLOOP
-
-; Reload the current nav (home page or network fetch). Returns CF on error.
-NAV_RELOAD
-	LD		A, (cur_kind)
-	OR		A
-	JP		Z, LOAD_HOME
-	JP		DO_FETCH
 
 ; ------------------------------------------------------
 ; Built-in home page (no network). Loaded into the doc like any fetched page.
@@ -643,9 +693,6 @@ FETCH_ERR
 ; with RX pause (drops RTS so the ESP holds its TX → no UART FIFO overrun), and
 ; shows the running downloaded size on the status bar.
 RECV_LOOP
-	LD		HL, 0
-	LD		(recv_lo), HL
-	LD		(recv_hi), HL			; clears recv_hi (low byte) too
 .l
 	LD		A, (DOC.doc_trunc)
 	OR		A
@@ -662,22 +709,9 @@ RECV_LOOP
 	LD		A, B
 	OR		C
 	JR		Z, .end					; no more data
-	PUSH	BC
 	LD		HL, STAGE
-	POP		BC
-	PUSH	BC
-	CALL	DOC.APPEND
-	POP		BC
-	; recv_total (24-bit) += BC
-	LD		HL, (recv_lo)
-	ADD		HL, BC
-	LD		(recv_lo), HL
-	JR		NC, .noc
-	LD		A, (recv_hi)
-	INC		A
-	LD		(recv_hi), A
-.noc
-	CALL	SHOW_PROGRESS
+	CALL	DOC.APPEND				; BC = bytes; doc size grows with it
+	CALL	SHOW_PROGRESS			; reads the size from the doc itself
 	JR		.l
 .end
 	CALL	NET.RX_RESUME			; leave RX resumed for the CLOSE handshake
@@ -690,6 +724,35 @@ RECV_LOOP
 ; Status-bar download progress: "Loading <n> bytes" (<1 KB) or "Loading <n> KB".
 ; Gopher has no content-length, so we show the downloaded amount, not a percent.
 SHOW_PROGRESS
+	CALL	STATUS_HOME				; clear status row, cursor at col 1
+	LD		HL, MSG_LOADING
+	CALL	TERM.PUTS
+	JP		PUT_SIZE
+
+; After a fetch: "Loaded <size>" plus " - INCOMPLETE" if the gopher "." terminator
+; was never received (a truncated transfer).
+SHOW_LOADED
+	CALL	STATUS_HOME
+	LD		HL, MSG_LOADED
+	CALL	TERM.PUTS
+	CALL	PUT_SIZE
+	LD		A, (DOC.doc_complete)
+	OR		A
+	RET		NZ						; complete -> done
+	LD		HL, MSG_INCOMPLETE
+	JP		TERM.PUTS
+
+; Status line for the freshly shown document: size+completeness for a network
+; page, the key help for the built-in home page.
+SHOW_DOC_STATUS
+	LD		A, (cur_kind)
+	OR		A
+	JP		NZ, SHOW_LOADED
+	LD		HL, MSG_STATUS
+	JP		SET_STATUS
+
+; Clear the status row (ATTR_STATUS) and move the cursor to its column 1.
+STATUS_HOME
 	LD		D, STATUS_ROW
 	LD		E, 0
 	LD		H, 1
@@ -699,10 +762,15 @@ SHOW_PROGRESS
 	CALL	TERM.FILL
 	LD		D, STATUS_ROW
 	LD		E, 1
-	CALL	TERM.LOCATE
-	LD		HL, MSG_LOADING
-	CALL	TERM.PUTS
-	; choose bytes vs KB
+	JP		TERM.LOCATE
+
+; Print the current document size at the cursor as "<n> bytes" (<1 KB) or "<n> KB".
+; Reads it from the live doc (DOC.SIZE), so it is right both while loading and for
+; a restored cached page on Back.
+PUT_SIZE
+	CALL	DOC.SIZE				; HL = low 16, A = high 8
+	LD		(recv_lo), HL
+	LD		(recv_hi), A
 	LD		A, (recv_hi)
 	OR		A
 	JR		NZ, .kb					; >= 64 KB -> KB
@@ -826,7 +894,9 @@ PUSH_HIST
 	LD		A, (hist_sp)
 	CP		HIST_MAX
 	JR		C, .haveroom
-	; full: drop the oldest record (shift the array down by one)
+	; full: free the oldest level's cached pages, then shift the array down
+	LD		HL, HIST_DATA + HR_DOCSTATE
+	CALL	DOC.FREE_STATE
 	LD		HL, HIST_DATA + HR_SIZE
 	LD		DE, HIST_DATA
 	LD		BC, (HIST_MAX - 1) * HR_SIZE
@@ -891,6 +961,12 @@ PUSH_HIST
 	LD		HL, DOC_TITLE
 	LD		B, TITLE_MAX
 	CALL	STRCPYN
+	; cache the document itself (page chain) so Back needs no re-fetch
+	LD		A, (hist_sp)
+	CALL	HREC_ADDR
+	LD		DE, HR_DOCSTATE
+	ADD		HL, DE
+	CALL	DOC.SAVE_STATE
 	LD		A, (hist_sp)
 	INC		A
 	LD		(hist_sp), A
@@ -951,6 +1027,12 @@ POP_HIST
 	LD		DE, DOC_TITLE
 	LD		B, TITLE_MAX
 	CALL	STRCPYN
+	; restore the cached document (page chain) - no re-fetch
+	LD		A, (hist_sp)
+	CALL	HREC_ADDR
+	LD		DE, HR_DOCSTATE
+	ADD		HL, DE
+	CALL	DOC.LOAD_STATE
 	RET
 
 ; HL = HIST_DATA + A*HR_SIZE
@@ -1041,6 +1123,100 @@ SHOW_FETCHING
 SHOW_ERROR
 	LD		HL, (last_err)
 	JP		SET_STATUS
+
+; ------------------------------------------------------
+; Single-line text input on the status row (used for type-7 search queries).
+; In:  HL = prompt ASCIIZ, DE = destination buffer, B = buffer size (incl. NUL).
+; Out: CF=0 submitted (Enter), CF=1 cancelled (Esc). Buffer is ASCIIZ either way.
+; Uses ScanKey (A=char code, E=ASCII) with a wait-for-release debounce so a held
+; key registers once. The buffer is kept NUL-terminated as it is edited so the
+; redraw can print it directly.
+; ------------------------------------------------------
+INPUT_LINE
+	LD		(in_prompt), HL
+	LD		(in_buf), DE
+	LD		A, B
+	DEC		A						; reserve one byte for the NUL
+	LD		(in_max), A
+	XOR		A
+	LD		(in_pos), A
+	LD		(DE), A					; start empty
+	CALL	INP_WAIT_RELEASE		; don't read the Enter that opened the prompt
+.redraw
+	CALL	INP_DRAW
+.poll
+	CALL	KBD.SCAN
+	JR		Z, .poll
+	CP		KEY_ENTER
+	JR		Z, .submit
+	CP		KEY_ESC
+	JR		Z, .cancel
+	CP		KEY_BS
+	JR		Z, .back
+	LD		A, E					; ASCII; accept printable 0x20..0x7E only
+	CP		0x20
+	JR		C, .ignore
+	CP		0x7F
+	JR		NC, .ignore
+	LD		A, (in_pos)
+	LD		HL, in_max
+	CP		(HL)
+	JR		Z, .ignore				; buffer full
+	LD		HL, (in_buf)
+	LD		C, A					; A = in_pos
+	LD		B, 0
+	ADD		HL, BC
+	LD		A, E
+	LD		(HL), A					; store the char
+	INC		HL
+	XOR		A
+	LD		(HL), A					; keep it NUL-terminated
+	LD		HL, in_pos
+	INC		(HL)
+	CALL	INP_WAIT_RELEASE
+	JR		.redraw
+.back
+	LD		A, (in_pos)
+	OR		A
+	JR		Z, .ignore				; nothing to erase
+	DEC		A
+	LD		(in_pos), A
+	LD		HL, (in_buf)
+	LD		C, A
+	LD		B, 0
+	ADD		HL, BC
+	XOR		A
+	LD		(HL), A					; truncate
+	CALL	INP_WAIT_RELEASE
+	JR		.redraw
+.ignore
+	CALL	INP_WAIT_RELEASE
+	JR		.poll
+.submit
+	CALL	INP_WAIT_RELEASE
+	OR		A						; CF=0
+	RET
+.cancel
+	CALL	INP_WAIT_RELEASE
+	SCF
+	RET
+
+; Repaint the status row: prompt + current buffer + an underscore cursor.
+INP_DRAW
+	CALL	STATUS_HOME
+	LD		HL, (in_prompt)
+	CALL	TERM.PUTS
+	LD		HL, (in_buf)
+	CALL	TERM.PUTS
+	LD		HL, INP_CURSOR
+	JP		TERM.PUTS
+INP_CURSOR		DB "_", 0
+
+; Spin until no key is held (ScanKey ZF=1), debouncing one keypress.
+INP_WAIT_RELEASE
+	CALL	KBD.SCAN
+	JR		NZ, INP_WAIT_RELEASE
+	RET
 
 ; ------------------------------------------------------
 ; Header bar.
@@ -1295,6 +1471,10 @@ recv_lo			DW 0					; bytes received this fetch (low 16)
 recv_hi			DB 0					; bytes received this fetch (high 8) -> 24-bit
 prog_suffix		DW 0					; " bytes"/" KB" pointer during progress draw
 NUMBUF			DS 8, 0					; UTIL.UTOA decimal scratch
+in_prompt		DW 0					; INPUT_LINE: prompt ASCIIZ
+in_buf			DW 0					; INPUT_LINE: destination buffer
+in_max			DB 0					; INPUT_LINE: max chars (excl. NUL)
+in_pos			DB 0					; INPUT_LINE: chars entered so far
 EMPTYSTR		DB 0
 
 HOST_CUR		DS 64, 0
@@ -1303,6 +1483,10 @@ SEL_CUR			DS 200, 0
 ; Current page title shown in the header (the display text of the link we
 ; followed; the home page sets a default). Saved/restored across history.
 DOC_TITLE		DS TITLE_MAX, 0
+
+; Type-7 search query (entered via INPUT_LINE). WIN1, so TERM.PUTS can echo it.
+SEARCH_MAX		EQU 64
+SEARCH_BUF		DS SEARCH_MAX, 0
 
 ; One decoded gopher row (type + TAB-split fields). MUST be in WIN1 (here in the
 ; code image), not the WIN2 scratch page: DSS PChars prints the display field
@@ -1317,9 +1501,12 @@ MSG_TITLE		DB "Moon Rabbit - gopher browser for Sprinter", 0
 MSG_STATUS		DB "Up/Down move  PgUp/PgDn page  Enter open  Backspace back  Esc quit", 0
 MSG_FETCHING	DB "Fetching...", 0
 MSG_LOADING		DB "Loading ", 0
+MSG_LOADED		DB "Loaded ", 0
+MSG_INCOMPLETE	DB " - INCOMPLETE (transfer truncated)", 0
 SUFFIX_B		DB " bytes", 0
 SUFFIX_KB		DB " KB", 0
 MSG_UNSUPPORTED	DB "That item type is not supported yet.", 0
+MSG_SEARCH		DB "Search (Enter=go  Esc=cancel): ", 0
 MSG_MEM_ERR		DB "Cannot allocate work page.", 0
 ERR_INIT		DB "Network init failed - run NETUP first.", 0
 ERR_CONN		DB "Connect failed (check host / port / Wi-Fi).", 0
@@ -1332,8 +1519,6 @@ ERR_CANCEL		DB "Cancelled.", 0
 ; ------------------------------------------------------
 WELCOME_DOC
 	DB "iMoon Rabbit - a gopher browser for the Sprinter", 13, 10
-	DB "i", 13, 10
-	DB "iWe stand with Ukraine!", 13, 10
 	DB "i", 13, 10
 	DB "iControls:", 13, 10
 	DB "i  Up / Down     - move the cursor", 13, 10

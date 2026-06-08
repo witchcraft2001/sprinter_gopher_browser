@@ -33,6 +33,7 @@ doc_trunc	DB 0					; set if the document overflowed the cap
 doc_wpage	DB 0					; current write page index
 doc_woff	DW 0					; write offset within write page (0..0x4000)
 doc_lines	DW 0					; total line count (set by COUNT_LINES)
+doc_complete	DB 0				; 1 if COUNT_LINES saw the gopher "." terminator
 doc_rpage	DB 0					; live read cursor page index
 doc_roff	DW 0					; live read cursor offset within page
 sc_line		DW 0					; seek cache: a known line number ...
@@ -75,6 +76,118 @@ RESET
 	LD		(doc_lines), HL
 	LD		(sc_line), HL
 	LD		(sc_off), HL
+	RET
+
+; The persistent part of the document = block handles, physical pages, and the
+; metadata up to doc_complete (the read cursor / seek cache are transient). This
+; whole block is saved/restored per history level so Back is instant (no refetch).
+DOC_STATE_SIZE	EQU doc_complete + 1 - doc_blocks	; = 40
+
+; ------------------------------------------------------
+; SAVE_STATE - copy the live document state to (HL). Trashes BC, DE, HL.
+; ------------------------------------------------------
+SAVE_STATE
+	EX		DE, HL					; DE = dest
+	LD		HL, doc_blocks
+	LD		BC, DOC_STATE_SIZE
+	LDIR
+	RET
+
+; ------------------------------------------------------
+; LOAD_STATE - restore the live document state from (HL), then reset the read
+; cursor / seek cache so the next render re-seeks. Trashes BC, DE, HL.
+; ------------------------------------------------------
+LOAD_STATE
+	LD		DE, doc_blocks
+	LD		BC, DOC_STATE_SIZE
+	LDIR
+	XOR		A
+	LD		(doc_rpage), A
+	LD		(sc_page), A
+	LD		HL, 0
+	LD		(doc_roff), HL
+	LD		(sc_line), HL
+	LD		(sc_off), HL
+	RET
+
+; ------------------------------------------------------
+; NEW - start a fresh empty document WITHOUT freeing the current pages (they were
+; just SAVE_STATE'd into a history record and are owned there now). Marks every
+; block slot empty so a later RESET won't double-free them.
+; ------------------------------------------------------
+NEW
+	XOR		A
+	LD		(doc_npages), A
+	LD		(doc_trunc), A
+	LD		(doc_wpage), A
+	LD		(doc_rpage), A
+	LD		(sc_page), A
+	LD		(doc_complete), A
+	LD		HL, 0
+	LD		(doc_woff), HL
+	LD		(doc_roff), HL
+	LD		(doc_lines), HL
+	LD		(sc_line), HL
+	LD		(sc_off), HL
+	LD		HL, doc_blocks
+	LD		B, DOC_MAX_PAGES
+.bl
+	LD		(HL), 0xFF
+	INC		HL
+	DJNZ	.bl
+	RET
+
+; ------------------------------------------------------
+; FREE_STATE - free the GetMem pages held by a SAVE_STATE'd descriptor at (HL)
+; (used when evicting the oldest history level). Trashes regs.
+; ------------------------------------------------------
+FREE_STATE
+	PUSH	HL
+	LD		DE, doc_npages - doc_blocks
+	ADD		HL, DE
+	LD		A, (HL)					; npages from the saved descriptor
+	POP		HL						; HL -> saved block handles
+	OR		A
+	RET		Z
+	LD		B, A
+.fl
+	LD		A, (HL)
+	CP		0xFF
+	JR		Z, .skip
+	PUSH	BC
+	PUSH	HL
+	LD		C, DSS_FREEMEM
+	RST		DSS
+	POP		HL
+	POP		BC
+.skip
+	INC		HL
+	DJNZ	.fl
+	RET
+
+; ------------------------------------------------------
+; SIZE - document byte length. Out: HL = low 16 bits, A = high 8 bits
+; (= doc_wpage*0x4000 + doc_woff). Trashes DE.
+; ------------------------------------------------------
+SIZE
+	LD		HL, (doc_woff)
+	LD		E, 0					; E = high-byte accumulator
+	LD		A, (doc_wpage)
+	LD		D, A					; D = page counter
+.l
+	LD		A, D
+	OR		A
+	JR		Z, .done
+	LD		A, H
+	ADD		A, 0x40					; += one 16 KB page (high byte 0x40)
+	LD		H, A
+	JR		NC, .nc
+	INC		E
+.nc
+	DEC		D
+	JR		.l
+.done
+	LD		A, E
 	RET
 
 ; ------------------------------------------------------
@@ -452,39 +565,39 @@ NEXT_LINE
 .sb		DB 0
 
 ; ------------------------------------------------------
-; COUNT_LINES - one scan over the document to set doc_lines (counts a trailing
-; partial line with no terminating LF). Does not touch the seek cache.
+; COUNT_LINES - one scan over the document to set doc_lines. Reads line by line
+; (NEXT_LINE) and STOPS at the gopher "." terminator (a line that is exactly
+; "."), so any trailing junk after it (stale page bytes / extra protocol bytes
+; the kit may have delivered past the menu) is not counted or shown. Counts a
+; trailing partial line with no terminating LF. Does not touch the seek cache.
 ; ------------------------------------------------------
 COUNT_LINES
 	XOR		A
 	LD		(doc_rpage), A
+	LD		(doc_complete), A		; assume incomplete until we meet "."
 	LD		HL, 0
 	LD		(doc_roff), HL
 	LD		(doc_lines), HL
-	LD		C, 0					; C = data-seen-since-last-LF flag
 .l
 	CALL	AT_END
-	JR		C, .tail
-	CALL	RD_BYTE					; preserves BC
-	CP		10
-	JR		Z, .lf
-	CP		13
-	JR		Z, .l
-	LD		C, 1
-	JR		.l
-.lf
-	LD		HL, (doc_lines)
+	RET		C						; reached the end without a terminator (incomplete)
+	CALL	NEXT_LINE				; -> MAIN.LINE_BUF (CR stripped, NUL-terminated)
+	; gopher terminator? a line that is exactly "."
+	LD		HL, MAIN.LINE_BUF
+	LD		A, (HL)
+	CP		'.'
+	JR		NZ, .count
 	INC		HL
-	LD		(doc_lines), HL
-	LD		C, 0
-	JR		.l
-.tail
-	LD		A, C
+	LD		A, (HL)
 	OR		A
-	RET		Z
+	JR		NZ, .count				; ".." etc. -> a real line, not the terminator
+	LD		A, 1
+	LD		(doc_complete), A		; LINE_BUF == "." -> document fully received
+	RET
+.count
 	LD		HL, (doc_lines)
 	INC		HL
 	LD		(doc_lines), HL
-	RET
+	JR		.l
 
 	ENDMODULE
