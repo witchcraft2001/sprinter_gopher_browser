@@ -5,18 +5,18 @@
 ; GetMem 16 KB pages. The ISA window and a document page time-share WIN3
 ; (0xC000): never both at once.
 ;
-; Page mapping: DSS GetMem (#3D) returns a block HANDLE, not a physical page.
-; At alloc time we resolve the block's physical page numbers via BIOS EMM_FN5
-; (#C5: A=handle, HL=dest -> writes phys page bytes, #FF-terminated, B=count) and
-; cache them in doc_phys[]. Mapping a page into WIN3 is then a single
-; `OUT (PAGE3=#E2), phys` (MAP_PAGE) - no per-switch DSS dispatch. This is the
-; loader/CD-driver idiom, proven on MAME and real hardware.
+; Page mapping: DSS GetMem (#3D) gives a block HANDLE; at alloc time BIOS EMM_FN5
+; (#C5: A=handle, HL=dest → physical page bytes, #FF-terminated) resolves it into
+; doc_phys[]. MAP_PAGE then maps a page with a single OUT (PAGE3=#E2), phys.
+; RD_BYTE re-OUTs every byte (cheap), so a DSS/BIOS print that clobbers WIN3
+; between bytes is harmless.
 ;
-; The reader walks bytes sequentially, re-mapping WIN3 on every RD_BYTE (the OUT
-; is cheap), so a TERM/DSS/BIOS print between bytes that clobbers WIN3 is
-; harmless. Each visible line is still copied into LINE_BUF (WIN2) before any
-; DSS/BIOS call. Position is (page index, offset 0..0x4000) - no 24-bit math.
-; Cap is DOC_MAX_PAGES (256 KB); past that the document is truncated (doc_trunc).
+; Line addressing: SEEK_LINE is RELATIVE to a one-entry cache (sc_line + its
+; page/offset) - it steps forward (SKIP_LINE) or backward (PREV_LINE) from the
+; cached line, never re-scanning from the start. Consecutive seeks to nearby
+; lines (the navigation pattern) are O(1). COUNT_LINES does one scan at load to
+; get the total line count (for bounds). Position is (page,offset) - no 24-bit
+; math. Cap DOC_MAX_PAGES (256 KB); beyond it the document is truncated.
 ; ======================================================
 
 DOC_MAX_PAGES	EQU 16
@@ -26,15 +26,18 @@ DOC_W3			EQU 0xC000
 	MODULE DOC
 
 ; ---- state (lives in the WIN1 load image, mutated at runtime) ----
-doc_blocks	DS DOC_MAX_PAGES, 0xFF	; GetMem block handle per logical page (0xFF=none, for FreeMem)
-doc_phys	DS DOC_MAX_PAGES, 0		; resolved physical page byte per logical page (-> PAGE3)
+doc_blocks	DS DOC_MAX_PAGES, 0xFF	; GetMem block handle per logical page (0xFF=none)
+doc_phys	DS DOC_MAX_PAGES, 0		; resolved physical page byte per logical page
 doc_npages	DB 0					; pages allocated
 doc_trunc	DB 0					; set if the document overflowed the cap
 doc_wpage	DB 0					; current write page index
 doc_woff	DW 0					; write offset within write page (0..0x4000)
 doc_lines	DW 0					; total line count (set by COUNT_LINES)
-doc_rpage	DB 0					; read cursor page index
-doc_roff	DW 0					; read cursor offset within page
+doc_rpage	DB 0					; live read cursor page index
+doc_roff	DW 0					; live read cursor offset within page
+sc_line		DW 0					; seek cache: a known line number ...
+sc_page		DB 0					; ... its page ...
+sc_off		DW 0					; ... and offset (start of line sc_line)
 
 ; ------------------------------------------------------
 ; RESET - free every allocated page and clear all state.
@@ -65,16 +68,18 @@ RESET
 	LD		(doc_trunc), A
 	LD		(doc_wpage), A
 	LD		(doc_rpage), A
+	LD		(sc_page), A
 	LD		HL, 0
 	LD		(doc_woff), HL
 	LD		(doc_roff), HL
 	LD		(doc_lines), HL
+	LD		(sc_line), HL
+	LD		(sc_off), HL
 	RET
 
 ; ------------------------------------------------------
-; MAP_PAGE - map logical page A into WIN3 by writing its cached physical page
-; byte to the PAGE3 MMU port (#E2). One OUT, no syscall. Preserves BC, DE, HL.
-; Valid only with ISA closed (normal RAM mapping); doc pages and ISA take turns.
+; MAP_PAGE - map logical page A into WIN3 via OUT of its cached physical page to
+; the PAGE3 MMU port (#E2). One OUT, no syscall. Preserves BC, DE, HL.
 ; ------------------------------------------------------
 MAP_PAGE
 	PUSH	BC
@@ -118,19 +123,18 @@ APPEND
 	SBC		HL, DE					; HL = space left in current page
 	LD		A, H
 	OR		L
-	JR		NZ, .haspace			; current page has room
+	JR		NZ, .haspace
 .grow
 	CALL	.new_page
 	JR		C, .dropall
 	LD		HL, DOC_PAGE_SIZE
 .haspace
-	; n = min(space=HL, len=.len)
 	LD		BC, (.len)
 	PUSH	HL
 	OR		A
 	SBC		HL, BC					; space - len; CF=1 if space < len
 	POP		HL
-	JR		NC, .n_is_len			; space >= len -> n = len
+	JR		NC, .n_is_len
 	LD		C, L					; n = space
 	LD		B, H
 	JR		.have_n
@@ -144,10 +148,10 @@ APPEND
 	ADD		HL, DE
 	EX		DE, HL					; DE = dest in WIN3
 	LD		HL, (.src)
-	PUSH	BC						; save n
+	PUSH	BC
 	LDIR
-	POP		BC						; BC = n
-	LD		(.src), HL				; src advanced past copied bytes
+	POP		BC
+	LD		(.src), HL
 	LD		HL, (doc_woff)
 	ADD		HL, BC
 	LD		(doc_woff), HL
@@ -160,7 +164,6 @@ APPEND
 	OR		A
 	RET
 
-; allocate one more page; CF=1 (and doc_trunc set) if cap reached / alloc fails.
 .new_page
 	LD		A, (doc_npages)
 	CP		DOC_MAX_PAGES
@@ -172,12 +175,11 @@ APPEND
 	LD		D, A					; D = block handle
 	CALL	.slot_addr				; HL = &doc_blocks[npages]
 	LD		(HL), D
-	; resolve the block's physical page list into doc_phys[npages] (#FF-terminated)
 	CALL	.phys_addr				; HL = &doc_phys[npages]
 	LD		A, D					; A = block handle
 	LD		C, BIOS_EMM_FN5
 	RST		BIOS
-	JR		C, .np_freefail			; cannot resolve -> free and fail
+	JR		C, .np_freefail
 	LD		A, (doc_npages)
 	INC		A
 	LD		(doc_npages), A
@@ -200,11 +202,9 @@ APPEND
 	LD		(doc_trunc), A
 	SCF
 	RET
-; HL = &doc_blocks[doc_npages]
 .slot_addr
 	LD		HL, doc_blocks
 	JR		.idx
-; HL = &doc_phys[doc_npages]
 .phys_addr
 	LD		HL, doc_phys
 .idx
@@ -220,8 +220,7 @@ APPEND
 
 ; ------------------------------------------------------
 ; AT_END - CF=1 if the read cursor has reached the write cursor (no more data).
-; Preserves BC, DE, HL (NEXT_LINE keeps its LINE_BUF write pointer in HL across
-; this call, so AT_END must NOT clobber HL). Trashes A.
+; Preserves BC, DE, HL (callers keep pointers in HL across this). Trashes A.
 ; ------------------------------------------------------
 AT_END
 	PUSH	HL
@@ -249,8 +248,7 @@ AT_END
 
 ; ------------------------------------------------------
 ; RD_BYTE - read the byte at the read cursor, advance it. Out: A=byte.
-; Re-maps the read page into WIN3 every call (cheap OUT), so it stays correct
-; even after a DSS/BIOS print clobbered WIN3. Preserves BC, DE, HL.
+; Re-maps the read page into WIN3 every call. Preserves BC, DE, HL.
 ; ------------------------------------------------------
 RD_BYTE
 	PUSH	BC
@@ -283,20 +281,135 @@ RD_BYTE
 .rb		DB 0
 
 ; ------------------------------------------------------
-; SEEK_LINE - position the read cursor at the start of line BC (0-based).
+; Cursor +/- one byte (page-aware), and read-without-advance. Internal helpers
+; for backward scanning. They mutate doc_rpage/doc_roff; trash A, HL.
 ; ------------------------------------------------------
-SEEK_LINE
-	XOR		A
+INC_RPOS
+	LD		HL, (doc_roff)
+	INC		HL
+	LD		A, H
+	CP		0x40
+	JR		NZ, .s
+	LD		A, (doc_rpage)
+	INC		A
 	LD		(doc_rpage), A
 	LD		HL, 0
-	LD		(doc_roff), HL
 .s
-	LD		A, B
-	OR		C
-	RET		Z
+	LD		(doc_roff), HL
+	RET
+
+; cursor -= 1. CF=1 if it was already at (0,0).
+DEC_RPOS
+	LD		HL, (doc_roff)
+	LD		A, H
+	OR		L
+	JR		NZ, .deco
+	LD		A, (doc_rpage)
+	OR		A
+	JR		Z, .uf
+	DEC		A
+	LD		(doc_rpage), A
+	LD		HL, 0x3FFF
+	LD		(doc_roff), HL
+	OR		A
+	RET
+.deco
+	DEC		HL
+	LD		(doc_roff), HL
+	OR		A
+	RET
+.uf
+	SCF
+	RET
+
+; read byte at cursor without advancing. A=byte. Trashes HL, DE.
+RD_CUR
+	LD		A, (doc_rpage)
+	CALL	MAP_PAGE
+	LD		HL, (doc_roff)
+	LD		DE, DOC_W3
+	ADD		HL, DE
+	LD		A, (HL)
+	RET
+
+; ------------------------------------------------------
+; PREV_LINE - move the read cursor from a line start back to the previous line
+; start (no-op at the document start). Preserves BC, DE, HL.
+; ------------------------------------------------------
+PREV_LINE
+	PUSH	BC
+	PUSH	DE
+	PUSH	HL
+	CALL	.iszero					; at (0,0)?
+	JR		Z, .ret
+	CALL	DEC_RPOS				; -> cur-1 (LF terminating the previous line)
+	CALL	.iszero
+	JR		Z, .ret					; previous line is line 0 (starts at 0)
+	CALL	DEC_RPOS				; -> cur-2
+.scan
+	CALL	.iszero
+	JR		Z, .ret					; reached start -> line 0 start
+	CALL	RD_CUR
+	CP		10
+	JR		Z, .lf
+	CALL	DEC_RPOS
+	JR		.scan
+.lf
+	CALL	INC_RPOS				; line starts right after the LF
+.ret
+	POP		HL
+	POP		DE
+	POP		BC
+	RET
+; ZF=1 if cursor == (page 0, offset 0). Trashes A, HL.
+.iszero
+	LD		HL, (doc_roff)
+	LD		A, (doc_rpage)
+	OR		H
+	OR		L
+	RET
+
+; ------------------------------------------------------
+; SEEK_LINE - position the read cursor at the start of line BC (0-based),
+; relative to the seek cache (steps forward/backward from the nearest cached
+; line; consecutive nearby seeks are O(1)). Updates the cache to line BC.
+; ------------------------------------------------------
+SEEK_LINE
+	LD		A, (sc_page)
+	LD		(doc_rpage), A
+	LD		HL, (sc_off)
+	LD		(doc_roff), HL
+	LD		HL, BC
+	LD		DE, (sc_line)
+	OR		A
+	SBC		HL, DE					; HL = n - sc_line
+	JR		Z, .done
+	JR		C, .back
+.fwd
+	LD		A, H
+	OR		L
+	JR		Z, .done
 	CALL	SKIP_LINE
-	DEC		BC
-	JR		.s
+	DEC		HL
+	JR		.fwd
+.back
+	LD		HL, (sc_line)
+	OR		A
+	SBC		HL, BC					; HL = sc_line - n (count back)
+.bk
+	LD		A, H
+	OR		L
+	JR		Z, .done
+	CALL	PREV_LINE
+	DEC		HL
+	JR		.bk
+.done
+	LD		(sc_line), BC
+	LD		A, (doc_rpage)
+	LD		(sc_page), A
+	LD		HL, (doc_roff)
+	LD		(sc_off), HL
+	RET
 
 ; advance the read cursor past one line (to the start of the next).
 SKIP_LINE
@@ -339,8 +452,8 @@ NEXT_LINE
 .sb		DB 0
 
 ; ------------------------------------------------------
-; COUNT_LINES - scan the whole document, set doc_lines (counts a trailing
-; partial line with no terminating LF).
+; COUNT_LINES - one scan over the document to set doc_lines (counts a trailing
+; partial line with no terminating LF). Does not touch the seek cache.
 ; ------------------------------------------------------
 COUNT_LINES
 	XOR		A

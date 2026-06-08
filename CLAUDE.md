@@ -110,7 +110,15 @@ shutdown-on-exit (below). Awaiting a re-test.
   cache/SetWin3 reasoning was wrong. `EMM_FN4 #C4` is dead RTL `pagemem.asm`
   code; we use `#C5`.) Position tracked as (page,offset) pairs (no 24-bit math).
   `RESET`, `APPEND` (STAGE→pages, maps WIN3 + `LDIR`), page-aware reader
-  (`SEEK_LINE`/`NEXT_LINE`/`RD_BYTE`/`AT_END`), `COUNT_LINES`.
+  (`SEEK_LINE`/`NEXT_LINE`/`RD_BYTE`/`AT_END`/`PREV_LINE`), `COUNT_LINES`.
+  **`SEEK_LINE` is RELATIVE, not from-start.** It steps from a one-entry cache
+  (`sc_line`+page+offset) — forward via `SKIP_LINE`, backward via `PREV_LINE`
+  (page-aware backward byte scan) — never re-scanning from line 0. Consecutive
+  seeks to nearby lines (the nav pattern) are O(1); this fixed the
+  slower-and-slower / hang on held arrows and the cursor "vanishing" on far
+  pages (both were the old O(n)-per-keypress from-start scan). `COUNT_LINES`
+  still does one scan at load to set `doc_lines` (total — for a future
+  position/progress indicator) — that's the only full scan, amortised by fetch.
   **`AT_END` preserves HL/DE** — `NEXT_LINE` keeps its `LINE_BUF` write pointer in
   HL across the `AT_END` call; the original `AT_END` clobbered HL, so every copied
   byte went to a junk address and `LINE_BUF` stayed empty (this — NOT the memory
@@ -127,8 +135,9 @@ shutdown-on-exit (below). Awaiting a re-test.
   in place via BIOS `Set_Place`+`Print_Atr` (`RECOLOR_ROW`, no text re-read — the
   selected row's type is cached in `sel_type` for correct de-highlight), or, at a
   viewport edge, hardware-scroll the region (DSS `Scroll #55`, `SCROLL_VIEW`) and
-  draw only the one newly exposed row (`DRAW_NEW_SEL_ROW`). Page jumps (Left/Right)
-  full-redraw via `RENDER_VIEWPORT` (which re-caches `sel_type`).
+  draw only the one newly exposed row (`DRAW_NEW_SEL_ROW`). Page jumps
+  (PgUp/PgDn, also Left/Right) full-redraw via `RENDER_VIEWPORT` (re-caches
+  `sel_type`). Key codes (positional, in D): PgUp `#59`, PgDn `#53`.
   Enter follows `0`/`1` links (NET connect/send/recv into a fresh doc); other
   types report "not supported yet". Backspace = back. Built-in **home** menu
   (`WELCOME_DOC`, gopher-format with real links) loaded at startup with no
@@ -153,6 +162,22 @@ shutdown-on-exit (below). Awaiting a re-test.
   a CF-returning `CHECK_NET_UP` instead of `WCOMMON.REQUIRE_NET_UP` (which exits).
   **Bring-up sped up:** `NET.INIT` runs once (`net_inited` flag) and is reused
   for every subsequent `TCP.OPEN`, so only the first fetch pays the ~30 s cost.
+- **Link stability (mirrors the kit's wget) — fixed flaky "init/Send failed".**
+  `NET.INIT` no longer calls `ISA.ISA_RESET` (it reset the card and broke the ESP
+  session NETUP set up — the main cause); it drains stale UART bytes
+  (`UART_EMPTY_RS`) and recovers a stalled first AT (`ESP_RESET`+re-init, retry).
+  `NET.CONNECT` preps the socket (RX-resume, `TCP.CLOSE` stale, drain) and
+  **retries `TCP.OPEN` once** after a settle. `NET.SEND` uses
+  `TCP.SEND_BUFFER_NO_WAIT`. **RTS/CTS flow control during the transfer:**
+  `RECV_LOOP` raises RTS (`NET.RX_RESUME` → `UART_RX_PAUSE/RESUME`, TL16C550 AFE)
+  before each `TCP.RECEIVE` and **drops it during the slow append/redraw**, so the
+  ESP holds its TX and the UART FIFO never overruns. `SETUP_UART_FLOW` (ESP side)
+  is set in `INIT`.
+- **Download progress** on the status bar: `SHOW_PROGRESS` shows the running
+  downloaded size ("Loading N bytes" < 1 KB, else "Loading N KB"; `UTIL.UTOA`
+  for the decimal). Gopher has no content-length, so it's amount, not a percent.
+  `doc_lines` (total, from `COUNT_LINES`) is available for a future scroll
+  position indicator.
 
 Next: **Phase 3 polish / Phase 4** —
 1. Type-7 **search** input (line editor → selector+TAB+query) and **binary

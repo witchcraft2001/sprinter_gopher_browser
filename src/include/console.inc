@@ -36,7 +36,7 @@ WIN2_BASE			EQU 0x8000
 STAGE				EQU 0x8000			; TCP receive staging buffer
 STAGE_SIZE			EQU 2048
 REQ_BUF				EQU 0x8A00			; outgoing selector + CRLF
-HIST_DATA			EQU 0x8C00			; history record array
+HIST_DATA			EQU 0x8C00			; history record array (ends ~0x9D60)
 ; LINE_BUF lives in WIN1 (the code image), NOT this WIN2 page: DSS PChars prints
 ; a row from it, and printing a source string out of the WIN2 page renders
 ; garbage (header/status print fine from WIN1). Defined as MAIN.LINE_BUF.
@@ -56,5 +56,7 @@ KEY_UP				EQU 0x58			; in D
 KEY_DOWN			EQU 0x52			; in D
 KEY_LEFT			EQU 0x54			; in D
 KEY_RIGHT			EQU 0x56			; in D
+KEY_PGUP			EQU 0x59			; in D
+KEY_PGDN			EQU 0x53			; in D
 
 	ENDIF

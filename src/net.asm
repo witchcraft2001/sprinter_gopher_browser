@@ -8,11 +8,14 @@
 
 	IFDEF BACKEND_ESP
 
-; Bring the link up. Out: CF=0 ok, CF=1 fail (A=ESP result code).
-; Missing card or "NETUP not run" are reported and the program exits via the
-; kit's own handlers (WIFI.UART_FIND CF / WCOMMON.REQUIRE_NET_UP).
+TCP_OPEN_RETRY_DELAY	EQU 500			; ms settle before the second TCP.OPEN attempt
+
+; Bring the link up once. Out: CF=0 ok, CF=1 fail (A=ESP result code).
+; Mirrors the kit's wget init (NO ISA_RESET - that resets the card and breaks the
+; ESP session NETUP set up; it was the main cause of flaky "init failed"). Drains
+; stale UART bytes, recovers a flaky first AT, and enables hardware RTS/CTS flow
+; control (SETUP_UART_FLOW) so the ESP holds its TX while we do slow work.
 INIT
-	CALL	ISA.ISA_RESET
 	CALL	WIFI.UART_FIND
 	RET		C
 	CALL	CHECK_NET_UP				; CF=1 if NETUP not run (no program exit)
@@ -20,8 +23,9 @@ INIT
 	CALL	NETCFG.LOAD
 	CALL	NETCFG.APPLY_UART_BAUD
 	CALL	WIFI.UART_INIT
+	CALL	WIFI.UART_EMPTY_RS			; drop stale boot / +IPD bytes before talking
 	LD		HL, CMD_AT
-	CALL	TX_CMD
+	CALL	AT_RECOVER					; AT, with one ESP-reset retry if it stalls
 	RET		C
 	LD		HL, CMD_ECHO_OFF
 	CALL	TX_CMD
@@ -48,13 +52,52 @@ TX_CMD
 	SCF
 	RET
 
-; In: HL=host ASCIIZ, DE=port ASCIIZ. CF=0 connected.
-CONNECT
-	JP		TCP.OPEN
+; Send AT command HL; on failure reset the ESP + re-init the UART and retry once.
+AT_RECOVER
+	PUSH	HL
+	CALL	TX_CMD
+	POP		HL
+	RET		NC
+	CALL	WIFI.ESP_RESET
+	CALL	WIFI.UART_SET_DEFAULT_DIVISOR
+	CALL	WIFI.UART_INIT
+	CALL	WIFI.UART_EMPTY_RS
+	JP		TX_CMD
 
-; In: HL=buffer, BC=length.
+; In: HL=host ASCIIZ, DE=port ASCIIZ. CF=0 connected. Prepares the socket (drops
+; any stale connection, drains RX) and retries the open once - the first open
+; after an idle/closed socket often needs a settle, which is the "Send failed" /
+; connect flakiness.
+CONNECT
+	LD		(c_host), HL
+	LD		(c_port), DE
+	CALL	.prep
+	LD		HL, (c_host)
+	LD		DE, (c_port)
+	CALL	TCP.OPEN
+	RET		NC
+	CALL	.prep
+	LD		HL, TCP_OPEN_RETRY_DELAY
+	CALL	UTIL.DELAY
+	LD		HL, CMD_AT
+	CALL	TX_CMD
+	LD		HL, CMD_CIPMUX_0
+	CALL	TX_CMD
+	LD		HL, (c_host)
+	LD		DE, (c_port)
+	JP		TCP.OPEN
+.prep
+	CALL	WIFI.UART_RX_RESUME
+	CALL	TCP.CLOSE					; drop any stale single-connection socket
+	CALL	WIFI.UART_EMPTY_RS
+	RET
+c_host	DW 0
+c_port	DW 0
+
+; In: HL=buffer, BC=length. Send without waiting for "SEND OK" (a fast server can
+; start replying before it; RECEIVE scans past the prompt/SEND OK itself).
 SEND
-	JP		TCP.SEND_BUFFER
+	JP		TCP.SEND_BUFFER_NO_WAIT
 
 ; In: HL=dest, BC=max, DE=timeout(ms). Out: BC=stored bytes, CF=1 on end/error.
 RECV
@@ -62,6 +105,13 @@ RECV
 
 CLOSE
 	JP		TCP.CLOSE
+
+; Hardware RX flow control (RTS via the TL16C550 AFE). Drop RTS around slow work
+; so the ESP holds its TX (no UART FIFO overrun); raise it before receiving.
+RX_PAUSE
+	JP		WIFI.UART_RX_PAUSE
+RX_RESUME
+	JP		WIFI.UART_RX_RESUME
 
 ; Hand the ESP back in AT command mode for the next program: close any lingering
 ; socket (AT+CIPCLOSE) and re-assert echo-off. Best-effort; ignores errors. Call

@@ -109,6 +109,10 @@ MAINLOOP
 	JP		Z, ON_PGUP
 	CP		KEY_RIGHT
 	JP		Z, ON_PGDN
+	CP		KEY_PGUP
+	JP		Z, ON_PGUP
+	CP		KEY_PGDN
+	JP		Z, ON_PGDN
 	JR		MAINLOOP
 
 QUIT
@@ -533,24 +537,105 @@ DO_FETCH
 
 ; Receive blocks into STAGE and append to the document until the connection
 ; closes / times out, or the document hits its page cap.
+; Receive into STAGE and append to the document. Brackets the slow append/redraw
+; with RX pause (drops RTS so the ESP holds its TX → no UART FIFO overrun), and
+; shows the running downloaded size on the status bar.
 RECV_LOOP
+	LD		HL, 0
+	LD		(recv_lo), HL
+	LD		(recv_hi), HL			; clears recv_hi (low byte) too
 .l
 	LD		A, (DOC.doc_trunc)
 	OR		A
-	RET		NZ
+	JR		NZ, .end
+	CALL	NET.RX_RESUME			; raise RTS: let the ESP stream
 	LD		HL, STAGE
 	LD		BC, STAGE_SIZE
 	LD		DE, RECV_TIMEOUT
 	CALL	NET.RECV
-	RET		C						; closed / timeout / error
+	PUSH	AF
+	CALL	NET.RX_PAUSE			; drop RTS: ESP holds while we store + draw
+	POP		AF
+	JR		C, .end					; closed / timeout / error
 	LD		A, B
 	OR		C
-	RET		Z						; no more data
+	JR		Z, .end					; no more data
 	PUSH	BC
 	LD		HL, STAGE
 	POP		BC
+	PUSH	BC
 	CALL	DOC.APPEND
+	POP		BC
+	; recv_total (24-bit) += BC
+	LD		HL, (recv_lo)
+	ADD		HL, BC
+	LD		(recv_lo), HL
+	JR		NC, .noc
+	LD		A, (recv_hi)
+	INC		A
+	LD		(recv_hi), A
+.noc
+	CALL	SHOW_PROGRESS
 	JR		.l
+.end
+	CALL	NET.RX_RESUME			; leave RX resumed for the CLOSE handshake
+	RET
+
+; Status-bar download progress: "Loading <n> bytes" (<1 KB) or "Loading <n> KB".
+; Gopher has no content-length, so we show the downloaded amount, not a percent.
+SHOW_PROGRESS
+	LD		D, STATUS_ROW
+	LD		E, 0
+	LD		H, 1
+	LD		L, SCR_W
+	LD		B, ATTR_STATUS
+	LD		A, ' '
+	CALL	TERM.FILL
+	LD		D, STATUS_ROW
+	LD		E, 1
+	CALL	TERM.LOCATE
+	LD		HL, MSG_LOADING
+	CALL	TERM.PUTS
+	; choose bytes vs KB
+	LD		A, (recv_hi)
+	OR		A
+	JR		NZ, .kb					; >= 64 KB -> KB
+	LD		HL, (recv_lo)
+	LD		DE, 1024
+	OR		A
+	SBC		HL, DE					; lo - 1024; CF=1 if < 1 KB
+	JR		NC, .kb
+	LD		HL, (recv_lo)			; show raw bytes
+	LD		DE, NUMBUF
+	CALL	UTIL.UTOA
+	LD		HL, SUFFIX_B
+	JR		.draw
+.kb
+	; kb = (recv_hi << 6) + (recv_lo >> 10)
+	LD		A, (recv_hi)
+	LD		L, A
+	LD		H, 0
+	ADD		HL, HL
+	ADD		HL, HL
+	ADD		HL, HL
+	ADD		HL, HL
+	ADD		HL, HL
+	ADD		HL, HL					; HL = recv_hi * 64
+	LD		A, (recv_lo + 1)		; recv_lo >> 8
+	SRL		A
+	SRL		A						; >> 10 total (0..63)
+	LD		E, A
+	LD		D, 0
+	ADD		HL, DE					; HL = KB
+	LD		DE, NUMBUF
+	CALL	UTIL.UTOA
+	LD		HL, SUFFIX_KB
+.draw
+	LD		(prog_suffix), HL
+	LD		HL, NUMBUF
+	CALL	TERM.PUTS
+	LD		HL, (prog_suffix)
+	JP		TERM.PUTS
 
 ; Build the gopher request (SEL_CUR + CRLF) in REQ_BUF. Out: HL=REQ_BUF, BC=len.
 BUILD_REQ
@@ -1048,6 +1133,10 @@ cur_kind		DB 0					; 0=home, 1=network
 DOC_TYPE_CUR	DB '1'
 net_inited		DB 0
 last_err		DW 0
+recv_lo			DW 0					; bytes received this fetch (low 16)
+recv_hi			DB 0					; bytes received this fetch (high 8) -> 24-bit
+prog_suffix		DW 0					; " bytes"/" KB" pointer during progress draw
+NUMBUF			DS 8, 0					; UTIL.UTOA decimal scratch
 EMPTYSTR		DB 0
 
 HOST_CUR		DS 64, 0
@@ -1064,8 +1153,11 @@ LINE_BUF_END	EQU LINE_BUF + 510
 ; Text.
 ; ------------------------------------------------------
 MSG_TITLE		DB "Moon Rabbit - gopher browser for Sprinter", 0
-MSG_STATUS		DB "Up/Down move  Left/Right page  Enter open  Backspace back  Esc quit", 0
+MSG_STATUS		DB "Up/Down move  PgUp/PgDn page  Enter open  Backspace back  Esc quit", 0
 MSG_FETCHING	DB "Fetching...", 0
+MSG_LOADING		DB "Loading ", 0
+SUFFIX_B		DB " bytes", 0
+SUFFIX_KB		DB " KB", 0
 MSG_UNSUPPORTED	DB "That item type is not supported yet.", 0
 MSG_MEM_ERR		DB "Cannot allocate work page.", 0
 ERR_INIT		DB "Network init failed - run NETUP first.", 0
