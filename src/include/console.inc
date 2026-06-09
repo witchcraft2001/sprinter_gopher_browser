@@ -42,7 +42,11 @@ WIN2_BASE			EQU 0x8000
 STAGE				EQU 0x8000			; TCP receive staging buffer
 STAGE_SIZE			EQU 2048
 REQ_BUF				EQU 0x8A00			; outgoing selector + CRLF
-HIST_DATA			EQU 0x8C00			; history record array (ends ~0x9D60)
+HIST_DATA			EQU 0x8C00			; history record array (ends ~0x97F0)
+; GOPHER.CFG is streamed through STAGE; its line accumulator lives up here in the
+; WIN2 scratch page (code is in WIN1 so it can never reach this). Only [settings]
+; are kept (a tiny WIN1 pool); ext->program lookups re-scan the file on demand.
+CFG_LINE			EQU 0x9800			; config line accumulator (256 B)
 ; LINE_BUF lives in WIN1 (the code image), NOT this WIN2 page: DSS PChars prints
 ; a row from it, and printing a source string out of the WIN2 page renders
 ; garbage (header/status print fine from WIN1). Defined as MAIN.LINE_BUF.
@@ -64,5 +68,8 @@ KEY_LEFT			EQU 0x54			; in D
 KEY_RIGHT			EQU 0x56			; in D
 KEY_PGUP			EQU 0x59			; in D
 KEY_PGDN			EQU 0x53			; in D
+KEY_HOME			EQU 0x57			; in D
+KEY_END				EQU 0x51			; in D
+KEY_F10				EQU 0x44			; in D (DSS XLAT: F1=#3B..F12=#46)
 
 	ENDIF

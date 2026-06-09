@@ -89,6 +89,9 @@ START
 	CALL	INIT_RUNTIME_PAGE			; map a fresh WIN2 page for the scratch buffers
 	JP		C, MEM_ERROR
 	CALL	INIT_PATHS					; resolve the EXE dir for DOWNLOAD\ (AppInfo #47)
+	LD		HL, CLOCK_TICK				; let the kit tick the clock during its blocking
+	LD		(WCOMMON.IDLE_CB), HL		; waits (INIT/connect), where ISA is briefly closed
+	CALL	CFG.LOAD					; read GOPHER.CFG (viewers + settings); ignore if absent
 	CALL	DOC.RESET
 	CALL	TERM.CLS
 	CALL	LOAD_HOME				; sets DOC_TITLE before the header is drawn
@@ -100,6 +103,7 @@ START
 	CALL	SHOW_DOC_STATUS			; key help, or a "run NETUP" warning if no link
 
 MAINLOOP
+	CALL	CLOCK_TICK				; refresh HH:MM:SS in the header (only on change)
 	CALL	KBD.SCAN
 	JR		Z, MAINLOOP
 
@@ -123,6 +127,12 @@ MAINLOOP
 	JP		Z, ON_PGUP
 	CP		KEY_PGDN
 	JP		Z, ON_PGDN
+	CP		KEY_HOME
+	JP		Z, ON_HOME
+	CP		KEY_END
+	JP		Z, ON_END
+	CP		KEY_F10
+	JP		Z, CONFIRM_QUIT			; F10 = quit (like Esc)
 	JR		MAINLOOP
 
 ; Esc at the menu asks for confirmation (so a stray Esc doesn't drop the user out
@@ -133,6 +143,7 @@ CONFIRM_QUIT
 	CALL	SET_STATUS
 	CALL	INP_WAIT_RELEASE
 .poll
+	CALL	CLOCK_TICK				; keep the clock live while the prompt is up
 	CALL	KBD.SCAN
 	JR		Z, .poll
 	CP		'Y'
@@ -167,8 +178,28 @@ INIT_RUNTIME_PAGE
 	LD		C, DSS_GETMEM
 	RST		DSS
 	RET		C
+	LD		(win2_block), A			; remember the handle to re-map after Dss.Exec
 	LD		B, 0
 	LD		C, DSS_SETWIN2
+	RST		DSS
+	RET
+
+; Re-map our WIN2 scratch page (after a child program may have remapped WIN2).
+REMAP_WIN2
+	LD		A, (win2_block)
+	LD		B, 0
+	LD		C, DSS_SETWIN2
+	RST		DSS
+	RET
+
+; Re-enter the EXE directory (cwd may have changed, e.g. a launched child CHDIR'd),
+; so relative paths (GOPHER.CFG, DOWNLOAD\) keep resolving next to the EXE.
+CHDIR_EXE
+	LD		A, (EXE_DIR)
+	OR		A
+	RET		Z						; EXE dir unknown (AppInfo failed) -> leave cwd
+	LD		HL, EXE_DIR
+	LD		C, DSS_CHDIR
 	RST		DSS
 	RET
 
@@ -469,6 +500,25 @@ REDRAW
 	CALL	RENDER_VIEWPORT
 	JP		MAINLOOP
 
+; Home: jump to the start of the document.
+ON_HOME
+	LD		HL, 0
+	LD		(sel_index), HL
+	LD		(top_index), HL
+	JP		REDRAW
+
+; End: jump to the last line (cursor on it, last page shown).
+ON_END
+	LD		HL, (DOC.doc_lines)
+	LD		A, H
+	OR		L
+	JP		Z, MAINLOOP				; empty doc
+	DEC		HL
+	LD		(sel_index), HL			; sel = lines - 1
+	CALL	MAX_TOP					; HL = max(0, lines - VIEW_ROWS)
+	LD		(top_index), HL
+	JP		REDRAW
+
 ; Header + full viewport repaint (after a page change).
 REDRAW_FULL
 	CALL	DRAW_HEADER
@@ -609,6 +659,7 @@ ON_ENTER
 	CALL	DOWNLOAD				; CF=1 on error (last_err set)
 	JR		C, .dlfail
 	CALL	SHOW_SAVED
+	CALL	MAYBE_OPEN_DOWNLOAD		; offer/launch a viewer per GOPHER.CFG
 	JP		MAINLOOP
 .dlfail
 	CALL	SHOW_ERROR
@@ -909,6 +960,7 @@ RECV_LOOP
 	LD		HL, STAGE
 	CALL	DOC.APPEND				; BC = bytes; doc size grows with it
 	CALL	SHOW_PROGRESS			; reads the size from the doc itself
+	CALL	CLOCK_TICK				; ISA is closed here (post RX_PAUSE) - DSS is safe
 	JR		.l
 .end
 	CALL	NET.RX_RESUME			; leave RX resumed for the CLOSE handshake
@@ -1153,6 +1205,7 @@ DL_RECV_LOOP
 	JR		C, .werr				; disk write failed -> abort
 	CALL	DL_ADD					; recv_lo/recv_hi += BC
 	CALL	DL_PROGRESS
+	CALL	CLOCK_TICK				; ISA closed here (post RX_PAUSE) - DSS is safe
 	JR		.l
 .end
 	CALL	NET.RX_RESUME			; resume for the CLOSE handshake
@@ -1194,6 +1247,138 @@ SHOW_SAVED
 	CALL	TERM.PUTS
 	LD		HL, DL_PATH
 	JP		TERM.PUTS
+
+; After a successful download: if GOPHER.CFG maps the file's extension to a
+; program, optionally ask the user (unless the "skip_ask_for_exec" setting is on)
+; and launch it via Dss.Exec with %file% = the saved file's path.
+MAYBE_OPEN_DOWNLOAD
+	CALL	DL_EXT_PTR				; HL = extension of DL_NAME (empty if none)
+	CALL	CFG.VIEWER_FOR_EXT		; HL=ext -> DE=command template, CF=1 if none
+	RET		C						; no association -> leave the "Saved ..." status
+	LD		(open_tpl), DE
+	CALL	SKIP_ASK				; CF=1 -> launch without asking
+	JR		C, .launch
+	CALL	CONFIRM_OPEN			; CF=1 -> user declined
+	JR		NC, .launch
+	CALL	SHOW_DOC_STATUS			; restore the status line after the prompt
+	RET
+.launch
+	CALL	BUILD_FILE_ABS			; FILE_ABS = absolute path of the saved file
+	LD		HL, (open_tpl)
+	LD		DE, FILE_ABS
+	CALL	CFG.BUILD_CMD			; HL = CMD_BUF ("%file%" expanded): "prog arg"
+	CALL	EXEC_PROGRAM			; run the viewer directly (full EXE path), like FN
+	PUSH	AF						; CF = launch error
+	CALL	REDRAW_FULL				; the viewer took over the screen - repaint
+	POP		AF
+	JR		C, .err
+	CALL	SHOW_DOC_STATUS
+	RET
+.err
+	LD		HL, MSG_EXEC_FAIL
+	JP		SET_STATUS
+
+; HL -> the extension of DL_NAME (the part after the last '.'); empty if none.
+DL_EXT_PTR
+	LD		HL, DL_NAME
+	LD		BC, 0					; BC = ext pointer (after the last '.'), 0 = none
+.l
+	LD		A, (HL)
+	OR		A
+	JR		Z, .done
+	CP		'.'
+	JR		NZ, .next
+	LD		B, H					; ext candidate = char after this '.'
+	LD		C, L
+	INC		BC
+.next
+	INC		HL
+	JR		.l
+.done
+	LD		A, B
+	OR		C
+	JR		Z, .noext
+	LD		H, B
+	LD		L, C
+	RET
+.noext
+	LD		HL, EMPTYSTR
+	RET
+
+; Build FILE_ABS = <EXE dir> + DL_PATH (absolute path of the saved file). If the
+; EXE dir is unknown (AppInfo failed) EXE_DIR is empty and the path stays relative.
+BUILD_FILE_ABS
+	LD		HL, EXE_DIR
+	LD		DE, FILE_ABS
+	CALL	COPYZ					; copy dir (no NUL); DE -> end
+	LD		HL, DL_PATH
+	CALL	COPYZ					; append "DOWNLOAD\<name>"
+	XOR		A
+	LD		(DE), A
+	RET
+
+; CF=1 if the "skip_ask_for_exec" setting is truthy (launch without asking),
+; CF=0 if absent/false (ask the user first).
+SKIP_ASK
+	LD		HL, KEY_SKIPASK
+	CALL	CFG.SETTING				; DE = value, CF=1 if not set
+	JR		C, .ask					; not set -> ask
+	LD		A, (DE)					; truthy if it starts 1/y/Y/t/T
+	CP		'1'
+	JR		Z, .skip
+	CP		'y'
+	JR		Z, .skip
+	CP		'Y'
+	JR		Z, .skip
+	CP		't'
+	JR		Z, .skip
+	CP		'T'
+	JR		Z, .skip
+.ask
+	OR		A						; CF=0 -> ask the user
+	RET
+.skip
+	SCF								; CF=1 -> launch without asking
+	RET
+
+; Ask whether to open the file. Out: CF=0 if yes (Y/y), CF=1 otherwise.
+CONFIRM_OPEN
+	LD		HL, MSG_OPEN_ASK
+	CALL	SET_STATUS
+	CALL	INP_WAIT_RELEASE
+.poll
+	CALL	CLOCK_TICK
+	CALL	KBD.SCAN
+	JR		Z, .poll
+	CP		'Y'
+	JR		Z, .yes
+	CP		'y'
+	JR		Z, .yes
+	CALL	INP_WAIT_RELEASE
+	SCF
+	RET
+.yes
+	CALL	INP_WAIT_RELEASE
+	OR		A						; CF=0
+	RET
+
+; Launch the program whose command line is in HL (program + args). Saves/restores
+; SP (Dss.Exec changes it), re-maps our WIN2 scratch page and re-asserts 80x32 text
+; on return (the child may have changed both). Out: A=exit code, CF=1 on launch
+; error (FM idiom: HL=cmdline, BC=#0040).
+EXEC_PROGRAM
+	LD		(exec_sp), SP
+	LD		BC, 0x0040				; B=0 (short name), C=#40 (Dss.Exec)
+	RST		DSS						; -> A=exit code, CF=1 error
+	LD		SP, (exec_sp)
+	PUSH	AF
+	CALL	REMAP_WIN2				; the child may have remapped WIN2
+	CALL	CHDIR_EXE				; ...and changed cwd - restore it to the EXE dir
+	LD		A, DSS_VMOD_T80			; re-assert 80x32 text mode
+	LD		C, DSS_SETVMOD
+	RST		DSS
+	POP		AF
+	RET
 
 ; Derive an 8.3 filename from the selector DL_SEL into DL_NAME, then build
 ; DL_PATH = "DOWNLOAD\<name>". Non-FAT chars are sanitised; an empty basename
@@ -1622,6 +1807,7 @@ INPUT_LINE
 .redraw
 	CALL	INP_DRAW
 .poll
+	CALL	CLOCK_TICK				; keep the clock live while typing
 	CALL	KBD.SCAN
 	JR		Z, .poll
 	CP		KEY_ENTER
@@ -1710,7 +1896,78 @@ DRAW_HEADER
 	LD		E, 1
 	CALL	TERM.LOCATE
 	LD		HL, DOC_TITLE			; current page title (clicked link / home)
+	CALL	TERM.PUTS
+	LD		A, 0xFF					; the full-row fill wiped the clock - force a redraw
+	LD		(clk_last), A
+	RET
+
+; ------------------------------------------------------
+; Clock in the header's right corner ("HH:MM:SS", cols 71..78). Called every main-
+; loop spin; reads DSS SYSTIME (#21: H=hours, L=minutes, B=seconds, decimal) and
+; only repaints when the second changes (clk_last holds the last drawn second; the
+; header redraw sets it to 0xFF to force a refresh).
+; ------------------------------------------------------
+CLOCK_TICK
+	LD		C, DSS_SYSTIME
+	RST		DSS						; H=hours, L=minutes, B=seconds
+	LD		A, H
+	LD		(clk_h), A
+	LD		A, L
+	LD		(clk_m), A
+	LD		A, B
+	LD		HL, clk_last
+	CP		(HL)
+	RET		Z						; same second -> nothing to do
+	LD		(HL), A					; remember this second
+	LD		(clk_s), A
+	; build "HH:MM:SS" in CLK_BUF
+	LD		HL, CLK_BUF
+	LD		A, (clk_h)
+	CALL	PUT2D
+	LD		(HL), ':'
+	INC		HL
+	LD		A, (clk_m)
+	CALL	PUT2D
+	LD		(HL), ':'
+	INC		HL
+	LD		A, (clk_s)
+	CALL	PUT2D
+	LD		(HL), 0
+	; paint the clock field in header colour (FILL also sets the print colour)
+	LD		D, HEADER_ROW
+	LD		E, SCR_W - 9			; col 71; leaves col 79 as a margin
+	LD		H, 1
+	LD		L, 9
+	LD		B, ATTR_HEADER
+	LD		A, ' '
+	CALL	TERM.FILL
+	LD		D, HEADER_ROW
+	LD		E, SCR_W - 9
+	CALL	TERM.LOCATE
+	LD		HL, CLK_BUF
 	JP		TERM.PUTS
+
+; A = value (0..99) -> two ASCII digits at HL; HL advanced by 2.
+PUT2D
+	LD		B, '0'
+.t
+	SUB		10
+	JR		C, .units
+	INC		B
+	JR		.t
+.units
+	ADD		A, 10 + '0'				; A back to 0..9, then to ASCII
+	LD		(HL), B					; tens
+	INC		HL
+	LD		(HL), A					; units
+	INC		HL
+	RET
+
+CLK_BUF		DB "00:00:00", 0
+clk_last	DB 0xFF
+clk_h		DB 0
+clk_m		DB 0
+clk_s		DB 0
 
 ; ------------------------------------------------------
 ; Viewport renderer (reads lines straight from the document pages).
@@ -1944,6 +2201,9 @@ cur_kind		DB 0					; 0=home, 1=network
 DOC_TYPE_CUR	DB '1'
 net_inited		DB 0
 home_fm			DB 0xFF					; open EXE file handle (from (IX-3) at START)
+win2_block		DB 0					; GetMem handle of the WIN2 scratch page
+exec_sp			DW 0					; saved SP across Dss.Exec
+open_tpl		DW 0					; viewer command template during MAYBE_OPEN
 last_err		DW 0
 recv_lo			DW 0					; bytes received this fetch (low 16)
 recv_hi			DB 0					; bytes received this fetch (high 8) -> 24-bit
@@ -1976,7 +2236,9 @@ DL_PATH			DS 32, 0				; "DOWNLOAD\<name>" (relative to the EXE dir)
 DL_DIRMK		DB "DOWNLOAD", 0		; mkdir target (relative to the EXE dir)
 DL_DIRPFX		DB "DOWNLOAD", 0x5C, 0	; per-file path prefix (backslash separator)
 EXE_DIR			DS 256, 0				; AppInfo #47 output buffer (EXE home dir)
+FILE_ABS		DS 160, 0				; absolute path of the saved file (for %file%)
 DEF_DLNAME		DB "INDEX.BIN", 0		; fallback when the selector has no basename
+KEY_SKIPASK		DB "skip_ask_for_exec", 0
 
 ; One decoded gopher row (type + TAB-split fields). MUST be in WIN1 (here in the
 ; code image), not the WIN2 scratch page: DSS PChars prints the display field
@@ -1988,7 +2250,7 @@ LINE_BUF_END	EQU LINE_BUF + 510
 ; Text.
 ; ------------------------------------------------------
 MSG_TITLE		DB "Gopher browser for Sprinter", 0
-MSG_STATUS		DB "Up/Down move  PgUp/PgDn page  Enter open  Backspace back  Esc quit", 0
+MSG_STATUS		DB "Up/Down/Home/End move  PgUp/PgDn page  Enter open  Bksp back  Esc/F10 quit", 0
 MSG_NONET		DB "Wi-Fi not up - run NETUP first (you can still browse the home page)", 0
 MSG_CONFIRM_QUIT DB "Quit?  Y = yes,  any other key = no", 0
 MSG_FETCHING	DB "Fetching...", 0
@@ -2002,6 +2264,8 @@ MSG_SEARCH		DB "Search (Enter=go  Esc=cancel): ", 0
 MSG_SAVING		DB "Saving ", 0
 MSG_SAVED		DB "Saved ", 0
 MSG_TO			DB " to ", 0
+MSG_OPEN_ASK	DB "Open in the associated program?  Y = yes,  any other key = no", 0
+MSG_EXEC_FAIL	DB "Could not launch the associated program.", 0
 MSG_MEM_ERR		DB "Cannot allocate work page.", 0
 ERR_INIT		DB "Network init failed - run NETUP first.", 0
 ERR_CONN		DB "Connect failed (check host / port / Wi-Fi).", 0
@@ -2033,6 +2297,7 @@ WELCOME_LEN		EQU WELCOME_END - WELCOME_DOC
 	INCLUDE "doc.asm"
 	INCLUDE "net.asm"
 	INCLUDE "file.asm"
+	INCLUDE "cfg.asm"
 
 	INCLUDE "netcfg_lib.asm"			; defines _NETCFG (needed by wcommon)
 	INCLUDE "wcommon.asm"

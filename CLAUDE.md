@@ -211,8 +211,21 @@ shutdown-on-exit (below). Awaiting a re-test.
    `SANITIZE_CH`, fallback `INDEX.BIN`); status shows running/final size ("Saving/
    Saved N KB to DOWNLOAD\NAME"); Esc cancels (kit `CANCELLED`); disk-full → ERR_DISK.
    `DL_RECV_LOOP` mirrors `RECV_LOOP`'s RTS flow-control bracketing, `FILE.WRITE`
-   from `STAGE` (WIN2) after `NET.RX_PAUSE` closes ISA. Still TODO: `h` (URL/`URL:`
-   links); the **confirm-to-open-externally** step below.
+   from `STAGE` (WIN2) after `NET.RX_PAUSE` closes ISA. **Open-in-viewer — DONE:**
+   after a download `MAYBE_OPEN_DOWNLOAD` takes the file's extension (`DL_EXT_PTR`),
+   `CFG.VIEWER_FOR_EXT` looks up the program; unless the `skip_ask_for_exec` setting
+   is truthy (`SKIP_ASK`) it asks (`CONFIRM_OPEN`, Y/N), then `CFG.BUILD_CMD` expands
+   `%file%`→`FILE_ABS` (`EXE_DIR`+`DOWNLOAD\name`). The viewer command (a full EXE
+   path + the file arg) is launched **directly** via **Dss.Exec `#40`** (`HL`=cmd,
+   `BC`=`#0040`, B=0), like FlexNavigator's `RunFile`. `EXEC_PROGRAM` saves/restores
+   `SP`, re-maps our WIN2 page (`REMAP_WIN2`, handle in `win2_block`), `CHDIR_EXE`
+   back to the EXE dir, and re-asserts 80x32 (`SetVMod #50 A=#03`) on return; then
+   `REDRAW_FULL`. (Confirmed working on target.) Two bugs fixed during bring-up:
+   (1) `CFG.TRIM_TRAIL` clobbered `DE` (the value pointer) → every viewer template
+   parsed EMPTY → launched an empty command; now PUSH/POPs DE. (2) Routing through
+   `SYSTEM.EXE /C` dropped into an interactive shell eating garbage - direct `#40`
+   is correct for an EXE viewer (the shell wrapper is only for `.bat`). Still TODO:
+   `h` (URL/`URL:` links).
    **Media policy (agreed):** binary/media items are **saved to a `DOWNLOAD\`
    directory** (next to the EXE) via the DSS file API (`file.asm`) — DONE; the
    browser does NOT auto-open them. Opening is **on explicit confirmation only**,
@@ -229,25 +242,38 @@ shutdown-on-exit (below). Awaiting a re-test.
    `GOPHER.EXE`. Best-effort: if `AppInfo`/`CHDIR` is unavailable (older DSS) we
    stay in the current dir. (`AppInfo B=2` = full path+name — reserved for the
    appended-home-page reader, item 6a. Buffer size: `APPINFO_BUF_SIZE`=256.)
-2a. **Config file (`GOPHER.CFG` next to the EXE) for downloads/viewers.** A small
-   text config, parsed at startup, that holds:
-   - **download directory path** — overrides the `<exedir>DOWNLOAD\` default (so the
-     user can point it at e.g. a different drive/folder); create it if missing.
-   - **type/extension → program map** — which DSS program opens which file type,
-     used by the confirm-to-open-externally step (item 2). E.g. lines like
-     `tap=TRDEMU.EXE`, `scr=VIEWER.EXE`, `gif=GIFVIEW.EXE`, plus optional defaults
-     by gopher item type (`I`, `s`, `;`, `9`). On confirm, look up the downloaded
-     file's extension (or item type), `Dss.Exec` the mapped program with the path.
-   Format: simple `key=value` per line, `#`/`;` comments, ASCIIZ; reuse the
-   NET.CFG-style parser idea. Falls back to built-in defaults (`DOWNLOAD\`, no
-   viewers) if the file is missing or a key is absent.
+2a. **Config file `GOPHER.CFG` (next to the EXE) — reading + parsing DONE
+   (`src/cfg.asm`, MODULE CFG).** INI-style with two sections separated so settings
+   and the program map don't mix: **`[settings]`** (generic `key=value`, reserved
+   for future options) and **`[viewers]`** (`ext = program %file%` — `%file%` is
+   replaced with the saved file's path at launch; program path abs or rel). `#`/`;`
+   comments, blank lines ignored; section & ext names compared case-insensitively.
+   The file is **streamed** through `STAGE` in chunks (size is NOT bounded by a
+   fixed buffer) and assembled line by line in a WIN2 accumulator (`CFG_LINE`).
+   **Only `[settings]` are kept** (a tiny WIN1 pool `ST_POOL`/`st_key`/`st_val`,
+   since they're needed throughout a run); the **`[viewers]` map is NOT kept** —
+   `CFG.VIEWER_FOR_EXT` re-scans the file **on demand** (a rare action: opening a
+   just-downloaded file) and copies just the one matching command into `CMD_TPL`.
+   This keeps persistent memory tiny and removes the earlier fixed `CFG_RAW@0xA000`
+   buffer (which was fine for space — code is WIN1, can't reach WIN2 — but an
+   arbitrary cap). `CFG.LOAD` (START) parses settings; `CFG.VIEWER_FOR_EXT`
+   (HL=ext→DE=cmd, CF), `CFG.SETTING` (HL=key→DE=val, CF), `CFG.BUILD_CMD`
+   (HL=tmpl, DE=path→`CMD_BUF`) expands every `%file%`. Sample in `data/gopher.cfg`
+   (not auto-deployed; drop next to GOPHER.EXE to use).
+   **Still TODO (the actual use):** on a finished download, look up the ext, show a
+   confirm prompt, `CFG.BUILD_CMD` + `Dss.Exec` the viewer; and consume a
+   `downloaddir` setting to override `DOWNLOAD\`.
 3. **Cancel during the network phase — DONE.** Esc (also Ctrl+Z) cancels both
    Fetching and Loading: the kit polls `WCOMMON.CHECK_CANCEL_IN_ISA` inside its
    UART/TCP/RECEIVE byte-waits and sets `WCOMMON.CANCELLED`; we clear it at fetch
    start, abort retries (`AT_RECOVER`/`CONNECT`) on cancel, and `FETCH_ERR` shows
    "Cancelled". (Note: cancel during `WIFI.UART_FIND` at the very start of INIT is
    not polled by the kit, so the first ~moment isn't cancellable — minor.)
-4. **Clock in the status bar** (DSS `SYSTIME #21`), refreshed in the main loop.
+4. **Clock in the header — DONE.** `CLOCK_TICK` (called each main-loop spin) reads
+   DSS `SYSTIME #21` (`H`=hours, `L`=minutes, `B`=seconds, decimal) and paints
+   "HH:MM:SS" in the header's right corner (cols 71-78, `ATTR_HEADER`) only when the
+   second changes (`clk_last`; `PUT2D` formats each 0-99 field). `DRAW_HEADER` sets
+   `clk_last=0xFF` so its full-row fill doesn't leave the clock blank.
 5. **Ctrl+S** — save the current document to a file (DSS file API).
 6. **Ctrl+D** — add the current document (host/port/selector + title) to bookmarks.
 6a. **Home page externalised out of the code image — DONE** (frees ~1.2 KB; the
