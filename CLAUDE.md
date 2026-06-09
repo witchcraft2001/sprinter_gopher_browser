@@ -525,6 +525,16 @@ from the two network kits under `src/lib/` so the browser is self-contained, or
 add `-I` paths to the kits. A `Makefile` should build both backends and package a
 FAT12 test image (see kits' `tools/build.sh`, `image.sh`).
 
+**Versioning.** App version is `DEFINE APP_VERSION "0.1"` in
+`src/include/app_version.inc` (bump on release; major.minor, optional patch like
+`0.1.12`). The build date/time is auto-stamped: the Makefile regenerates
+`build/buildinfo.inc` (`DEFINE BUILD_DATETIME "DD.MM.YYYY HH:MM"`) every build
+(needs `-I $(BUILD)`). Both feed `MSG_BANNER`, printed by `SHOW_BANNER` at startup
+and on exit (after CLS): `GOPHER Browser v.0.1 (…)\r\nby Dmitry Mikhalchenkov
+(SprinterTeam)`. (Don't call our file `version.inc` — the network kit ships one and
+the `-I` paths would shadow ours. `EXE_VERSION` is the DSS EXE-format version, not
+the app version.)
+
 ## 8. Conventions & gotchas
 
 - **No eZ80** — `agon-snail` is design reference only; never copy its opcodes.
