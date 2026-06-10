@@ -46,7 +46,13 @@ HIST_DATA			EQU 0x8C00			; history record array (ends ~0x97F0)
 ; GOPHER.CFG is streamed through STAGE; its line accumulator lives up here in the
 ; WIN2 scratch page (code is in WIN1 so it can never reach this). Only [settings]
 ; are kept (a tiny WIN1 pool); ext->program lookups re-scan the file on demand.
-CFG_LINE			EQU 0x9800			; config line accumulator (256 B)
+CFG_LINE			EQU 0x9800			; config line accumulator (256 B; ends 0x98FF)
+; Path/exec buffers kept in WIN2 (not WIN1) so they don't eat the tight stack
+; headroom below 0x8000. Never PChars sources - only DSS file/exec args + Z80 ops.
+EXE_DIR				EQU 0x9900			; AppInfo #47 EXE home dir (256 B)
+FILE_ABS			EQU 0x9A00			; absolute saved-file path for %file% (160 B)
+CFG_ST_POOL			EQU 0x9AA0			; kept [settings] strings (256 B)
+CFG_CMD_BUF			EQU 0x9BA0			; built Dss.Exec command line (192 B)
 ; LINE_BUF lives in WIN1 (the code image), NOT this WIN2 page: DSS PChars prints
 ; a row from it, and printing a source string out of the WIN2 page renders
 ; garbage (header/status print fine from WIN1). Defined as MAIN.LINE_BUF.

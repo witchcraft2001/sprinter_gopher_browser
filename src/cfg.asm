@@ -26,16 +26,17 @@
 ST_MAX			EQU 16					; max kept settings
 ST_POOL_SIZE	EQU 256					; bytes of kept setting strings
 LINE_MAX		EQU 256					; longest config line (== CFG_LINE region)
-EXT_MAX			EQU 16					; longest extension we match
-TPL_MAX			EQU 128					; matched viewer command template
+EXT_MAX			EQU 16					; longest extension / URL scheme we match
+TPL_MAX			EQU 128					; matched command template
 CMD_MAX			EQU 192					; built command line (Dss.Exec arg)
 
 MODE_SETTINGS	EQU 0					; LOAD: collect [settings]
-MODE_VIEWER		EQU 1					; VIEWER_FOR_EXT: find one [viewers] entry
+MODE_LOOKUP		EQU 1					; find one entry in section `lookup_sec`
 
 SEC_NONE		EQU 0
 SEC_SETTINGS	EQU 1
-SEC_VIEWERS		EQU 2
+SEC_VIEWERS		EQU 2					; [viewers]: ext -> program %file%
+SEC_URLS		EQU 3					; [urls]:    scheme -> program %url%
 
 ; ------------------------------------------------------
 ; Parse [settings] from GOPHER.CFG at startup. Out: CF=1 if absent.
@@ -43,7 +44,7 @@ SEC_VIEWERS		EQU 2
 LOAD
 	XOR		A
 	LD		(st_count), A
-	LD		HL, ST_POOL
+	LD		HL, CFG_ST_POOL
 	LD		(pool_ptr), HL
 	LD		A, MODE_SETTINGS
 	LD		(cfg_mode), A
@@ -54,15 +55,28 @@ LOAD
 ; Out: CF=0 and DE=command template (in CMD_TPL); CF=1 if none / no file.
 ; ------------------------------------------------------
 VIEWER_FOR_EXT
-	LD		DE, look_ext			; remember the wanted ext (HL may be transient)
+	LD		A, SEC_VIEWERS
+	JR		LOOKUP
+
+; Look up the program for a URL scheme in [urls], on demand. In: HL=scheme ASCIIZ
+; (e.g. "http"). Out: CF=0 and DE=command template (CMD_TPL); CF=1 if none / no file.
+HANDLER_FOR_SCHEME
+	LD		A, SEC_URLS
+	; fall through
+
+; Common on-demand lookup: A = section to search, HL = key. Re-scans GOPHER.CFG and
+; returns the value of the first matching key. Out: CF=0/DE=CMD_TPL, or CF=1.
+LOOKUP
+	LD		(lookup_sec), A
+	LD		DE, look_ext			; remember the wanted key (HL may be transient)
 	LD		B, EXT_MAX
 	CALL	MAIN.STRCPYN
 	XOR		A
 	LD		(vw_found), A
-	LD		A, MODE_VIEWER
+	LD		A, MODE_LOOKUP
 	LD		(cfg_mode), A
 	CALL	SCAN_FILE
-	RET		C						; no file -> no viewer
+	RET		C						; no file -> not found
 	LD		A, (vw_found)
 	OR		A
 	JR		Z, .none
@@ -85,7 +99,7 @@ SCAN_FILE
 	; Open by ABSOLUTE path (EXE dir + name) so it is found regardless of the
 	; current directory. EXE_DIR is empty if AppInfo failed -> falls back to a
 	; relative open.
-	LD		HL, MAIN.EXE_DIR
+	LD		HL, EXE_DIR				; WIN2 buffer (console.inc EQU)
 	LD		DE, cfg_path
 	CALL	MAIN.COPYZ
 	LD		HL, CFG_NAME
@@ -216,24 +230,19 @@ PROC_LINE
 	EX		DE, HL					; DE = value
 	POP		HL						; HL = key
 	CALL	TRIM_TRAIL
-	LD		A, (cur_section)
-	CP		SEC_SETTINGS
-	JR		Z, .settings
-	CP		SEC_VIEWERS
-	JR		Z, .viewers
-	RET
-.settings
+	; dispatch by mode: LOAD collects [settings]; a lookup matches in lookup_sec.
 	LD		A, (cfg_mode)
 	CP		MODE_SETTINGS
-	RET		NZ						; only collected during LOAD
-	JP		ADD_SETTING
-.viewers
-	LD		A, (cfg_mode)
-	CP		MODE_VIEWER
-	RET		NZ						; only searched during a lookup
+	JR		Z, .load
+	; MODE_LOOKUP: only the section we're searching, key vs look_ext
+	LD		A, (cur_section)
+	LD		B, A
+	LD		A, (lookup_sec)
+	CP		B
+	RET		NZ						; not our section
 	PUSH	DE						; value (command)
 	LD		DE, look_ext
-	CALL	STRCMP_CI				; key(HL) vs wanted ext
+	CALL	STRCMP_CI				; key(HL) vs wanted key
 	POP		DE
 	RET		NZ
 	EX		DE, HL					; HL = value (command template)
@@ -243,6 +252,11 @@ PROC_LINE
 	LD		A, 1
 	LD		(vw_found), A
 	RET
+.load
+	LD		A, (cur_section)
+	CP		SEC_SETTINGS
+	RET		NZ						; only [settings] collected at LOAD
+	JP		ADD_SETTING
 .section
 	INC		HL						; past '['
 	PUSH	HL
@@ -264,6 +278,9 @@ PROC_LINE
 	LD		DE, S_VIEWERS
 	CALL	STRCMP_CI
 	JR		Z, .is_viewers
+	LD		DE, S_URLS
+	CALL	STRCMP_CI
+	JR		Z, .is_urls
 	XOR		A
 	LD		(cur_section), A
 	RET
@@ -273,6 +290,10 @@ PROC_LINE
 	RET
 .is_viewers
 	LD		A, SEC_VIEWERS
+	LD		(cur_section), A
+	RET
+.is_urls
+	LD		A, SEC_URLS
 	LD		(cur_section), A
 	RET
 
@@ -322,10 +343,10 @@ POOL_ADD
 	PUSH	DE
 .c
 	LD		A, D					; room: pool_ptr (DE) < ST_POOL + ST_POOL_SIZE
-	CP		high (ST_POOL + ST_POOL_SIZE)
+	CP		high (CFG_ST_POOL + ST_POOL_SIZE)
 	JR		C, .room
 	LD		A, E
-	CP		low (ST_POOL + ST_POOL_SIZE)
+	CP		low (CFG_ST_POOL + ST_POOL_SIZE)
 	JR		NC, .oflow
 .room
 	LD		A, (HL)
@@ -395,7 +416,7 @@ SETTING
 ; ------------------------------------------------------
 BUILD_CMD
 	LD		(bc_path), DE
-	LD		DE, CMD_BUF
+	LD		DE, CFG_CMD_BUF
 	LD		(bc_dst), DE
 	LD		BC, CMD_MAX - 1
 .l
@@ -407,10 +428,14 @@ BUILD_CMD
 	JR		Z, .done
 	CP		'%'
 	JR		NZ, .copy
-	PUSH	HL
+	PUSH	HL						; "%file%" or "%url%" -> the substitution value
 	LD		DE, TOK_FILE
 	CALL	MATCH_TOKEN
+	JR		NC, .token
+	LD		DE, TOK_URL
+	CALL	MATCH_TOKEN
 	JR		C, .nomatch
+.token
 	POP		AF						; consumed the token
 	CALL	EMIT_PATH
 	JR		.l
@@ -424,7 +449,7 @@ BUILD_CMD
 .done
 	LD		HL, (bc_dst)
 	LD		(HL), 0
-	LD		HL, CMD_BUF
+	LD		HL, CFG_CMD_BUF
 	RET
 
 EMIT_CH
@@ -555,6 +580,7 @@ cfg_fm			DB 0
 cfg_rem			DW 0
 cfg_mode		DB 0
 cur_section		DB 0
+lookup_sec		DB 0					; section a MODE_LOOKUP scan is searching
 vw_found		DB 0
 ch_tmp			DB 0
 line_wp			DW 0
@@ -567,12 +593,12 @@ bc_dst			DW 0
 cfg_path		DS 144, 0				; "<EXE dir>GOPHER.CFG" (absolute open path)
 look_ext		DS EXT_MAX, 0			; the extension being looked up
 CMD_TPL			DS TPL_MAX, 0			; matched viewer command template
-ST_POOL			DS ST_POOL_SIZE, 0		; kept setting strings
-CMD_BUF			DS CMD_MAX, 0			; built command for Dss.Exec
 
 CFG_NAME		DB "GOPHER.CFG", 0
 S_SETTINGS		DB "settings", 0
 S_VIEWERS		DB "viewers", 0
+S_URLS			DB "urls", 0
 TOK_FILE		DB "%file%", 0
+TOK_URL			DB "%url%", 0
 
 	ENDMODULE

@@ -224,8 +224,20 @@ shutdown-on-exit (below). Awaiting a re-test.
    (1) `CFG.TRIM_TRAIL` clobbered `DE` (the value pointer) → every viewer template
    parsed EMPTY → launched an empty command; now PUSH/POPs DE. (2) Routing through
    `SYSTEM.EXE /C` dropped into an interactive shell eating garbage - direct `#40`
-   is correct for an EXE viewer (the shell wrapper is only for `.bat`). Still TODO:
-   `h` (URL/`URL:` links).
+   is correct for an EXE viewer (the shell wrapper is only for `.bat`).
+   **Type `h` (URL links) — DONE.** `ON_ENTER` `.urllink`: the selector is a URL,
+   usually `URL:<url>`; `STRIP_URL_PREFIX` drops a leading `URL:` (CI). If the URL
+   is `gopher://host[:port][/<type><selector>]` (`SKIP_PREFIX_CI`), `PARSE_GOPHER_URL`
+   fills `HOST_CUR/PORT_CUR`(def 70)`/SEL_CUR/DOC_TYPE_CUR`(def `1`) and it's fetched
+   like a normal link (PUSH_HIST + GOTO_FETCH). For any other scheme (`GET_URL_SCHEME`
+   → `http`/`ftp`/`mailto`/…) it looks the scheme up in the **`[urls]`** section of
+   GOPHER.CFG (`CFG.HANDLER_FOR_SCHEME`; `scheme = program %url%`). If a handler is
+   configured: show the URL on the header (`SHOW_URL_HEADER`), confirm
+   (`CONFIRM_OPEN`, unless `skip_ask_for_exec`), then `CFG.BUILD_CMD` (expands
+   `%url%`) + `EXEC_PROGRAM`. No handler → `SHOW_WEBLINK` shows `Web link: <url>` on
+   the status bar. CFG: `[viewers]` (ext→`%file%`) and `[urls]` (scheme→`%url%`)
+   share one on-demand lookup (`LOOKUP` with `lookup_sec`); `BUILD_CMD` expands both
+   `%file%` and `%url%`.
    **Media policy (agreed):** binary/media items are **saved to a `DOWNLOAD\`
    directory** (next to the EXE) via the DSS file API (`file.asm`) — DONE; the
    browser does NOT auto-open them. Opening is **on explicit confirmation only**,
@@ -333,6 +345,17 @@ shutdown-on-exit (below). Awaiting a re-test.
    (76 chars, a deliberate right margin that avoids the cursor-wrap-scroll bug),
    one row per item, no wrap/horizontal-scroll - same as NEXTplorer. Enhancement:
    horizontal-scroll the selected row, or wrap long lines onto continuation rows.
+15. **"Back to previous page" links should act like Backspace.** Many gopher
+   menus include an explicit *go up/back* item (e.g. a type-`1` link displayed as
+   "Back to previous page" / "Back to home page", often with selector `/` or the
+   parent path). Right now following it FETCHES the parent and PUSHES a new history
+   level, so the history grows instead of unwinding. Detect such links and route
+   them to `ON_BACK` (pop history, no re-fetch) instead of `.follow`. Detection
+   options: (a) match the display text against a small set of phrases ("back",
+   "previous", "up", "..", "parent"); (b) if the link's host/port/selector equals
+   the previous history record's, treat Enter as Back. (a) is simplest; (b) is more
+   robust but only catches the immediate parent. Consider both (phrase OR matches-
+   parent) and fall back to a normal fetch if neither.
 
 Reference repos are cloned at `/tmp/gopher-analysis/{moon-rabbit-zx,internet-nextplorer,agon-snail}`
 (re-clone if gone). Working dir: `/Users/dmitry/dev/zx/sprinter/sources/moonrabbit`.

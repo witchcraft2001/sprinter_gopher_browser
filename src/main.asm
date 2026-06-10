@@ -92,8 +92,10 @@ START
 	CALL	INIT_RUNTIME_PAGE			; map a fresh WIN2 page for the scratch buffers
 	JP		C, MEM_ERROR
 	CALL	INIT_PATHS					; resolve the EXE dir for DOWNLOAD\ (AppInfo #47)
-	LD		HL, CLOCK_TICK				; let the kit tick the clock during its blocking
-	LD		(WCOMMON.IDLE_CB), HL		; waits (INIT/connect), where ISA is briefly closed
+	; NOTE: we deliberately do NOT install a kit IDLE_CB clock tick - it runs at the
+	; deepest point of the kit's receive call chain, and CLOCK_TICK's DSS draw calls
+	; there overflowed the (tight) stack and hung the fetch. The clock still updates
+	; in the main loop and between receive blocks (RECV_LOOP), at safe stack depths.
 	CALL	CFG.LOAD					; read GOPHER.CFG (viewers + settings); ignore if absent
 	CALL	DOC.RESET
 	CALL	TERM.CLS
@@ -107,8 +109,10 @@ START
 
 MAINLOOP
 	CALL	CLOCK_TICK				; refresh HH:MM:SS in the header (only on change)
+	CALL	IDLE_TICK				; after 3 s idle on a link, preview its target
 	CALL	KBD.SCAN
 	JR		Z, MAINLOOP
+	CALL	RESET_IDLE				; a key -> restart the idle timer / clear preview
 
 	CP		KEY_ESC
 	JP		Z, CONFIRM_QUIT
@@ -137,6 +141,52 @@ MAINLOOP
 	CP		KEY_F10
 	JP		Z, CONFIRM_QUIT			; F10 = quit (like Esc)
 	JR		MAINLOOP
+
+; ------------------------------------------------------
+; Idle link preview: when the cursor rests on a link for ~3 s, show the link's
+; target on the status bar. Driven by the per-second clock (now_sec, set by
+; CLOCK_TICK), so no extra SYSTIME call. RESET_IDLE restarts the timer (and
+; restores the status) on any keypress.
+; ------------------------------------------------------
+IDLE_TICK
+	LD		A, (now_sec)
+	LD		HL, idle_sec
+	CP		(HL)
+	RET		Z						; same second -> nothing
+	LD		(HL), A					; advance the per-second counter
+	LD		A, (preview_shown)
+	OR		A
+	RET		NZ						; preview already up -> leave it
+	LD		A, (idle_count)
+	CP		3
+	RET		NC						; already counted (e.g. resting on a non-link)
+	INC		A
+	LD		(idle_count), A
+	CP		3
+	RET		NZ
+	JP		SHOW_LINK_PREVIEW		; 3 s elapsed -> show the link under the cursor
+
+; Restart the idle timer on activity; if a preview is up, restore the status.
+; Preserves the KBD.SCAN result (AF/BC/DE) for the caller's key dispatch.
+RESET_IDLE
+	PUSH	AF
+	PUSH	BC
+	PUSH	DE
+	XOR		A
+	LD		(idle_count), A
+	LD		A, (now_sec)
+	LD		(idle_sec), A
+	LD		A, (preview_shown)
+	OR		A
+	JR		Z, .done
+	XOR		A
+	LD		(preview_shown), A
+	CALL	SHOW_DOC_STATUS			; restore the normal status line
+.done
+	POP		DE
+	POP		BC
+	POP		AF
+	RET
 
 ; Esc at the menu asks for confirmation (so a stray Esc doesn't drop the user out
 ; of the browser). Y/y quits; any other key returns to browsing. The Esc that
@@ -581,11 +631,13 @@ ON_ENTER
 	CALL	IS_BIN_TYPE				; 9/5/g/I/s/;/d/p -> downloadable
 	JP		Z, .download
 	LD		A, (row_type)
+	CP		'h'
+	JP		Z, .urllink				; URL: link (gopher:// navigates; web link shown)
 	CP		'i'
 	JP		Z, MAINLOOP
 	CP		'.'
 	JP		Z, MAINLOOP
-	JP		.unsupported			; h (URL) and other types - later phase
+	JP		.unsupported			; other types - later phase
 .follow
 	LD		HL, (p_host)
 	LD		A, (HL)
@@ -673,6 +725,62 @@ ON_ENTER
 .dlfail
 	CALL	SHOW_ERROR
 	JP		MAINLOOP
+.urllink
+	; gopher type 'h': the selector is a URL, usually "URL:<url>". gopher:// is
+	; navigated like a normal link; other schemes (http/ftp/mailto/...) are routed
+	; to a program from [urls] in GOPHER.CFG (scheme=program %url%), after a confirm.
+	LD		HL, (p_sel)
+	CALL	STRIP_URL_PREFIX		; HL -> URL ("URL:" stripped if present)
+	LD		(url_full), HL
+	LD		DE, SCHEME_GOPHER
+	CALL	SKIP_PREFIX_CI			; gopher:// ?  CF=0 and HL past it if so
+	JR		C, .h_other
+	LD		(url_ptr), HL			; HL now points past "gopher://"
+	CALL	PUSH_HIST				; cache the page we leave
+	CALL	DOC.NEW
+	LD		HL, (p_disp)			; title = the link text
+	LD		DE, DOC_TITLE
+	LD		B, TITLE_MAX
+	CALL	STRCPYN
+	LD		HL, (url_ptr)
+	CALL	PARSE_GOPHER_URL		; -> HOST_CUR / PORT_CUR / SEL_CUR / DOC_TYPE_CUR
+	LD		A, 1
+	LD		(cur_kind), A
+	JP		GOTO_FETCH
+.h_other
+	LD		HL, (url_full)			; scheme (up to ':') -> URL_SCHEME
+	CALL	GET_URL_SCHEME
+	LD		HL, URL_SCHEME			; a program for this scheme in [urls]?
+	CALL	CFG.HANDLER_FOR_SCHEME	; DE = command template, CF=1 if none
+	JR		C, .h_nohandler
+	LD		(open_tpl), DE
+	CALL	SHOW_URL_HEADER			; show the URL (header) so it stays during the ask
+	CALL	SKIP_ASK				; CF=1 -> launch without asking
+	JR		C, .h_exec
+	CALL	CONFIRM_OPEN			; CF=1 -> user declined
+	JR		C, .h_cancel
+.h_exec
+	LD		HL, (open_tpl)
+	LD		DE, (url_full)
+	CALL	CFG.BUILD_CMD			; expand %url% -> CMD_BUF
+	CALL	EXEC_PROGRAM
+	PUSH	AF						; CF = launch error
+	CALL	REDRAW_FULL				; the program/header took over - repaint
+	POP		AF
+	JR		C, .h_execfail
+	CALL	SHOW_DOC_STATUS
+	JP		MAINLOOP
+.h_execfail
+	LD		HL, MSG_EXEC_FAIL
+	JP		SET_STATUS
+.h_cancel
+	CALL	REDRAW_FULL				; restore the header (URL was shown there)
+	CALL	SHOW_DOC_STATUS
+	JP		MAINLOOP
+.h_nohandler
+	LD		HL, (url_full)			; no [urls] entry -> just show the URL
+	CALL	SHOW_WEBLINK
+	JP		MAINLOOP
 
 ; Copy the parsed row's link fields into the current nav (used by .follow).
 COPY_NAV_FROM_ROW
@@ -717,6 +825,316 @@ GOTO_FETCH
 	CALL	REDRAW_FULL
 	CALL	SHOW_ERROR
 	JP		MAINLOOP
+
+; ------------------------------------------------------
+; Type-'h' URL helpers.
+; ------------------------------------------------------
+; HL = selector -> HL advanced past a leading "URL:" (case-insensitive) if present.
+STRIP_URL_PREFIX
+	LD		DE, PFX_URL
+	CALL	SKIP_PREFIX_CI
+	RET								; HL advanced (CF=0) or unchanged (CF=1); both ok
+
+; If the ASCIIZ at HL starts with the ASCIIZ prefix at DE (case-insensitive),
+; return CF=0 and HL advanced past the prefix; else CF=1 and HL unchanged.
+SKIP_PREFIX_CI
+	PUSH	HL
+.l
+	LD		A, (DE)
+	OR		A
+	JR		Z, .match				; prefix consumed -> match
+	CP		'a'						; uppercase the prefix char
+	JR		C, .pu
+	CP		'z' + 1
+	JR		NC, .pu
+	SUB		0x20
+.pu
+	LD		B, A
+	LD		A, (HL)					; uppercase the input char
+	CP		'a'
+	JR		C, .su
+	CP		'z' + 1
+	JR		NC, .su
+	SUB		0x20
+.su
+	CP		B
+	JR		NZ, .no
+	INC		HL
+	INC		DE
+	JR		.l
+.no
+	POP		HL
+	SCF
+	RET
+.match
+	POP		AF						; drop the saved HL, keep the advanced one
+	OR		A						; CF=0
+	RET
+
+; Parse "host[:port][/<type><selector>]" at HL into HOST_CUR / PORT_CUR / SEL_CUR /
+; DOC_TYPE_CUR (defaults: port 70, type '1', empty selector). Fields are length-
+; capped to their buffers.
+PARSE_GOPHER_URL
+	LD		DE, HOST_CUR			; --- host (up to ':' '/' or end) ---
+	LD		B, 63
+.h
+	LD		A, B
+	OR		A
+	JR		Z, .hd
+	LD		A, (HL)
+	OR		A
+	JR		Z, .hd
+	CP		':'
+	JR		Z, .hd
+	CP		'/'
+	JR		Z, .hd
+	LD		(DE), A
+	INC		DE
+	INC		HL
+	DEC		B
+	JR		.h
+.hd
+	XOR		A
+	LD		(DE), A					; NUL-terminate host
+	LD		A, (HL)					; --- optional :port ---
+	CP		':'
+	JR		NZ, .defport
+	INC		HL
+	LD		DE, PORT_CUR
+	LD		B, 7
+.p
+	LD		A, B
+	OR		A
+	JR		Z, .pd
+	LD		A, (HL)
+	OR		A
+	JR		Z, .pd
+	CP		'/'
+	JR		Z, .pd
+	LD		(DE), A
+	INC		DE
+	INC		HL
+	DEC		B
+	JR		.p
+.pd
+	XOR		A
+	LD		(DE), A
+	JR		.path
+.defport
+	LD		A, '7'
+	LD		(PORT_CUR), A
+	LD		A, '0'
+	LD		(PORT_CUR + 1), A
+	XOR		A
+	LD		(PORT_CUR + 2), A
+.path
+	LD		A, (HL)					; --- /<type><selector> ---
+	CP		'/'
+	JR		NZ, .nopath
+	INC		HL						; skip '/'
+	LD		A, (HL)
+	OR		A
+	JR		Z, .nopath				; "/" with nothing after -> defaults
+	LD		(DOC_TYPE_CUR), A		; gopher type byte
+	INC		HL
+	LD		DE, SEL_CUR				; selector = the rest
+	LD		B, 199
+.s
+	LD		A, B
+	OR		A
+	JR		Z, .sterm
+	LD		A, (HL)
+	LD		(DE), A
+	OR		A
+	RET		Z						; copied the NUL -> done
+	INC		HL
+	INC		DE
+	DEC		B
+	JR		.s
+.sterm
+	XOR		A
+	LD		(DE), A
+	RET
+.nopath
+	LD		A, '1'
+	LD		(DOC_TYPE_CUR), A
+	XOR		A
+	LD		(SEL_CUR), A
+	RET
+
+; Show a (non-gopher) URL on the status line, capped to fit the row.
+SHOW_WEBLINK
+	PUSH	HL						; url
+	LD		HL, MSG_LINKPFX
+	LD		DE, WEBLINK_BUF
+	CALL	COPYZ					; "Web link: " -> DE at end
+	POP		HL						; url
+.l
+	LD		A, D					; stop near the end of the buffer
+	CP		high (WEBLINK_BUF + 78)
+	JR		C, .cp
+	LD		A, E
+	CP		low (WEBLINK_BUF + 78)
+	JR		NC, .done
+.cp
+	LD		A, (HL)
+	OR		A
+	JR		Z, .done
+	LD		(DE), A
+	INC		DE
+	INC		HL
+	JR		.l
+.done
+	XOR		A
+	LD		(DE), A
+	LD		HL, WEBLINK_BUF
+	JP		SET_STATUS
+
+; Copy the URL scheme (up to the first ':') at HL into URL_SCHEME (e.g. "http").
+GET_URL_SCHEME
+	LD		DE, URL_SCHEME
+	LD		B, 15
+.l
+	LD		A, B
+	OR		A
+	JR		Z, .done
+	LD		A, (HL)
+	OR		A
+	JR		Z, .done
+	CP		':'
+	JR		Z, .done
+	LD		(DE), A
+	INC		DE
+	INC		HL
+	DEC		B
+	JR		.l
+.done
+	XOR		A
+	LD		(DE), A
+	RET
+
+; Show "Open URL: <url>" on the header row (so it stays visible while the confirm
+; prompt is on the status row). url_full holds the URL; capped to fit before the clock.
+SHOW_URL_HEADER
+	LD		HL, MSG_OPENURL
+	LD		DE, WEBLINK_BUF
+	CALL	COPYZ					; "Open URL: " -> DE at end
+	LD		HL, (url_full)
+.l
+	LD		A, D
+	CP		high (WEBLINK_BUF + 68)
+	JR		C, .cp
+	LD		A, E
+	CP		low (WEBLINK_BUF + 68)
+	JR		NC, .done
+.cp
+	LD		A, (HL)
+	OR		A
+	JR		Z, .done
+	LD		(DE), A
+	INC		DE
+	INC		HL
+	JR		.l
+.done
+	XOR		A
+	LD		(DE), A
+	LD		D, HEADER_ROW			; paint the header and print it there
+	LD		E, 0
+	LD		H, 1
+	LD		L, SCR_W
+	LD		B, ATTR_HEADER
+	LD		A, ' '
+	CALL	TERM.FILL
+	LD		D, HEADER_ROW
+	LD		E, 1
+	CALL	TERM.LOCATE
+	LD		HL, WEBLINK_BUF
+	CALL	TERM.PUTS
+	LD		A, 0xFF					; let the clock repaint over its corner next tick
+	LD		(clk_last), A
+	RET
+
+; Show the target of the link under the cursor on the status bar (idle preview).
+; "gopher://host:port/<type><selector>" for normal links; the raw URL for type 'h'.
+SHOW_LINK_PREVIEW
+	LD		A, (DOC_TYPE_CUR)
+	CP		'1'
+	RET		NZ						; text document -> no links
+	LD		HL, (DOC.doc_lines)
+	LD		A, H
+	OR		L
+	RET		Z						; empty doc
+	LD		HL, (sel_index)
+	LD		DE, (DOC.doc_lines)
+	OR		A
+	SBC		HL, DE
+	RET		NC						; selection past the end
+	LD		BC, (sel_index)
+	CALL	DOC.SEEK_LINE
+	CALL	DOC.NEXT_LINE
+	CALL	PARSE_ROW
+	LD		A, (row_type)
+	CP		'i'
+	RET		Z						; info / non-link rows -> nothing
+	CP		'.'
+	RET		Z
+	LD		HL, (p_host)
+	LD		A, (HL)
+	OR		A
+	RET		Z						; no host on this row
+	LD		A, (row_type)
+	CP		'h'
+	JR		Z, .hlink
+	; "gopher://" host ":" port "/" <type> selector
+	LD		HL, SCHEME_GOPHER
+	LD		DE, PREVIEW_BUF
+	CALL	COPYZ
+	LD		HL, (p_host)
+	CALL	PV_APPEND
+	LD		A, ':'
+	LD		(DE), A
+	INC		DE
+	LD		HL, (p_port)
+	CALL	PV_APPEND
+	LD		A, '/'
+	LD		(DE), A
+	INC		DE
+	LD		A, (row_type)
+	LD		(DE), A
+	INC		DE
+	LD		HL, (p_sel)
+	CALL	PV_APPEND
+	JR		.show
+.hlink
+	LD		HL, (p_sel)				; type 'h': show the URL itself
+	CALL	STRIP_URL_PREFIX
+	LD		DE, PREVIEW_BUF
+	CALL	PV_APPEND
+.show
+	XOR		A
+	LD		(DE), A					; NUL-terminate PREVIEW_BUF
+	LD		A, 1
+	LD		(preview_shown), A
+	LD		HL, PREVIEW_BUF
+	JP		SET_STATUS
+
+; Append ASCIIZ HL to DE, stopping at the NUL or near the end of PREVIEW_BUF (so
+; the status line never overflows the row). DE left at the write position.
+PV_APPEND
+	LD		A, D
+	CP		high (PREVIEW_BUF + 74)
+	JR		C, .go
+	LD		A, E
+	CP		low (PREVIEW_BUF + 74)
+	RET		NC						; reached the cap
+.go
+	LD		A, (HL)
+	OR		A
+	RET		Z
+	LD		(DE), A
+	INC		DE
+	INC		HL
+	JR		PV_APPEND
 
 ; ------------------------------------------------------
 ; Backspace: return to the previous page. The previous document is cached in
@@ -1919,6 +2337,8 @@ DRAW_HEADER
 CLOCK_TICK
 	LD		C, DSS_SYSTIME
 	RST		DSS						; H=hours, L=minutes, B=seconds
+	LD		A, B
+	LD		(now_sec), A			; current second, for the idle-preview timer
 	LD		A, H
 	LD		(clk_h), A
 	LD		A, L
@@ -1977,6 +2397,10 @@ clk_last	DB 0xFF
 clk_h		DB 0
 clk_m		DB 0
 clk_s		DB 0
+now_sec		DB 0					; current second (set by CLOCK_TICK)
+idle_sec	DB 0					; last second the idle timer counted
+idle_count	DB 0					; seconds of inactivity (capped at 3)
+preview_shown	DB 0				; 1 while a link preview is on the status bar
 
 ; ------------------------------------------------------
 ; Viewport renderer (reads lines straight from the document pages).
@@ -2213,6 +2637,8 @@ home_fm			DB 0xFF					; open EXE file handle (from (IX-3) at START)
 win2_block		DB 0					; GetMem handle of the WIN2 scratch page
 exec_sp			DW 0					; saved SP across Dss.Exec
 open_tpl		DW 0					; viewer command template during MAYBE_OPEN
+url_ptr			DW 0					; parse pointer for a type-'h' URL
+url_full		DW 0					; pointer to the full URL (scheme included)
 last_err		DW 0
 recv_lo			DW 0					; bytes received this fetch (low 16)
 recv_hi			DB 0					; bytes received this fetch (high 8) -> 24-bit
@@ -2244,8 +2670,7 @@ DL_NAME			DS 16, 0				; derived 8.3 filename
 DL_PATH			DS 32, 0				; "DOWNLOAD\<name>" (relative to the EXE dir)
 DL_DIRMK		DB "DOWNLOAD", 0		; mkdir target (relative to the EXE dir)
 DL_DIRPFX		DB "DOWNLOAD", 0x5C, 0	; per-file path prefix (backslash separator)
-EXE_DIR			DS 256, 0				; AppInfo #47 output buffer (EXE home dir)
-FILE_ABS		DS 160, 0				; absolute path of the saved file (for %file%)
+; EXE_DIR / FILE_ABS now live in WIN2 (console.inc) to spare the WIN1 stack.
 DEF_DLNAME		DB "INDEX.BIN", 0		; fallback when the selector has no basename
 KEY_SKIPASK		DB "skip_ask_for_exec", 0
 
@@ -2271,6 +2696,13 @@ MSG_INCOMPLETE	DB " - INCOMPLETE (transfer truncated)", 0
 SUFFIX_B		DB " bytes", 0
 SUFFIX_KB		DB " KB", 0
 MSG_UNSUPPORTED	DB "That item type is not supported yet.", 0
+MSG_LINKPFX		DB "Web link: ", 0
+MSG_OPENURL		DB "Open URL: ", 0
+PFX_URL			DB "URL:", 0
+SCHEME_GOPHER	DB "gopher://", 0
+URL_SCHEME		DS 16, 0
+WEBLINK_BUF		DS 80, 0
+PREVIEW_BUF		DS 88, 0				; idle link-preview string for the status bar
 MSG_SEARCH		DB "Search (Enter=go  Esc=cancel): ", 0
 MSG_SAVING		DB "Saving ", 0
 MSG_SAVED		DB "Saved ", 0
