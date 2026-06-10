@@ -53,6 +53,9 @@ EXE_DIR				EQU 0x9900			; AppInfo #47 EXE home dir (256 B)
 FILE_ABS			EQU 0x9A00			; absolute saved-file path for %file% (160 B)
 CFG_ST_POOL			EQU 0x9AA0			; kept [settings] strings (256 B)
 CFG_CMD_BUF			EQU 0x9BA0			; built Dss.Exec command line (192 B)
+HOST_CUR			EQU 0x9C60			; current page host (64 B)   - fetch nav buffers
+PORT_CUR			EQU 0x9CA0			; current page port (8 B)      (not PChars sources)
+SEL_CUR				EQU 0x9CA8			; current page selector (200 B)
 ; LINE_BUF lives in WIN1 (the code image), NOT this WIN2 page: DSS PChars prints
 ; a row from it, and printing a source string out of the WIN2 page renders
 ; garbage (header/status print fine from WIN1). Defined as MAIN.LINE_BUF.

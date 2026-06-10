@@ -92,10 +92,11 @@ START
 	CALL	INIT_RUNTIME_PAGE			; map a fresh WIN2 page for the scratch buffers
 	JP		C, MEM_ERROR
 	CALL	INIT_PATHS					; resolve the EXE dir for DOWNLOAD\ (AppInfo #47)
-	; NOTE: we deliberately do NOT install a kit IDLE_CB clock tick - it runs at the
-	; deepest point of the kit's receive call chain, and CLOCK_TICK's DSS draw calls
-	; there overflowed the (tight) stack and hung the fetch. The clock still updates
-	; in the main loop and between receive blocks (RECV_LOOP), at safe stack depths.
+	LD		HL, CLOCK_TICK				; tick the clock during the kit's blocking waits
+	LD		(WCOMMON.IDLE_CB), HL		; (INIT/connect/receive). Safe now that big WIN1
+										; buffers moved to WIN2 freed ~570 B of stack head-
+										; room - the earlier hang was that deep draw on a
+										; too-tight stack.
 	CALL	CFG.LOAD					; read GOPHER.CFG (viewers + settings); ignore if absent
 	CALL	DOC.RESET
 	CALL	TERM.CLS
@@ -643,6 +644,19 @@ ON_ENTER
 	LD		A, (HL)
 	OR		A
 	JP		Z, .unsupported			; no host on this row
+	; A link that points back at the previous page unwinds history (instant)
+	; instead of re-fetching the parent and growing the history stack. Detect it
+	; two ways: (a) the link's target equals the previous page (robust); (b) it
+	; reads as a "Back"/".." item (catches parents reached by a different selector,
+	; e.g. "Back to home page" -> "/").
+	LD		A, (hist_sp)
+	OR		A
+	JR		Z, .follow_go			; no history -> nothing to go back to
+	CALL	MATCHES_PREV_PAGE
+	JP		NC, ON_BACK				; same host/port/selector as previous page
+	CALL	IS_BACK_LINK
+	JP		NC, ON_BACK				; back-titled link
+.follow_go
 	CALL	PUSH_HIST				; cache the page we are leaving (nav + its doc pages)
 	CALL	DOC.NEW					; detach those pages; start a fresh empty doc
 	CALL	COPY_NAV_FROM_ROW		; title/host/port/selector/type from the parsed row
@@ -869,6 +883,99 @@ SKIP_PREFIX_CI
 .match
 	POP		AF						; drop the saved HL, keep the advanced one
 	OR		A						; CF=0
+	RET
+
+; Decide whether the selected row is a "go to the previous page" link (e.g.
+; gophermaps often carry a "Back to previous page" / ".." entry). Looks only at
+; the display text (p_disp), case-insensitively: matches a leading ".." or the
+; word "back" (with a word boundary, so "Background" is NOT treated as Back).
+; Returns CF=0 if it's a back link, CF=1 otherwise. Clobbers A/HL/DE.
+IS_BACK_LINK
+	LD		HL, (p_disp)
+	LD		DE, PHRASE_DOTDOT
+	CALL	SKIP_PREFIX_CI			; leading ".."?
+	RET		NC						; yes -> back link (CF=0)
+	LD		HL, (p_disp)
+	LD		DE, PHRASE_BACK
+	CALL	SKIP_PREFIX_CI			; leading "back"? (HL advanced past it)
+	RET		C						; no -> not a back link (CF=1)
+	LD		A, (HL)					; char right after "back"
+	OR		A
+	RET		Z						; "back" exactly -> back link (CF=0)
+	CP		'a'						; a letter after "back" (e.g. "Background")?
+	JR		C, .boundary
+	CP		'z' + 1
+	JR		C, .notback
+.boundary
+	CP		'A'
+	JR		C, .yes					; punctuation/space -> word boundary
+	CP		'Z' + 1
+	JR		NC, .yes
+.notback
+	SCF								; letter follows -> not a back link
+	RET
+.yes
+	OR		A						; CF=0
+	RET
+
+PHRASE_DOTDOT		DB ".." , 0
+PHRASE_BACK			DB "back", 0
+
+; Decide whether the selected row links back at the page we came from, i.e. its
+; target (p_host/p_port/p_sel, pointers into the parsed row) is byte-for-byte the
+; previous history record (top of the stack). This is the robust back detection:
+; following such a link should pop history, not push a new copy of the parent.
+; Assumes the caller already checked hist_sp > 0. CF=0 if it matches the previous
+; page, CF=1 otherwise. Clobbers A/BC/DE/HL.
+MATCHES_PREV_PAGE
+	LD		A, (hist_sp)
+	DEC		A
+	CALL	HREC_ADDR				; HL = previous record
+	PUSH	HL
+	LD		DE, HR_HOST
+	ADD		HL, DE
+	EX		DE, HL					; DE = &HR_HOST
+	LD		HL, (p_host)
+	CALL	STREQ
+	POP		HL
+	RET		C						; host differs
+	PUSH	HL
+	LD		DE, HR_PORT
+	ADD		HL, DE
+	EX		DE, HL
+	LD		HL, (p_port)
+	CALL	STREQ
+	POP		HL
+	RET		C						; port differs
+	LD		DE, HR_SEL
+	ADD		HL, DE
+	EX		DE, HL
+	LD		HL, (p_sel)
+	JP		STREQ					; selector: CF from STREQ is the verdict
+
+; Compare ASCIIZ strings at HL and DE. CF=0 if equal, CF=1 if not. Clobbers A;
+; preserves HL/DE.
+STREQ
+	PUSH	HL
+	PUSH	DE
+.l
+	LD		A, (DE)
+	CP		(HL)
+	JR		NZ, .ne
+	OR		A
+	JR		Z, .eq					; both reached NUL together -> equal
+	INC		HL
+	INC		DE
+	JR		.l
+.eq
+	POP		DE
+	POP		HL
+	OR		A						; CF=0
+	RET
+.ne
+	POP		DE
+	POP		HL
+	SCF
 	RET
 
 ; Parse "host[:port][/<type><selector>]" at HL into HOST_CUR / PORT_CUR / SEL_CUR /
@@ -2650,9 +2757,7 @@ in_max			DB 0					; INPUT_LINE: max chars (excl. NUL)
 in_pos			DB 0					; INPUT_LINE: chars entered so far
 EMPTYSTR		DB 0
 
-HOST_CUR		DS 64, 0
-PORT_CUR		DS 8, 0
-SEL_CUR			DS 200, 0
+; HOST_CUR / PORT_CUR / SEL_CUR now live in WIN2 (console.inc) to spare WIN1 stack.
 ; Current page title shown in the header (the display text of the link we
 ; followed; the home page sets a default). Saved/restored across history.
 DOC_TITLE		DS TITLE_MAX, 0
