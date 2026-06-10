@@ -1911,6 +1911,14 @@ EXEC_PROGRAM
 	LD		A, DSS_VMOD_T80			; re-assert 80x32 text mode
 	LD		C, DSS_SETVMOD
 	RST		DSS
+	; The child process ran with the ISA card in an unknown state (DSS/Exec and
+	; the viewer may have touched the ISA window / UART), so our cached "card is
+	; up" assumption is no longer valid - drop it. The next fetch then re-runs
+	; NET.INIT (re-finds/re-inits the UART + AT, drains stale bytes); that no
+	; longer ISA_RESETs, so the NETUP Wi-Fi session is preserved. Without this,
+	; the next TCP.OPEN talks to a disturbed card -> "Connect failed".
+	XOR		A
+	LD		(net_inited), A
 	POP		AF
 	RET
 
