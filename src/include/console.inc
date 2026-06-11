@@ -58,13 +58,26 @@ PORT_CUR			EQU 0x9CA0			; current page port (8 B)      (not PChars sources)
 SEL_CUR				EQU 0x9CA8			; current page selector (200 B; ends 0x9D70)
 ; Download accumulator: batch many TCP +IPD blocks here and flush to disk in
 ; 512-byte-aligned chunks, so the FAT layer does whole-sector writes instead of
-; one small unaligned write per ~2 KB recv. Sits in the free top of the WIN2
-; page (0xA000..0xBFFF); never a PChars source (raw bytes streamed to a file).
-DL_BUF				EQU 0xA000			; 8 KB download buffer (ends 0xBFFF)
-DL_BUF_SIZE			EQU 0x2000			; 8192
-; LINE_BUF lives in WIN1 (the code image), NOT this WIN2 page: DSS PChars prints
-; a row from it, and printing a source string out of the WIN2 page renders
-; garbage (header/status print fine from WIN1). Defined as MAIN.LINE_BUF.
+; one small unaligned write per ~2 KB recv. Sits above the small buffers, below
+; the stack (0xA000..0xAFFF); never a PChars source (raw bytes streamed to a file).
+DL_BUF				EQU 0xA000			; 4 KB download buffer (ends 0xAFFF)
+DL_BUF_SIZE			EQU 0x1000			; 4096
+; Runtime stack: the top 4 KB of our WIN2 GetMem page (0xB000..0xBFFF, top
+; 0xC000, grows down). The code image fits entirely in WIN1 (< 16 KB), so the
+; whole WIN2 page is ours and the stack lives here - far from the network lib's
+; BSS (which sits just under 0x8000 in WIN1). This replaces the old "stack in
+; WIN1 under the BSS" model whose ~1.8 KB margin overflowed into the BSS during a
+; deep receive + clock draw ("Network init failed"). START switches SP here once
+; the page is mapped; it survives Dss.Exec unchanged (DSS saves/restores the
+; parent's window registers, and this GetMem page is tagged to our task so the
+; child can't allocate over it). 0xB000 > DL_BUF end (0xAFFF).
+RUN_STACK_TOP		EQU 0xC000
+; LINE_BUF lives in WIN1 (the code image, MAIN.LINE_BUF) - a convenience, not a
+; requirement: DSS PChars prints correctly from this WIN2 page too (verified on
+; target; the old "PChars renders garbage from WIN2" note was a myth - the real
+; bug was an HL clobber in AT_END). The reason to copy a row out before printing
+; is so no doc page stays mapped in WIN3 across the DSS call, not the source
+; window.
 
 ; --- attribute byte: PAPER(hi nibble, 0..7) | INK(lo nibble, 0..15) ---
 ATTR_NORM			EQU 0x07			; light grey on black (info text)

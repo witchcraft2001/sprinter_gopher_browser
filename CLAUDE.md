@@ -127,11 +127,18 @@ shutdown-on-exit (below). Awaiting a re-test.
   HL across the `AT_END` call; the original `AT_END` clobbered HL, so every copied
   byte went to a junk address and `LINE_BUF` stayed empty (this — NOT the memory
   syscalls — was the long-standing "garbage/blank rows" bug).
-- `LINE_BUF` lives in **WIN1** (the code image, `MAIN.LINE_BUF`), not the WIN2
-  scratch page: DSS PChars prints the row's display field straight from it.
-  (STAGE/REQ_BUF/HIST_DATA stay in the WIN2 GetMem page — they're plain memory,
-  never a PChars source.) Each visible line is copied into `LINE_BUF` **before**
-  any TERM/DSS call.
+- `LINE_BUF` lives in **WIN1** (the code image, `MAIN.LINE_BUF`); each visible
+  line is copied into it **before** any TERM/DSS call (so no doc page stays
+  mapped in WIN3 across the print). **MYTH BUSTED:** an earlier note here claimed
+  "DSS PChars renders garbage from a WIN2 source string, so LINE_BUF must be in
+  WIN1." That is **false** — verified on target: `PChars #5C` (which routes the
+  string read through BIOS `LP_PR_LINE_DIR` via `RST ToBIOS`) prints **correctly
+  from a WIN2 GetMem page** (`SHOW_EXEC_BANNER` PChars's the command line straight
+  out of `CFG_CMD_BUF` at `0x9BA0`). The original "garbage rows" bug was the
+  `AT_END` HL-clobber (above), misattributed to the memory window. So buffers may
+  freely be PChars sources from WIN2; `LINE_BUF` staying in WIN1 is now just a
+  minor convenience, not a requirement. (STAGE/REQ_BUF/HIST_DATA stay in the WIN2
+  GetMem page as plain memory.)
 - `src/main.asm` rewritten: gopher rows parsed (`PARSE_ROW`: type/display/
   selector/host/port, TABs→NUL) and rendered straight from doc pages through the
   30-row viewport. **Menu vs text documents:** `DOC_TYPE_CUR` holds the gopher
@@ -163,12 +170,33 @@ shutdown-on-exit (below). Awaiting a re-test.
   re-fetches** the parent (network) or reloads home — a deliberate v1
   simplification of §4a's "no-refetch keep-the-page-chain" model (only ONE doc
   chain is alive at a time → far less memory/complexity; upgrade later).
-- **Memory model — model A (proven wget layout), NOT the flat §4a image.** All
-  code + small state + stack (top `0x8000`, down) live in WIN1; the big scratch
-  buffers (`STAGE`/`LINE_BUF`/`REQ_BUF`/`HIST_DATA`, addresses in `console.inc`)
-  live in a single GetMem page mapped at WIN2 (`0x8000`) via `INIT_RUNTIME_PAGE`.
-  `SetWin2` is safe **because no code lives in WIN2** (the §4a fear was code in
-  WIN2). Doc pages use WIN3 only (`OUT (#E2)` of a `EMM_FN5`-resolved page).
+- **Memory model — code in WIN1, runtime stack + buffers in the WIN2 GetMem
+  page.** Code + small state live in WIN1 (loads at `0x4100`, image fits below
+  `0x8000`). A single GetMem page mapped at WIN2 via `INIT_RUNTIME_PAGE` holds the
+  scratch buffers (`STAGE`/`LINE_BUF`/`REQ_BUF`/`HIST_DATA`/`DL_BUF`, addresses in
+  `console.inc`) **and the runtime stack** (top `RUN_STACK_TOP = 0xC000`, the top
+  4 KB of the page, grows down). `SetWin2` is safe because no code lives in WIN2.
+  Doc pages use WIN3 only (`OUT (#E2)` of a `EMM_FN5`-resolved page).
+  - **Why the stack is in WIN2 (not WIN1 under the BSS):** the network-lib BSS
+    sits just below `0x8000` in WIN1 (top ~`0x78xx`). An earlier model put the
+    stack at `0x8000` growing down through that region, leaving only ~1.8 KB
+    before the BSS — and a deep kit-receive chain plus the IDLE_CB clock draw
+    overflowed into the BSS, corrupting the AT response (**"Network init
+    failed"**). Putting the stack in the WIN2 page removes that coupling entirely.
+  - **Boot vs runtime stack:** the EXE header's initial SP is `STACK_TOP = 0x8000`
+    (a WIN1 *boot* stack) because WIN2 isn't ours yet at entry. `START` switches
+    `SP = RUN_STACK_TOP` **right after `INIT_RUNTIME_PAGE`** maps the page (the
+    early boot frames are dead — `START` exits via DSS, never RETs through them).
+  - **Dss.Exec and the WIN2 stack — no juggling needed.** `Dss.Exec #40` swaps
+    all of WIN1/WIN2/WIN3 for the child, but DSS **saves the parent's window
+    registers (and SP) on entry and restores them on return** (`Execute.ASM`:
+    `IN A,(SLOTn)`…`OUT (SLOTn),A`). And our WIN2 page is a **GetMem block tagged
+    to our task**, so the child can't allocate over it (`FREE_PROCESS_MEMORY`
+    frees only the child's pages). So the WIN2 runtime stack survives a child
+    intact — `EXEC_PROGRAM` just runs the exec normally; no boot-stack switch, no
+    `REMAP_WIN2`. (The corruption the old "never `SetWin2`" lore feared only
+    happens if you map a page into WIN2/WIN3 that you did **not** GetMem — then
+    the child can grab it as free memory and clobber it.)
 - **Network errors** classified to friendly status-bar messages (init/connect/
   send/empty); no program exit, no blocking "press a key". `NET.INIT` now calls
   a CF-returning `CHECK_NET_UP` instead of `WCOMMON.REQUIRE_NET_UP` (which exits).
@@ -433,6 +461,13 @@ The network card (ESP UART **or** NE2000) is on the **ISA bus mapped into WIN3**
   registers are at its ISA base (e.g. `0xC300` for I/O base `0x300`).
 
 ## 4a. Memory budget & layout (IMPORTANT — agreed Phase 2)
+
+> ⚠️ **Superseded in part.** The "flat WIN1+WIN2 image, never `SetWin2`, stack at
+> `0xBFFF`" design below was the Phase-2 *theory* and was **not** adopted. The
+> implemented model (see §2 "Memory model") is: **code in WIN1; a GetMem page
+> mapped at WIN2 via `SetWin2` holds the scratch buffers AND the runtime stack
+> (`RUN_STACK_TOP = 0xC000`).** `SetWin2` is used and safe (no code in WIN2). Only
+> the WIN3 ISA/doc-page time-sharing rule below still holds verbatim.
 
 Z80 sees four 16 KB windows; the ISA network card is fixed at **WIN3**. ISA and a
 document page never need to be mapped at the same instant, so they **time-share

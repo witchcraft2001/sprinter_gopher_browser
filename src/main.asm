@@ -25,7 +25,10 @@
 
 EXE_VERSION		EQU 1
 LOAD_ADDR		EQU 0x4100
-STACK_TOP		EQU 0x8000				; grows down through the WIN1 code page
+STACK_TOP		EQU 0x8000				; BOOT stack (WIN1): used only for early startup,
+										; before the WIN2 page is mapped. The runtime stack is
+										; RUN_STACK_TOP in the WIN2 page (START switches SP to
+										; it once INIT_RUNTIME_PAGE has mapped the page).
 
 DEFAULT_TIMEOUT	EQU 2000				; ms; also used by wcommon
 RECV_TIMEOUT	EQU 5000				; ms per receive block
@@ -91,12 +94,16 @@ START
 	CALL	SHOW_BANNER					; version + build-date banner on load
 	CALL	INIT_RUNTIME_PAGE			; map a fresh WIN2 page for the scratch buffers
 	JP		C, MEM_ERROR
+	; The WIN2 page is now ours, so move the stack into its top 4 KB
+	; (RUN_STACK_TOP), away from the network lib's BSS under 0x8000. The early
+	; boot frames on the WIN1 stack are done with (START exits via DSS, never
+	; RETs through them), so abandoning them is safe.
+	LD		SP, RUN_STACK_TOP
 	CALL	INIT_PATHS					; resolve the EXE dir for DOWNLOAD\ (AppInfo #47)
-	LD		HL, CLOCK_TICK				; tick the clock during the kit's blocking waits
-	LD		(WCOMMON.IDLE_CB), HL		; (INIT/connect/receive). Safe now that big WIN1
-										; buffers moved to WIN2 freed ~570 B of stack head-
-										; room - the earlier hang was that deep draw on a
-										; too-tight stack.
+	LD		HL, CLOCK_TICK_CB			; tick the clock during the kit's blocking waits
+	LD		(WCOMMON.IDLE_CB), HL		; (INIT/connect/receive). The wrapper preserves IX/IY
+										; (the kit restores only AF/BC/DE/HL around IDLE_CB).
+										; Stack safety is now handled by RUN_STACK_TOP in WIN2.
 	CALL	CFG.LOAD					; read GOPHER.CFG (viewers + settings); ignore if absent
 	CALL	DOC.RESET
 	CALL	TERM.CLS
@@ -232,23 +239,18 @@ MEM_ERROR
 	LD		B, 3
 	JP		WCOMMON.EXIT
 
-; Allocate one 16 KB page and map it into WIN2 (0x8000) for the scratch buffers.
+; Allocate one 16 KB page and map it into WIN2 (0x8000) for the scratch buffers
+; and the runtime stack. No need to remember the handle for after Dss.Exec: DSS
+; saves/restores the parent's window registers across a child, and this page is a
+; GetMem block tagged to our task (the child can't allocate over it), so WIN2 is
+; ours again automatically on return.
 INIT_RUNTIME_PAGE
 	LD		B, 1
 	LD		C, DSS_GETMEM
 	RST		DSS
 	RET		C
-	LD		(win2_block), A			; remember the handle to re-map after Dss.Exec
 	LD		B, 0
-	LD		C, DSS_SETWIN2
-	RST		DSS
-	RET
-
-; Re-map our WIN2 scratch page (after a child program may have remapped WIN2).
-REMAP_WIN2
-	LD		A, (win2_block)
-	LD		B, 0
-	LD		C, DSS_SETWIN2
+	LD		C, DSS_SETWIN2			; A = handle from GetMem
 	RST		DSS
 	RET
 
@@ -1727,7 +1729,7 @@ DOWNLOAD
 ; +IPD blocks until it is nearly full or the stream pauses, decrements RECV_REMAIN
 ; per byte (so it never overruns the buffer) and carries a partial IPD payload to
 ; the next call - no bytes are lost.
-DL_FLUSH_HI		EQU DL_BUF_SIZE - 2048	; 6144: flush once this full (room for 1+ IPD)
+DL_FLUSH_HI		EQU DL_BUF_SIZE - 2048	; 2048: flush once this full (room for 1+ IPD)
 DL_RECV_LOOP
 	LD		HL, 0
 	LD		(dl_fill), HL			; accumulator empty
@@ -1972,23 +1974,47 @@ CONFIRM_OPEN
 ; SP (Dss.Exec changes it), re-maps our WIN2 scratch page and re-asserts 80x32 text
 ; on return (the child may have changed both). Out: A=exit code, CF=1 on launch
 ; error (FM idiom: HL=cmdline, BC=#0040).
+; Clear the screen to the standard attributes (black paper, non-bright white
+; ink = ATTR_NORM) and announce the program we are about to launch, so the
+; external viewer starts from a clean, predictable console. In: HL = command
+; line (lives in the WIN2 page, CFG_CMD_BUF). Preserves HL for the Dss.Exec that
+; follows. (PChars prints fine straight from WIN2 - verified on target.)
+SHOW_EXEC_BANNER
+	PUSH	HL
+	CALL	TERM.CLS				; black background, non-bright white text
+	LD		DE, 0					; D=row 0, E=col 0
+	CALL	TERM.LOCATE
+	LD		HL, MSG_RUNEXT			; "Running external viewer:\r\n"
+	CALL	TERM.PUTS
+	POP		HL
+	PUSH	HL						; HL = command line
+	CALL	TERM.PUTS				; print the command line straight from WIN2
+	LD		HL, MSG_CRLF			; end the line so the child starts on a fresh row
+	CALL	TERM.PUTS
+	POP		HL						; restore command pointer for Dss.Exec
+	RET
+
 EXEC_PROGRAM
+	CALL	SHOW_EXEC_BANNER		; clean screen + "Running external viewer:" + cmd
+	; Dss.Exec saves the parent's WIN1/WIN2/WIN3 page registers (and SP) and
+	; restores them on return; our WIN2 page is a GetMem block tagged to our task,
+	; so the child can't allocate over it. So the WIN2 runtime stack survives the
+	; exec unchanged - no stack juggling needed. (exec_sp is just belt-and-braces;
+	; it's a WIN1 var, valid to read whatever WIN2 holds.)
 	LD		(exec_sp), SP
 	LD		BC, 0x0040				; B=0 (short name), C=#40 (Dss.Exec)
 	RST		DSS						; -> A=exit code, CF=1 error
 	LD		SP, (exec_sp)
 	PUSH	AF
-	CALL	REMAP_WIN2				; the child may have remapped WIN2
-	CALL	CHDIR_EXE				; ...and changed cwd - restore it to the EXE dir
+	CALL	CHDIR_EXE				; cwd is process state (not a window) - restore it
 	LD		A, DSS_VMOD_T80			; re-assert 80x32 text mode
 	LD		C, DSS_SETVMOD
 	RST		DSS
-	; The child process ran with the ISA card in an unknown state (DSS/Exec and
-	; the viewer may have touched the ISA window / UART), so our cached "card is
-	; up" assumption is no longer valid - drop it. The next fetch then re-runs
-	; NET.INIT (re-finds/re-inits the UART + AT, drains stale bytes); that no
-	; longer ISA_RESETs, so the NETUP Wi-Fi session is preserved. Without this,
-	; the next TCP.OPEN talks to a disturbed card -> "Connect failed".
+	; The child ran with the ISA card in an unknown state (DSS/Exec and the viewer
+	; may have touched the ISA window / UART), so drop our cached "card is up"
+	; flag; the next fetch re-runs NET.INIT (re-init UART + AT, drain stale bytes,
+	; no ISA_RESET so the NETUP Wi-Fi session is preserved). Without this the next
+	; TCP.OPEN talks to a disturbed card -> "Connect failed".
 	XOR		A
 	LD		(net_inited), A
 	POP		AF
@@ -2521,6 +2547,20 @@ DRAW_HEADER
 ; only repaints when the second changes (clk_last holds the last drawn second; the
 ; header redraw sets it to 0xFF to force a refresh).
 ; ------------------------------------------------------
+; IDLE_CB entry point. The network kit invokes IDLE_CB from inside its AT/receive
+; byte-waits (CHECK_CANCEL_IN_ISA) and restores only AF/BC/DE/HL around the call,
+; NOT IX/IY - so we preserve IX/IY here in case SYSTIME/PChars in the clock draw
+; clobber a pointer the kit's receive loop relies on. (Stack depth is no longer a
+; concern: the runtime stack lives in the WIN2 page at RUN_STACK_TOP, not under
+; the lib BSS.)
+CLOCK_TICK_CB
+	PUSH	IX
+	PUSH	IY
+	CALL	CLOCK_TICK
+	POP		IY
+	POP		IX
+	RET
+
 CLOCK_TICK
 	LD		C, DSS_SYSTIME
 	RST		DSS						; H=hours, L=minutes, B=seconds
@@ -2821,7 +2861,6 @@ cur_kind		DB 0					; 0=home, 1=network
 DOC_TYPE_CUR	DB '1'
 net_inited		DB 0
 home_fm			DB 0xFF					; open EXE file handle (from (IX-3) at START)
-win2_block		DB 0					; GetMem handle of the WIN2 scratch page
 exec_sp			DW 0					; saved SP across Dss.Exec
 open_tpl		DW 0					; viewer command template during MAYBE_OPEN
 url_ptr			DW 0					; parse pointer for a type-'h' URL
@@ -2872,6 +2911,8 @@ LINE_BUF_END	EQU LINE_BUF + 510
 MSG_TITLE		DB "Gopher browser for Sprinter", 0
 MSG_BANNER		DB "GOPHER Browser v.", APP_VERSION, " (", BUILD_DATETIME, ")", 13, 10
 				DB "by Dmitry Mikhalchenkov (SprinterTeam)", 13, 10, 0
+MSG_RUNEXT		DB "Running external viewer:", 13, 10, 0
+MSG_CRLF		DB 13, 10, 0
 MSG_STATUS		DB "Up/Down/Home/End move  PgUp/PgDn page  Enter open  Bksp back  Esc/F10 quit", 0
 MSG_NONET		DB "Wi-Fi not up - run NETUP first (you can still browse the home page)", 0
 MSG_CONFIRM_QUIT DB "Quit?  Y = yes,  any other key = no", 0
@@ -2914,7 +2955,7 @@ WELCOME_DOC
 	DB "i", 13, 10
 	DB "i(Appended home page INDEX.GPH not found - using the built-in stub.)", 13, 10
 	DB "i", 13, 10
-	DB "1Floodgap Systems official gopher server", 9, "/", 9, "gopher.floodgap.com", 9, "70", 13, 10
+	DB "1Virtual TR-DOS official gopher hole", 9, "/", 9, "vtrd.in", 9, "70", 13, 10
 	DB "1Nihirash's gopher hole", 9, "/", 9, "nihirash.net", 9, "70", 13, 10
 WELCOME_END
 WELCOME_LEN		EQU WELCOME_END - WELCOME_DOC
