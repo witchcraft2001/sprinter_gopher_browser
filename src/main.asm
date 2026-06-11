@@ -1715,33 +1715,70 @@ DOWNLOAD
 	LD		HL, ERR_DISK
 	JP		FETCH_ERR
 
-; Receive blocks into STAGE and write them to the open file until the connection
-; closes/times out, or the user cancels, or a write fails. Mirrors RECV_LOOP's
-; RTS-flow-control bracketing. Out: CF=0 normal end, CF=1 cancel/disk error.
+; Receive into the 8 KB DL_BUF accumulator and flush to the open file in
+; 512-byte-aligned chunks until the connection closes/times out, the user
+; cancels, or a write fails. Batching cuts the FAT cost: instead of one small
+; unaligned write per ~2 KB recv (each touching a partial sector), we write
+; whole 512-byte-aligned blocks and carry the sub-sector remainder forward.
+; Mirrors RECV_LOOP's RTS-flow-control bracketing (RTS up to stream, down to
+; write/draw). Out: CF=0 normal end, CF=1 cancel/disk error.
+;
+; Each NET.RECV is given ALL the free space in DL_BUF; the kit reads back-to-back
+; +IPD blocks until it is nearly full or the stream pauses, decrements RECV_REMAIN
+; per byte (so it never overruns the buffer) and carries a partial IPD payload to
+; the next call - no bytes are lost.
+DL_FLUSH_HI		EQU DL_BUF_SIZE - 2048	; 6144: flush once this full (room for 1+ IPD)
 DL_RECV_LOOP
+	LD		HL, 0
+	LD		(dl_fill), HL			; accumulator empty
 .l
 	CALL	NET.RX_RESUME			; raise RTS: let the ESP stream
-	LD		HL, STAGE
-	LD		BC, STAGE_SIZE
+	LD		HL, (dl_fill)
+	LD		DE, DL_BUF
+	ADD		HL, DE					; HL = DL_BUF + dl_fill (dest)
+	PUSH	HL
+	LD		HL, DL_BUF_SIZE
+	LD		DE, (dl_fill)
+	OR		A
+	SBC		HL, DE					; HL = free space = SIZE - fill
+	LD		B, H
+	LD		C, L					; BC = space
+	POP		HL						; HL = dest
 	LD		DE, RECV_TIMEOUT
 	CALL	NET.RECV
 	PUSH	AF
-	CALL	NET.RX_PAUSE			; drop RTS while we write + draw
+	CALL	NET.RX_PAUSE			; drop RTS while we (maybe) write + draw
 	POP		AF
 	JR		C, .end					; closed / timeout / error / cancelled
 	LD		A, B
 	OR		C
 	JR		Z, .end					; no more data
-	PUSH	BC						; BC = bytes received
-	LD		HL, STAGE
-	CALL	FILE.WRITE				; HL=buf, BC=len
-	POP		BC
-	JR		C, .werr				; disk write failed -> abort
-	CALL	DL_ADD					; recv_lo/recv_hi += BC
+	CALL	DL_ADD					; recv_lo/recv_hi += BC (received) - preserves BC
+	LD		HL, (dl_fill)
+	ADD		HL, BC
+	LD		(dl_fill), HL			; dl_fill += received
 	CALL	DL_PROGRESS
 	CALL	CLOCK_TICK				; ISA closed here (post RX_PAUSE) - DSS is safe
+	LD		HL, (dl_fill)
+	LD		DE, DL_FLUSH_HI
+	OR		A
+	SBC		HL, DE
+	JR		C, .l					; below high-water -> keep accumulating
+	CALL	DL_FLUSH_ALIGNED		; write (fill & ~511) bytes, carry the remainder
+	JR		C, .werr
 	JR		.l
 .end
+	; flush whatever is left (one final, possibly sub-sector, write)
+	LD		HL, (dl_fill)
+	LD		A, H
+	OR		L
+	JR		Z, .tail_done
+	LD		B, H
+	LD		C, L					; BC = leftover bytes
+	LD		HL, DL_BUF
+	CALL	FILE.WRITE
+	JR		C, .werr
+.tail_done
 	CALL	NET.RX_RESUME			; resume for the CLOSE handshake
 	LD		A, (WCOMMON.CANCELLED)	; CF=1 only if the user cancelled
 	OR		A
@@ -1751,6 +1788,41 @@ DL_RECV_LOOP
 .werr
 	CALL	NET.RX_RESUME
 	SCF								; CF=1, CANCELLED=0 -> caller reports disk error
+	RET
+
+; Write the 512-byte-aligned prefix of DL_BUF to disk, then shift the sub-sector
+; remainder down to the front of DL_BUF. In: dl_fill = bytes buffered. Out:
+; dl_fill = leftover (< 512); CF=1 on disk write error. Trashes A/BC/DE/HL.
+DL_FLUSH_ALIGNED
+	LD		HL, (dl_fill)
+	LD		A, H
+	AND		0xFE					; nwrite = dl_fill & 0xFE00 (multiple of 512)
+	LD		H, A
+	LD		L, 0
+	LD		A, H
+	OR		L
+	RET		Z						; nothing aligned yet (CF=0)
+	LD		B, H
+	LD		C, L					; BC = nwrite
+	PUSH	BC
+	LD		HL, DL_BUF
+	CALL	FILE.WRITE				; HL=buf, BC=len
+	POP		DE						; DE = nwrite
+	RET		C						; disk error
+	LD		HL, (dl_fill)
+	OR		A
+	SBC		HL, DE					; HL = remainder = fill - nwrite
+	LD		(dl_fill), HL
+	LD		A, H
+	OR		L
+	RET		Z						; no remainder -> done (CF=0)
+	LD		B, H
+	LD		C, L					; BC = remainder
+	LD		HL, DL_BUF
+	ADD		HL, DE					; HL = DL_BUF + nwrite (src tail)
+	LD		DE, DL_BUF				; dst = front
+	LDIR
+	OR		A						; CF=0
 	RET
 
 ; recv_lo/recv_hi += BC (24-bit running total).
@@ -2781,6 +2853,7 @@ DL_PORT			DS 8, 0
 DL_SEL			DS 200, 0
 DL_NAME			DS 16, 0				; derived 8.3 filename
 DL_PATH			DS 32, 0				; "DOWNLOAD\<name>" (relative to the EXE dir)
+dl_fill			DW 0					; bytes currently buffered in DL_BUF
 DL_DIRMK		DB "DOWNLOAD", 0		; mkdir target (relative to the EXE dir)
 DL_DIRPFX		DB "DOWNLOAD", 0x5C, 0	; per-file path prefix (backslash separator)
 ; EXE_DIR / FILE_ABS now live in WIN2 (console.inc) to spare the WIN1 stack.

@@ -55,7 +55,13 @@ CFG_ST_POOL			EQU 0x9AA0			; kept [settings] strings (256 B)
 CFG_CMD_BUF			EQU 0x9BA0			; built Dss.Exec command line (192 B)
 HOST_CUR			EQU 0x9C60			; current page host (64 B)   - fetch nav buffers
 PORT_CUR			EQU 0x9CA0			; current page port (8 B)      (not PChars sources)
-SEL_CUR				EQU 0x9CA8			; current page selector (200 B)
+SEL_CUR				EQU 0x9CA8			; current page selector (200 B; ends 0x9D70)
+; Download accumulator: batch many TCP +IPD blocks here and flush to disk in
+; 512-byte-aligned chunks, so the FAT layer does whole-sector writes instead of
+; one small unaligned write per ~2 KB recv. Sits in the free top of the WIN2
+; page (0xA000..0xBFFF); never a PChars source (raw bytes streamed to a file).
+DL_BUF				EQU 0xA000			; 8 KB download buffer (ends 0xBFFF)
+DL_BUF_SIZE			EQU 0x2000			; 8192
 ; LINE_BUF lives in WIN1 (the code image), NOT this WIN2 page: DSS PChars prints
 ; a row from it, and printing a source string out of the WIN2 page renders
 ; garbage (header/status print fine from WIN1). Defined as MAIN.LINE_BUF.
