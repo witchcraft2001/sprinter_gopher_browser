@@ -99,5 +99,11 @@ KEY_PGDN			EQU 0x53			; in D
 KEY_HOME			EQU 0x57			; in D
 KEY_END				EQU 0x51			; in D
 KEY_F10				EQU 0x44			; in D (DSS XLAT: F1=#3B..F12=#46)
+; Physical keycodes for letter keys (in D). With Ctrl held the symbolic code
+; (A/E) is 0, so a Ctrl+letter shortcut is recognised by the letter's D code.
+; Values are the DSS XLAT_T outputs for the B/D keys (AT set-2 0x32/0x23);
+; verified against KEYINTER.ASM and the texteditor's Ctrl+Y/C/V/X codes.
+KEY_B				EQU 0x2E			; in D (B key)
+KEY_D				EQU 0x1F			; in D (D key)
 
 	ENDIF

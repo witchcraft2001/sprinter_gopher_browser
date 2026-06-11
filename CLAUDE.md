@@ -315,7 +315,23 @@ shutdown-on-exit (below). Awaiting a re-test.
    second changes (`clk_last`; `PUT2D` formats each 0-99 field). `DRAW_HEADER` sets
    `clk_last=0xFF` so its full-row fill doesn't leave the clock blank.
 5. **Ctrl+S** — save the current document to a file (DSS file API).
-6. **Ctrl+D** — add the current document (host/port/selector + title) to bookmarks.
+6. **Ctrl+D — add the current page to bookmarks — DONE.** `ON_ADD_BOOKMARK`
+   appends one type-1 gopher record `"<type><title> TAB <selector> TAB <host> TAB
+   <port> CRLF"` (built in `BM_LINE`, WIN1) to `BOOKMARK.GPH` next to the EXE. Only
+   network pages are bookmarkable — the home/bookmarks pages have an empty
+   `HOST_CUR` and are skipped ("Nothing to bookmark"). `APPEND_BM_LINE` opens the
+   file `FM_READ_WRITE`, `MOVE_FP SEEK_END`, `DSS_WRITE`; if the open fails (no
+   file yet) it creates one with the proven `#0A` create/overwrite call first.
+   **Ctrl-combo detection (subtle — got it wrong first):** the DSS keyboard
+   driver (`KEYINTER.ASM`) emits **no symbolic code for a Ctrl+letter** (A/E = 0),
+   so checking the ASCII/control byte never fires. The combo is recognised by the
+   shift-state mask in **B** (bit 5 = Ctrl; B per the manual's `#30-#37` contract,
+   NOT C which is the layout/RUS-LAT mode) plus the **physical keycode in D**
+   (`AND 0x7F`): `KEY_B`=`0x2E`, `KEY_D`=`0x1F`. Those D codes are the driver's
+   `XLAT_T[]` outputs for the B/D keys (AT set-2 `0x32`/`0x23`), cross-checked
+   against the texteditor's Ctrl+Y/C/V/X codes (`0x15`/`0x2C`/`0x2D`/`0x2B`).
+   `ScanKey` still returns NZ ("key present") for a Ctrl+letter even though A=0,
+   so `KBD.SCAN` sees it.
 6a. **Home page externalised out of the code image — DONE** (frees ~1.2 KB; the
    home page is now editable in `data/index.gph`). **Priority at startup
    (`LOAD_HOME`): external `INDEX.GPH` in the EXE dir → appended-to-EXE copy →
@@ -343,8 +359,14 @@ shutdown-on-exit (below). Awaiting a re-test.
      or a non-loader build). PRELOAD sizes memory by `LOADER`, NOT file length, so
      appending doesn't change allocation. NEEDS on-target check that the loader
      path works on BIOS v3.06 and FM stays open.
-6b. **Bookmarks file** next to the EXE (e.g. `bookmarks.gph`), opened by **Ctrl+B**
-   (or a link on the home page); Ctrl+D appends to it.
+6b. **Bookmarks file `BOOKMARK.GPH` next to the EXE, opened by Ctrl+B — DONE.**
+   (8.3 name — `bookmarks.gph` would need an LFN; DSS is FAT16/8.3.) `ON_BOOKMARKS`
+   browses it as a normal local type-1 menu: `PUSH_HIST` + `DOC.NEW` (so Backspace
+   returns), then the shared `LOAD_DISK_GPH` (HL=name; refactored out of
+   `LOAD_HOME_DISK`) reads the whole file into the doc. `cur_kind=0`/empty
+   `HOST_CUR` mark it local (no "Loaded N bytes", not re-bookmarkable). If the file
+   is absent/empty a built-in `BM_EMPTY_DOC` placeholder ("No bookmarks yet…") is
+   shown instead. Ctrl+D (item 6) appends.
 6c. **Ctrl+G — open an arbitrary address**: a text-input prompt (host[:port][/sel])
    then fetch it.
 7. **Empty doc after long Fetching** on a flaky fetch — investigate / harden
@@ -606,6 +628,40 @@ the app version.)
 - The kits' `dss.inc`/`macro.inc`/`sprinter.inc` are the **authoritative** equates.
 - NEXTplorer/Moon Rabbit ship under *Nihirash's Coffeeware License* — preserve
   attribution and license headers from base files.
+- **Network kit BSS must stay clear of the WIN2 page (0x8000).** The kit anchors
+  its BSS (`RS_BUFF`, ESP-TCP buffers, netcfg's 2 KB `CFG_BUFF`) right after the
+  WIN1 image. As the app grows, that chain creeps up; if it crosses `0x8000` it
+  straddles the WIN1/WIN2 page boundary and overlaps the WIN2 scratch buffers
+  (`STAGE` etc.), silently corrupting receives and hanging every fetch. Fix used:
+  `DEFINE NETCFG_BSS_BASE_OVERRIDE` + `NETCFG_BSS_BASE EQU DL_BUF` relocates the
+  big netcfg BSS wholly into the WIN2 page (its config-load lifetime is disjoint
+  from `DL_BUF`'s download use). Build-time `ASSERT`s after the kit INCLUDEs guard
+  `TCP.TCP_BSS_END <= 0x8000` and netcfg-within-`DL_BUF`, so future growth fails
+  the build instead of corrupting at runtime. (If TCP BSS later nears 0x8000,
+  relocate it too via `ESP_TCP_BSS_BASE_OVERRIDE`.)
+- **`net_inited` caching can strand a stale ESP session.** `NET.INIT` runs once
+  and is cached (`net_inited=1`); later fetches reuse the open UART/ESP session.
+  If that session goes stale (e.g. after the user lingers on a local page — the
+  Ctrl+B bookmarks page or home — between network fetches), the next `TCP.OPEN`
+  can hang on "Fetching..." and, because the flag stays 1, never recover. Remedy:
+  call `INVALIDATE_NET` when leaving such a path so the next fetch re-runs
+  `NET.INIT` (full UART re-init + AT + drain, no ISA_RESET). **This is NOT because
+  file I/O corrupts the card** — verified the kit brackets every UART access with
+  `ISA_OPEN/ISA_CLOSE` (save/restore WIN3), which is exactly why a chunked download
+  (interleaved `RECV` + `FILE.WRITE` on one open socket) keeps working. The
+  `EXEC_PROGRAM` re-init is for a different reason: a child program can reprogram
+  the ISA card directly. **Confirmed on target:** `INVALIDATE_NET` after the Ctrl+B
+  bookmarks detour fixes the "fetch hangs after bookmarks" report. (The deeper
+  trigger of the staleness wasn't instrumented; a long idle on a *network* page
+  could plausibly strand the session the same way — if that ever surfaces, re-init
+  on connect-failure or before any fetch following an idle gap would generalise it.)
+- **`MAINLOOP` dispatch is `JP`-based** (`JP Z, ON_x`), so a key handler runs with
+  an empty stack (`SP = RUN_STACK_TOP`). A handler MUST end by `JP MAINLOOP` — it
+  must NOT tail-jump into a routine that ends in `RET` (e.g. `JP SET_STATUS`,
+  which RETs via `TERM.PUTS`): that `RET` pops garbage above the WIN2 page and
+  hangs. Use `CALL SET_STATUS` + `JP MAINLOOP`. (Bit both `ON_ADD_BOOKMARK` and
+  the older `.h_execfail`.) A bare `JP SET_STATUS` is only OK as a tail-call
+  inside a routine that was itself `CALL`ed (e.g. `SHOW_ERROR`, `SHOW_DOC_STATUS`).
 
 ## 9. Reference index (local paths)
 

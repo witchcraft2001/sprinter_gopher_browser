@@ -129,6 +129,21 @@ MAINLOOP
 	CP		KEY_BS
 	JP		Z, ON_BACK
 
+	; Ctrl combos. B = shift-state mask (bit 5 = Ctrl). For a Ctrl+letter the DSS
+	; driver emits NO symbolic code (A/E = 0), so the letter is identified by its
+	; physical keycode in D (masked with 0x7F, as the texteditor does for its own
+	; Ctrl shortcuts). Only checked when a Ctrl key is down, so plain typing and
+	; the arrow keys (handled below) are unaffected.
+	LD		A, B
+	AND		KB_CTRL | KB_L_CTRL | KB_R_CTRL
+	JR		Z, .navkeys
+	LD		A, D
+	AND		0x7F
+	CP		KEY_B					; Ctrl+B -> open the bookmarks file
+	JP		Z, ON_BOOKMARKS
+	CP		KEY_D					; Ctrl+D -> add the current page to bookmarks
+	JP		Z, ON_ADD_BOOKMARK
+.navkeys
 	LD		A, D
 	CP		KEY_UP
 	JP		Z, ON_UP
@@ -788,7 +803,8 @@ ON_ENTER
 	JP		MAINLOOP
 .h_execfail
 	LD		HL, MSG_EXEC_FAIL
-	JP		SET_STATUS
+	CALL	SET_STATUS				; CALL (not JP): ON_ENTER is a JP target from
+	JP		MAINLOOP				; MAINLOOP, so end with JP, not a bare RET
 .h_cancel
 	CALL	REDRAW_FULL				; restore the header (URL was shown there)
 	CALL	SHOW_DOC_STATUS
@@ -1261,6 +1277,151 @@ ON_BACK
 	JP		MAINLOOP
 
 ; ------------------------------------------------------
+; Bookmarks (Ctrl+B = open, Ctrl+D = add the current page). The bookmarks live in
+; a gopher-format file BOOKMARK.GPH next to the EXE (8.3 name; we chdir'd into the
+; EXE dir at startup, so a relative name resolves there). Each line is a normal
+; type-1 menu record, so opening the file just browses it like any other page.
+; ------------------------------------------------------
+BM_FILE			DB "BOOKMARK.GPH", 0
+
+; Ctrl+B: open BOOKMARK.GPH as a local menu page. Pushes history (so Backspace
+; returns to where you were) and detaches the current doc, like following a link.
+ON_BOOKMARKS
+	CALL	PUSH_HIST				; cache the current page (nav + its doc pages)
+	CALL	DOC.NEW					; detach those pages; start a fresh empty doc
+	XOR		A
+	LD		(cur_kind), A			; 0 = local page (no "Loaded N bytes" status)
+	LD		A, '1'
+	LD		(DOC_TYPE_CUR), A		; bookmarks render as a gopher menu
+	LD		HL, MSG_BM_TITLE
+	LD		DE, DOC_TITLE
+	LD		B, TITLE_MAX
+	CALL	STRCPYN
+	LD		HL, 0
+	LD		(HOST_CUR), HL			; empty host marks a local page (not bookmarkable)
+	LD		HL, BM_FILE
+	CALL	LOAD_DISK_GPH			; load the file into the doc; CF=1 absent/empty
+	JR		NC, .have
+	LD		HL, BM_EMPTY_DOC		; no bookmarks yet -> a friendly placeholder page
+	LD		BC, BM_EMPTY_LEN
+	CALL	DOC.APPEND
+.have
+	CALL	INVALIDATE_NET			; re-init the ESP before the next fetch: time spent on
+									; this local page can leave the cached session stale
+	CALL	DOC.COUNT_LINES
+	LD		HL, 0
+	LD		(sel_index), HL
+	LD		(top_index), HL
+	CALL	REDRAW_FULL
+	CALL	SHOW_DOC_STATUS
+	JP		MAINLOOP
+
+; Ctrl+D: append the current page to BOOKMARK.GPH as a type-1 gopher record
+; "<type><title> TAB <selector> TAB <host> TAB <port> CRLF". Only network pages
+; have a host to bookmark; the home/bookmarks pages (empty host) are skipped.
+ON_ADD_BOOKMARK
+	LD		A, (HOST_CUR)
+	OR		A
+	JR		Z, .nothing
+	CALL	BUILD_BM_LINE			; -> BM_LINE, BC = byte count
+	CALL	APPEND_BM_LINE			; create/append BOOKMARK.GPH; CF=1 on disk error
+	PUSH	AF						; force a re-init before the next fetch (the cached ESP
+	CALL	INVALIDATE_NET			; session may go stale here); preserve the write's CF
+	POP		AF
+	JR		C, .fail
+	LD		HL, MSG_BM_ADDED
+	JR		.show
+.nothing
+	LD		HL, MSG_BM_NONE
+	JR		.show
+.fail
+	LD		HL, MSG_BM_FAIL
+.show
+	CALL	SET_STATUS				; CALL (not JP): SET_STATUS RETs, we JP to the loop
+	JP		MAINLOOP
+
+; Build the bookmark line for the current page into BM_LINE. Out: BC = length.
+; DOC_TITLE is in WIN1; SEL_CUR/HOST_CUR/PORT_CUR are in the WIN2 scratch page -
+; COPYZ reads either window fine.
+BUILD_BM_LINE
+	LD		DE, BM_LINE
+	LD		A, (DOC_TYPE_CUR)		; gopher type byte
+	LD		(DE), A
+	INC		DE
+	LD		HL, DOC_TITLE			; display text
+	CALL	COPYZ
+	LD		A, 9					; TAB
+	LD		(DE), A
+	INC		DE
+	LD		HL, SEL_CUR				; selector
+	CALL	COPYZ
+	LD		A, 9
+	LD		(DE), A
+	INC		DE
+	LD		HL, HOST_CUR			; host
+	CALL	COPYZ
+	LD		A, 9
+	LD		(DE), A
+	INC		DE
+	LD		HL, PORT_CUR			; port
+	CALL	COPYZ
+	LD		A, 13					; CRLF (NEXT_LINE tolerates CRLF or LF)
+	LD		(DE), A
+	INC		DE
+	LD		A, 10
+	LD		(DE), A
+	INC		DE
+	LD		HL, BM_LINE				; BC = DE - BM_LINE
+	EX		DE, HL					; HL = end, DE = start
+	OR		A
+	SBC		HL, DE
+	LD		B, H
+	LD		C, L
+	RET
+
+; Append BM_LINE (BC bytes) to BOOKMARK.GPH, creating the file if needed.
+; Out: CF=1 on a disk error (create/write failed).
+APPEND_BM_LINE
+	PUSH	BC						; save the length across the open/create
+	LD		HL, BM_FILE
+	LD		A, FM_READ_WRITE
+	LD		C, DSS_OPEN_FILE
+	RST		DSS						; -> A=handle, CF=1 if not found
+	JR		NC, .opened
+	LD		HL, BM_FILE				; first bookmark: create the file (#0A, the
+	LD		A, FA_ARCHIVE			; create/overwrite call proven by the download path)
+	LD		C, FILE.DSS_CREATE_OVR
+	RST		DSS						; -> A=handle, CF=1 error
+	JR		C, .err
+.opened
+	LD		(bm_fm), A
+	LD		B, SEEK_END				; append: position at end of file
+	LD		HL, 0
+	LD		IX, 0
+	LD		C, DSS_MOVE_FP
+	RST		DSS
+	POP		BC						; restore the line length
+	PUSH	BC
+	LD		D, B
+	LD		E, C					; DE = size
+	LD		HL, BM_LINE
+	LD		A, (bm_fm)
+	LD		C, DSS_WRITE
+	RST		DSS						; HL=buf, DE=size, A=handle; CF=1 error
+	PUSH	AF						; keep the write's CF across CLOSE
+	LD		A, (bm_fm)
+	LD		C, DSS_CLOSE_FILE
+	RST		DSS
+	POP		AF
+	POP		BC
+	RET
+.err
+	POP		BC
+	SCF
+	RET
+bm_fm			DB 0
+
+; ------------------------------------------------------
 ; Built-in home page (no network). Loaded into the doc like any fetched page.
 ; ------------------------------------------------------
 LOAD_HOME
@@ -1296,6 +1457,13 @@ LOAD_HOME
 HOME_FILE		DB "INDEX.GPH", 0
 LOAD_HOME_DISK
 	LD		HL, HOME_FILE
+	; fall through into LOAD_DISK_GPH
+
+; Open the ASCIIZ gopher file named in HL (relative to the EXE dir, where we
+; chdir'd at startup) and load its whole contents into the current document.
+; Out: CF=0 loaded (>0 B), CF=1 absent/empty. Shared by the home page and the
+; bookmarks page (Ctrl+B).
+LOAD_DISK_GPH
 	LD		A, FM_READ
 	LD		C, DSS_OPEN_FILE
 	RST		DSS						; HL=name, A=mode -> A=handle, CF=1 not found
@@ -2015,9 +2183,25 @@ EXEC_PROGRAM
 	; flag; the next fetch re-runs NET.INIT (re-init UART + AT, drain stale bytes,
 	; no ISA_RESET so the NETUP Wi-Fi session is preserved). Without this the next
 	; TCP.OPEN talks to a disturbed card -> "Connect failed".
+	CALL	INVALIDATE_NET
+	POP		AF
+	RET
+
+; Drop the cached "ESP is initialised" flag so the next fetch re-runs NET.INIT
+; (full UART re-init + AT + drain, no ISA_RESET -> Wi-Fi session preserved). This
+; is a RECOVERY: a cached net_inited=1 makes a fetch skip init and reuse the open
+; UART/ESP session; if that session has gone stale the connect hangs on
+; "Fetching..." and, because the flag stays 1, never recovers ("link dies"). A
+; forced re-init clears any stale UART/ESP state.
+;   NOTE: this is NOT because file I/O corrupts the card. The kit brackets every
+;   UART access with ISA_OPEN/ISA_CLOSE (which save/restore WIN3), so a file
+;   read/write between network ops is safe - that's exactly why a chunked download
+;   (interleaved RECV + FILE.WRITE on one open socket) works. EXEC_PROGRAM re-inits
+;   for a different reason (a child program can reprogram the ISA card directly).
+; Trashes A.
+INVALIDATE_NET
 	XOR		A
 	LD		(net_inited), A
-	POP		AF
 	RET
 
 ; Derive an 8.3 filename from the selector DL_SEL into DL_NAME, then build
@@ -2899,6 +3083,10 @@ DL_DIRPFX		DB "DOWNLOAD", 0x5C, 0	; per-file path prefix (backslash separator)
 DEF_DLNAME		DB "INDEX.BIN", 0		; fallback when the selector has no basename
 KEY_SKIPASK		DB "skip_ask_for_exec", 0
 
+; One gopher record assembled for Ctrl+D before it is appended to BOOKMARK.GPH.
+; Sized for type + title(64) + selector(200) + host(64) + port(8) + TABs + CRLF.
+BM_LINE			DS 352, 0
+
 ; One decoded gopher row (type + TAB-split fields). MUST be in WIN1 (here in the
 ; code image), not the WIN2 scratch page: DSS PChars prints the display field
 ; straight from this buffer, and a WIN2 source prints as garbage.
@@ -2913,7 +3101,7 @@ MSG_BANNER		DB "GOPHER Browser v.", APP_VERSION, " (", BUILD_DATETIME, ")", 13, 
 				DB "by Dmitry Mikhalchenkov (SprinterTeam)", 13, 10, 0
 MSG_RUNEXT		DB "Running external viewer:", 13, 10, 0
 MSG_CRLF		DB 13, 10, 0
-MSG_STATUS		DB "Up/Down/Home/End move  PgUp/PgDn page  Enter open  Bksp back  Esc/F10 quit", 0
+MSG_STATUS		DB "Up/Dn move  Enter open  Bksp back  ^B bookmarks  ^D add  Esc/F10 quit", 0
 MSG_NONET		DB "Wi-Fi not up - run NETUP first (you can still browse the home page)", 0
 MSG_CONFIRM_QUIT DB "Quit?  Y = yes,  any other key = no", 0
 MSG_FETCHING	DB "Fetching...", 0
@@ -2935,6 +3123,10 @@ MSG_SAVING		DB "Saving ", 0
 MSG_SAVED		DB "Saved ", 0
 MSG_TO			DB " to ", 0
 MSG_OPEN_ASK	DB "Open in the associated program?  Y = yes,  any other key = no", 0
+MSG_BM_TITLE	DB "Bookmarks", 0
+MSG_BM_ADDED	DB "Page added to bookmarks.", 0
+MSG_BM_NONE		DB "Nothing to bookmark (open a gopher page first).", 0
+MSG_BM_FAIL		DB "Could not write the bookmarks file.", 0
 MSG_EXEC_FAIL	DB "Could not launch the associated program.", 0
 MSG_MEM_ERR		DB "Cannot allocate work page.", 0
 ERR_INIT		DB "Network init failed - run NETUP first.", 0
@@ -2960,6 +3152,15 @@ WELCOME_DOC
 WELCOME_END
 WELCOME_LEN		EQU WELCOME_END - WELCOME_DOC
 
+; Shown by Ctrl+B when BOOKMARK.GPH does not exist yet (or is empty).
+BM_EMPTY_DOC
+	DB "iNo bookmarks yet.", 13, 10
+	DB "i", 13, 10
+	DB "iOpen a gopher page, then press Ctrl+D to bookmark it.", 13, 10
+	DB "iPress Backspace to go back.", 13, 10
+BM_EMPTY_END
+BM_EMPTY_LEN	EQU BM_EMPTY_END - BM_EMPTY_DOC
+
 	ENDMODULE
 
 	INCLUDE "term.asm"
@@ -2969,12 +3170,34 @@ WELCOME_LEN		EQU WELCOME_END - WELCOME_DOC
 	INCLUDE "file.asm"
 	INCLUDE "cfg.asm"
 
+; The network kit anchors its BSS chain immediately after the WIN1 image
+; (RS_BUFF = post-image RAM). As this app grew, netcfg's 2 KB CFG_BUFF was pushed
+; PAST 0x8000 (to ~0x85BA), so it straddled the WIN1/WIN2 page boundary AND
+; overlapped STAGE - corrupting the receive buffer and killing the link (the
+; "fetching hangs / connection dies" bug). netcfg reads NET.CFG into CFG_BUFF as
+; one contiguous block, so it must live wholly within a single physical page and
+; not collide with a live buffer. Relocate the whole netcfg BSS into the DL_BUF
+; region (4 KB, entirely in the WIN2 page): netcfg's config load runs once inside
+; NET.INIT, strictly BEFORE any receive/download touches DL_BUF, so their
+; lifetimes are disjoint and aliasing is safe. RS_BUFF + the ESP-TCP BSS stay in
+; WIN1 under 0x8000. (The kit exposes this override for exactly this situation.)
+	DEFINE NETCFG_BSS_BASE_OVERRIDE		; tell netcfg_lib NOT to self-place its BSS
+NETCFG_BSS_BASE		EQU DL_BUF			; ...we place it here (in the WIN2 page) instead
 	INCLUDE "netcfg_lib.asm"			; defines _NETCFG (needed by wcommon)
 	INCLUDE "wcommon.asm"
 	INCLUDE "dss_error.asm"
 	INCLUDE "isa.asm"
 	INCLUDE "esp_tcp.asm"
 	INCLUDE "esplib.asm"				; anchors the lib BSS chain; keep last
+
+; Guard rails against the "network BSS crept past 0x8000" corruption (which silently
+; clobbers the WIN2 scratch page and hangs every fetch). RS_BUFF and the ESP-TCP
+; BSS are anchored just after the WIN1 image, so they must stay below WIN2 (0x8000);
+; netcfg's BSS is deliberately relocated into DL_BUF (WIN2) and must stay within it.
+; If the image grows enough to break either, the build fails here instead of at run.
+	ASSERT TCP.TCP_BSS_END <= 0x8000		; WIN1 network BSS must not reach the WIN2 page
+	ASSERT NETCFG.NETCFG_BSS_END <= DL_BUF + DL_BUF_SIZE	; netcfg BSS must fit inside DL_BUF
+	ASSERT NETCFG_BSS_BASE >= 0x8000		; ...and live wholly in the WIN2 page (no boundary split)
 
 ; End of the emitted image. The EXE header's LOADER field = IMAGE_END - LOAD_ADDR,
 ; and the Makefile appends INDEX.GPH starting at file offset 0x200 + that size.
