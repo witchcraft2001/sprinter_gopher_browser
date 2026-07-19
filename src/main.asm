@@ -93,6 +93,7 @@ START
 	LD		A, (IX-3)					; EXE file handle - DSS leaves a loader EXE open,
 	LD		(home_fm), A				; FM at (IX-3); used to read the appended home page
 	CALL	WCOMMON.INIT_VMODE			; record current mode so EXIT restores cleanly
+	CALL	INIT_PROGRESS_VRAM			; save screen 0/1 and derive direct status address
 	CALL	SHOW_BANNER					; version + build-date banner on load
 	CALL	INIT_RUNTIME_PAGE			; map a fresh WIN2 page for the scratch buffers
 	JP		C, MEM_ERROR
@@ -2108,7 +2109,6 @@ DOWNLOAD
 	CALL	NET.ACTIVE_PREP			; clear LSR/parser state; RTS up for the '>' prompt
 	LD		HL, MSG_RECEIVING_ZERO	; safe DSS draw: selector has not been sent yet
 	CALL	SET_STATUS
-	CALL	DLP_CHECK				; verify the VRAM fast path against that text
 	LD		HL, DL_SEL
 	CALL	BUILD_REQ_HL			; HL=REQ_BUF, BC=len
 	CALL	NET.SEND
@@ -2416,16 +2416,12 @@ DL_APPEND_RUN
 	SCF
 	RET		NZ						; page cap / GetMem failure
 	CALL	DL_ADD					; received total += BC
-	; Progress DURING receive must be VRAM-only: a DSS draw here runs with RTS
+	; Progress DURING receive is VRAM-only: a DSS draw here runs with RTS
 	; asserted and, like the page loop's deferred drawing, could expose the
-	; stream to a mid-draw close. The VRAM paint is DI-guarded and sub-ms, so it
-	; is safe. If VRAM calibration failed (dlp_base=0) skip the per-burst draw
-	; entirely; the final "Saved N KB" (RX idle) still reports the size via DSS.
+	; stream to a mid-draw close. The VRAM paint is DI-guarded and sub-ms.
 	LD		HL, 0
 	LD		(dl_pending), HL		; appended now -> counted in recv_lo, no pending
-	LD		A, (dlp_base)
-	OR		A
-	CALL	NZ, DL_PROGRESS_RX
+	CALL	DL_PROGRESS_RX
 	OR		A						; CF=0
 	RET
 
@@ -2562,11 +2558,8 @@ DL_ADD
 
 ; Per-burst progress during accumulation: show recv_lo (appended) plus the
 ; bytes accumulated this window but not yet appended (the whole fill). VRAM only
-; (no gap); skipped if VRAM calibration failed. Clobbers A/BC/DE/HL.
+; (no gap). Clobbers A/BC/DE/HL.
 DL_PROGRESS_ACC
-	LD		A, (dlp_base)
-	OR		A
-	RET		Z						; no VRAM path -> skip (final Saved shows size)
 	LD		HL, (dl_comb)			; fill = un-appended bytes this window
 	LD		(dl_pending), HL
 	CALL	DL_PROGRESS_RX
@@ -2606,17 +2599,6 @@ DL_PROGRESS_RX
 	SBC		HL, DE					; HL = delta (KB only grows)
 	POP		DE						; DE = KB
 	RET		Z						; same KB -> nothing to redraw
-	LD		A, (dlp_base)
-	OR		A
-	JR		NZ, .go					; VRAM path: draw every KB
-	; DSS fallback path: draw every 2+ KB to bound the added RTS-low windows
-	LD		A, H
-	OR		A
-	JR		NZ, .go
-	LD		A, L
-	CP		2
-	RET		C						; delta 1 KB -> wait (dl_last_kb unchanged)
-.go
 	LD		(dl_last_kb), DE
 	PUSH	DE
 	LD		HL, DLP_NUM				; blank the variable part (erases a longer
@@ -2636,13 +2618,11 @@ DL_PROGRESS_RX
 	INC		HL
 	LD		(HL), 'B'
 	LD		A, (dlp_base)
-	OR		A
-	JR		Z, DLP_DRAW_DSS			; sanity check failed -> pause-free DSS draw
 	; fall through to the VRAM paint, A = PORT_Y of the first cell
 
 ; Paint DLP_TXT onto the status row via direct text VRAM access (see
-; console.inc): WIN3 -> page #50, PORT_Y selects the column (= DLP_COL1-1+col,
-; see the derivation above DLP_CHECK), symbol at #C301+row*4, attribute right
+; console.inc): WIN3 -> page #50, PORT_Y selects the column (base derived from
+; DSS GetVMod by INIT_PROGRESS_VRAM), symbol at #C301+row*4, attribute right
 ; after it. DI around the burst - an interrupt handler could remap WIN3 or
 ; PORT_Y between select and write.
 DLP_ROW_SYM		EQU 0xC301 + STATUS_ROW * 4
@@ -2672,54 +2652,20 @@ DLP_DRAW
 	EI
 	RET
 
-; Fallback when the VRAM probe found nothing: an ordinary DSS status draw with
-; NO RTS pause - the ~1-2 ms draw rides on the 16-byte FIFO + TL16C550 AFE,
-; like a DOC.APPEND does. A manual NET.RX_PAUSE here was the last remaining
-; mid-receive purge window: on real HW (ESP-AT V2.2.1) the firmware drops its
-; queued +IPD tail when the peer's FIN is processed while the relay is blocked,
-; so a paused draw every 2 KB truncated files of every size by a variable
-; amount. NOTHING in the receive loop may pause RTS.
-DLP_DRAW_DSS
-	CALL	STATUS_HOME
-	LD		HL, DLP_TXT
-	JP		TERM.PUTS
-
-; PORT_Y of the console's column 1 - a PLATFORM CONSTANT, identical on every
-; Sprinter (same BIOS window code), NOT a per-machine value. Derivation, from
-; the BIOS source (FUNC_LOW_PRINT.ASM WIN_OPEN_W1): H_BEG = 2*PLACE_H + 1,
-; OR #80 for the standard screen half; the 80x32 console window (LP_SCR_80,
-; opened by LP_SET_80 with HL=#4000) has PLACE_H=0 -> H_BEG=#81, so text
-; column C maps to PORT_Y = #81 + C. (The platform manual's "screen A,
-; PORT_Y=col+1" formula describes the OTHER, non-displayed half - drawing
-; there was why the first VRAM progress build showed nothing.)
-DLP_COL1		EQU 0x82
-
-; Verify the constant once per download before relying on it: the 'R' of the
-; "Receiving 0 KB" status just drawn by DSS must be visible at (STATUS_ROW,
-; col 1) = PORT_Y DLP_COL1. This is a sanity check of an invariant, not a
-; search: on the expected match progress uses the zero-cost VRAM path; on a
-; mismatch (foreign video state) dlp_base=0 selects the pause-free DSS
-; fallback so a download still shows progress and never pauses RTS.
-DLP_CHECK
-	DI
-	IN		A, (PAGE3)
-	LD		B, A					; saved WIN3 page
-	LD		A, VRAM_TXT_PAGE
-	OUT		(PAGE3), A
-	LD		A, DLP_COL1
-	OUT		(PORT_Y), A
-	LD		A, (DLP_ROW_SYM)
-	CP		'R'
-	LD		A, DLP_COL1				; keeps flags
-	JR		Z, .set
-	XOR		A						; unexpected layout -> DSS fallback
-.set
-	LD		(dlp_base), A
-	LD		A, VRAM_PORTY_PARK
-	OUT		(PORT_Y), A
+; WCOMMON.INIT_VMODE has already selected 80x32. DSS GetVMod returns the active
+; screen in B (0/1). In this mode BIOS H_BEG is #01 for screen 0 and #81 for
+; screen 1; our status text starts at logical column 1, hence PORT_Y #02/#82.
+; Store both values once at startup. No probing or DSS call is needed while a
+; binary transfer is active.
+INIT_PROGRESS_VRAM
+	LD		C, DSS_GETVMOD
+	RST		DSS						; A=mode (#03), B=active screen (0/1)
 	LD		A, B
-	OUT		(PAGE3), A				; restore WIN3
-	EI
+	AND		1
+	LD		(video_page), A
+	RRCA							; screen 1 -> bit 7
+	OR		0x02					; logical status column 1
+	LD		(dlp_base), A
 	RET
 
 ; Status for the post-receive disk phase: "Writing <n> KB". Network is idle and
@@ -2924,6 +2870,8 @@ EXEC_PROGRAM
 	LD		SP, (exec_sp)
 	PUSH	AF
 	CALL	CHDIR_EXE				; cwd is process state (not a window) - restore it
+	LD		A, (video_page)			; restore the text-screen page captured at startup
+	LD		B, A
 	LD		A, DSS_VMOD_T80			; re-assert 80x32 text mode
 	LD		C, DSS_SETVMOD
 	RST		DSS
@@ -3844,7 +3792,8 @@ dl_first		DB 0					; 1 = first read of an accumulation window
 dl_pending		DW 0					; accumulated-but-not-appended bytes (progress)
 dl_partial		DB 0					; 1 = user kept an incomplete transfer
 dl_last_kb		DW 0					; last whole-KB value drawn by DL_PROGRESS_RX
-dlp_base		DB 0					; DLP_COL1 after DLP_CHECK ok; 0 = DSS fallback
+video_page		DB 0					; DSS text screen 0/1, captured after INIT_VMODE
+dlp_base		DB 0x02					; PORT_Y status col 1: #02 (screen 0) / #82 (screen 1)
 dl_disk_err		DB 0					; 0=none, 1=DSS_WRITE, 2=UART LSR error, 4=no memory
 dl_net_err		DB 0					; raw receive result (unused vs timeout)
 DL_DIRMK		DB "DOWNLOAD", 0		; mkdir target (relative to the EXE dir)
@@ -3889,7 +3838,7 @@ URL_SCHEME		DS 16, 0
 PREVIEW_BUF		DS 88, 0				; idle link-preview string for the status bar
 MSG_SEARCH		DB "Search (Enter=go  Esc=cancel): ", 0
 ; Fixed-width status text painted by DL_PROGRESS_RX (DLP_DRAW writes exactly
-; DLP_TXT_LEN cells; the trailing NUL is for the DLP_DRAW_DSS fallback's PUTS).
+; DLP_TXT_LEN cells; the trailing NUL also keeps this buffer ASCIIZ).
 ; DLP_NUM holds "<n> KB" + space padding.
 DLP_TXT			DB "Receiving "
 DLP_NUM			DS 16, ' '

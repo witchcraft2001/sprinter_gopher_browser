@@ -341,20 +341,16 @@ shutdown-on-exit (below). Awaiting a re-test.
    `#C301+row*4`, attr next byte, park `#C0`, DI around the burst, save/restore
    WIN3 via `IN A,(#E2)` — readable, the BIOS `LP_OPEN_PG` does the same): no
    DSS/BIOS call, no RTS pause; the TL16C550 auto-RTS (AFE) covers the ~0.2 ms
-   burst. **The console's PORT_Y column base is a PLATFORM CONSTANT** (same
-   BIOS on every Sprinter, no per-machine variance): BIOS `WIN_OPEN_W1`
-   computes `H_BEG = 2*PLACE_H + 1 | #80` (the `|#80` half is the DISPLAYED
-   one), and the 80×32 console window (`LP_SCR_80` via `LP_SET_80`, `PLACE_H=0`)
-   gets `H_BEG = #81` → text column C = PORT_Y `#81+C`, so col 1 = `#82`
-   (`DLP_COL1`). The platform manual's "screen A, PORT_Y = col+1" formula is
-   the OTHER, non-displayed half — drawing there was why the first VRAM
-   progress build showed nothing. `DLP_CHECK` verifies the constant once per
-   download (reads back the 'R' of the DSS-drawn "Receiving" status at
-   `DLP_COL1`) — a sanity check of the invariant, not a search; a match locks
-   the zero-cost VRAM path; a mismatch (`dlp_base=0`) falls back to
-   `DLP_DRAW_DSS` — a normal DSS status draw with **NO RTS pause** (the ~1-2 ms
-   ride on the 16-byte FIFO + AFE, like a `DOC.APPEND`), rate-limited to every
-   2 KB. **Invariant: NOTHING in the receive loop may call `NET.RX_PAUSE`.**
+   burst. **The PORT_Y base is computed, never probed.** Immediately after
+   `WCOMMON.INIT_VMODE` selects 80×32, `INIT_PROGRESS_VRAM` calls DSS
+   `GetVMod #51` (`B` = active text screen 0/1). BIOS `WIN_OPEN_W1` gives
+   `H_BEG=#01` for screen 0 and `#81` for screen 1; the status starts at logical
+   column 1, so `dlp_base = #02 | (B<<7)` (`#02`/`#82`). The screen number is
+   saved in `video_page`; after an external viewer `EXEC_PROGRAM` explicitly
+   passes that page in `B` while reasserting mode `#03`. Thus every in-stream
+   update always takes the direct VRAM path; there is no DSS fallback or
+   screen-content search. **Invariant: NOTHING in the receive loop may call
+   `NET.RX_PAUSE`.**
    The pre-0.1.7 fallback paused RTS around each draw and that was the
    remaining tail-killer on real HW (ESP-AT V2.2.1): the firmware drops queued
    `+IPD` frames when the peer's FIN is processed while the relay is blocked,
