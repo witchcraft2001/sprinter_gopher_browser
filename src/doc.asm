@@ -210,6 +210,18 @@ MAP_PAGE
 	RET
 
 ; ------------------------------------------------------
+; RESERVE - make sure the first document page is allocated before a network
+; transfer starts. This keeps the common first APPEND down to a fast map+LDIR;
+; it cannot enter DSS GetMem while the ESP is already streaming.
+; Out: CF=0 ready, CF=1 allocation failed (doc_trunc is set).
+; ------------------------------------------------------
+RESERVE
+	LD		A, (doc_npages)
+	OR		A
+	RET		NZ
+	JP		ALLOC_PAGE
+
+; ------------------------------------------------------
 ; APPEND - copy BC bytes from HL (WIN1/WIN2) into the document, growing the
 ; page chain on demand. Out: CF=0 (truncation is silent, sets doc_trunc).
 ; ------------------------------------------------------
@@ -238,7 +250,7 @@ APPEND
 	OR		L
 	JR		NZ, .haspace
 .grow
-	CALL	.new_page
+	CALL	ALLOC_PAGE
 	JR		C, .dropall
 	LD		HL, DOC_PAGE_SIZE
 .haspace
@@ -272,12 +284,14 @@ APPEND
 	OR		A
 	SBC		HL, BC
 	LD		(.len), HL
-	JR		.loop
+	JP		.loop
 .dropall
 	OR		A
 	RET
+.src	DW 0
+.len	DW 0
 
-.new_page
+ALLOC_PAGE
 	LD		A, (doc_npages)
 	CP		DOC_MAX_PAGES
 	JR		NC, .np_fail
@@ -328,8 +342,6 @@ APPEND
 	ADC		A, H
 	LD		H, A
 	RET
-.src	DW 0
-.len	DW 0
 
 ; ------------------------------------------------------
 ; AT_END - CF=1 if the read cursor has reached the write cursor (no more data).
@@ -539,7 +551,7 @@ SKIP_LINE
 ; advancing the read cursor past the LF.
 ; ------------------------------------------------------
 NEXT_LINE
-	LD		HL, MAIN.LINE_BUF
+	LD		HL, LINE_BUF
 .l
 	CALL	AT_END
 	JR		C, .done
@@ -550,7 +562,7 @@ NEXT_LINE
 	JR		Z, .done				; LF ends the line (consumed)
 	LD		(.sb), A
 	PUSH	HL
-	LD		DE, MAIN.LINE_BUF_END
+	LD		DE, LINE_BUF + 510
 	OR		A
 	SBC		HL, DE					; CF=1 if HL < end (room)
 	POP		HL
@@ -581,9 +593,9 @@ COUNT_LINES
 .l
 	CALL	AT_END
 	RET		C						; reached the end without a terminator (incomplete)
-	CALL	NEXT_LINE				; -> MAIN.LINE_BUF (CR stripped, NUL-terminated)
+	CALL	NEXT_LINE				; -> LINE_BUF (CR stripped, NUL-terminated)
 	; gopher terminator? a line that is exactly "."
-	LD		HL, MAIN.LINE_BUF
+	LD		HL, LINE_BUF
 	LD		A, (HL)
 	CP		'.'
 	JR		NZ, .count

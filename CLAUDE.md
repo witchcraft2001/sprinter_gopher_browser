@@ -127,7 +127,7 @@ shutdown-on-exit (below). Awaiting a re-test.
   HL across the `AT_END` call; the original `AT_END` clobbered HL, so every copied
   byte went to a junk address and `LINE_BUF` stayed empty (this — NOT the memory
   syscalls — was the long-standing "garbage/blank rows" bug).
-- `LINE_BUF` lives in **WIN1** (the code image, `MAIN.LINE_BUF`); each visible
+- `LINE_BUF` lives in **WIN2** at `0x9D80`; each visible
   line is copied into it **before** any TERM/DSS call (so no doc page stays
   mapped in WIN3 across the print). **MYTH BUSTED:** an earlier note here claimed
   "DSS PChars renders garbage from a WIN2 source string, so LINE_BUF must be in
@@ -136,9 +136,10 @@ shutdown-on-exit (below). Awaiting a re-test.
   from a WIN2 GetMem page** (`SHOW_EXEC_BANNER` PChars's the command line straight
   out of `CFG_CMD_BUF` at `0x9BA0`). The original "garbage rows" bug was the
   `AT_END` HL-clobber (above), misattributed to the memory window. So buffers may
-  freely be PChars sources from WIN2; `LINE_BUF` staying in WIN1 is now just a
-  minor convenience, not a requirement. (STAGE/REQ_BUF/HIST_DATA stay in the WIN2
-  GetMem page as plain memory.)
+  freely be PChars sources from WIN2. Moving `LINE_BUF` there freed 512 bytes of
+  scarce WIN1 image space; during binary downloads its first 40 bytes temporarily
+  hold the detached visible page's DOC descriptor. (STAGE/REQ_BUF/HIST_DATA stay
+  in the same WIN2 GetMem page as plain memory.)
 - `src/main.asm` rewritten: gopher rows parsed (`PARSE_ROW`: type/display/
   selector/host/port, TABs→NUL) and rendered straight from doc pages through the
   30-row viewport. **Menu vs text documents:** `DOC_TYPE_CUR` holds the gopher
@@ -163,8 +164,9 @@ shutdown-on-exit (below). Awaiting a re-test.
   network, so the UI is usable before the first fetch.
 - **On exit** (`QUIT`): if the ESP was ever initialised (`net_inited`), call
   `NET.SHUTDOWN` (AT+CIPCLOSE + ATE0) to hand the card back in AT command mode so
-  the next program isn't blocked. We use CIPMODE=0 throughout (kit's +IPD path),
-  so no transparent-mode `+++` escape is needed (unlike SpecTalkZX's `esp_restore`).
+  the next program isn't blocked. Page fetches temporarily use transparent
+  `CIPMODE=1`, but `NET.RAW_FINISH` consumes the peer `CLOSED` or uses a guarded
+  `+++` escape and restores `CIPMODE=0` before returning to the UI.
 - **History:** stack of nav records `{kind,host,port,selector,type,sel,top}` in
   the WIN2 page (`HIST_DATA`), cap 16, oldest dropped on overflow. **Back
   re-fetches** the parent (network) or reloads home — a deliberate v1
@@ -213,9 +215,10 @@ shutdown-on-exit (below). Awaiting a re-test.
   before each `TCP.RECEIVE` and **drops it during the slow append/redraw**, so the
   ESP holds its TX and the UART FIFO never overruns. `SETUP_UART_FLOW` (ESP side)
   is set in `INIT`.
-- **Download progress** on the status bar: `SHOW_PROGRESS` shows the running
-  downloaded size ("Loading N bytes" < 1 KB, else "Loading N KB"; `UTIL.UTOA`
-  for the decimal). Gopher has no content-length, so it's amount, not a percent.
+- **Download progress** on the status bar: page fetches use `SHOW_PROGRESS`;
+  binary receive paints `Receiving N KB` directly into text VRAM page `#50`
+  (no DSS/BIOS call and no RTS pause), updating on whole-KB changes. Gopher has
+  no content-length, so it is an amount, not a percent.
   `doc_lines` (total, from `COUNT_LINES`) is available for a future scroll
   position indicator.
 
@@ -231,15 +234,155 @@ shutdown-on-exit (below). Awaiting a re-test.
 2. **Unsupported gopher item types** (currently "not supported yet"): type `7`
    **search — DONE** (`INPUT_LINE` status-row prompt → `SEL_CUR = selector + TAB +
    query`, fetched and rendered as a type-1 menu). **Binary downloads — DONE**
-   (types `9`/`5`/`g`/`I`/`s`/`;`/`d`/`p` via `IS_BIN_TYPE`): `DOWNLOAD` streams the
-   selector straight to a file in `DOWNLOAD\` (`src/file.asm` = DSS Create `#0A`/
+   (types `9`/`5`/`g`/`I`/`s`/`;`/`d`/`p` via `IS_BIN_TYPE`): `DOWNLOAD` saves to
+   a file in `DOWNLOAD\` (`src/file.asm` = DSS Create `#0A`/
    Write `#14`/Close `#12`/MkDir `#1B`; backslash 8.3 paths) **without touching the
    current document or history** (dedicated `DL_HOST/DL_PORT/DL_SEL` buffers).
    Filename derived from the selector basename, sanitised to 8.3 (`MAKE_DLNAME` +
-   `SANITIZE_CH`, fallback `INDEX.BIN`); status shows running/final size ("Saving/
-   Saved N KB to DOWNLOAD\NAME"); Esc cancels (kit `CANCELLED`); disk-full → ERR_DISK.
-   `DL_RECV_LOOP` mirrors `RECV_LOOP`'s RTS flow-control bracketing, `FILE.WRITE`
-   from `STAGE` (WIN2) after `NET.RX_PAUSE` closes ISA. **Open-in-viewer — DONE:**
+   `SANITIZE_CH`, fallback `INDEX.BIN`); status shows running/final size
+   ("Receiving/Saved N KB", switching to MB for large files); Esc cancels (kit
+   `CANCELLED`); disk-full → ERR_DISK.
+   **THE TAIL-LOSS SAGA — root cause and the v0.1.9 fix.** Proven on REAL
+   Sprinter+ESP (ESP-AT V2.2.1): downloads were byte-exact PREFIXES of their
+   originals, losing a VARIABLE tail (428 B … 2903 B, < 1 TCP window), and
+   `\r\nCLOSED` was never seen. The firmware **discards up to ~1-2 KB of
+   un-relayed RX when the peer's FIN is processed while RTS is DEASSERTED**
+   (i.e. during a slow append/flush). This is documented by the kit's OWN wget
+   (`HOLD_TAIL_MARGIN EQU 8192`: it holds the last 8 KB in RAM with RTS asserted
+   continuously across the close, "so ESP-AT never discards … the largest tail
+   ESP can drop in one close"). wget knows where the end is from HTTP
+   `Content-Length` (and can even re-`GET` the tail with `Range:`); **gopher has
+   neither length nor range**, so we cannot know when to stop making
+   RTS-deasserting gaps. ESP-AT **V2.2.1 also has no passive receive**
+   (`CIPRECVMODE`/`CIPRECVDATA` absent — confirmed by the kit docs and a
+   strings-scan of the flashed images; that would hold data past close and fix
+   it deterministically). Transparent mode alone did NOT fix it (v0.1.8): pages
+   survive only because their `.`-terminator arrives BEFORE the close; a binary
+   stream's last data byte is flush against the FIN.
+   **v0.1.10 keeps the drain-gate but returns binary downloads to ACTIVE +IPD
+   mode** (`DL_RECV_LOOP`, `CIPMODE=0`). Transparent `CIPMODE=1` (v0.1.8/0.1.9)
+   was a **regression on real hardware**: its byte-scanned `\r\nCLOSED` token
+   often never arrived, so downloads hung ~5-8 s then failed "incomplete" (and
+   still lost the tail) — the user confirmed downloads were **more stable without
+   transparent mode**. The kit's own wget uses active mode; its `TCP.RECEIVE`
+   returns **`RES_NOT_CONN` on a genuine peer CLOSED**, a reliable EOF that needs
+   no in-band token. So the whole transparent token machinery is gone
+   (`DL_FIND_CLOSED`, `DL_HOLD`, the withheld-tail split-token handling —
+   deleted). Each `NET.RECV` is capped at **`DL_RECV_CAP` = 1499** (< the kit's
+   `TCP_ACTIVE_IPD_MAX` = 1500) so `CAN_READ_ANOTHER_ACTIVE_IPD` skips its
+   multi-frame peek and returns after ONE +IPD frame; the next read then observes
+   `CLOSED` cleanly instead of swallowing it behind payload.
+   The **tail protection is unchanged** — still wget's "RTS asserted across the
+   close" without a length: bursts ACCUMULATE in `DL_BUF` with RTS held (wget's
+   `RX_RESUME`-before / `RX_PAUSE`-after each read); the doc `DOC.APPEND` — the
+   ONLY RTS-deasserting step — runs ONLY when a short `DL_CONT_TIMEOUT` (250 ms)
+   continuation read returns `RES_RS_TIMEOUT`, i.e. the ESP is momentarily DRAINED
+   (nothing queued to drop on FIN), or when the accumulator passes `DL_ACC_HIGH =
+   DL_BUF_SIZE - DL_RECV_CAP` mid-stream (safe: data still flowing, FIN not
+   pending). A standard gopher server sends the whole body then closes, so the
+   last bytes always drain before the FIN and the `RES_NOT_CONN` is read gap-free.
+   Per-burst VRAM progress (`DL_PROGRESS_ACC`, showing `recv_lo + dl_pending` =
+   fill) keeps the counter advancing < every KB with no gap. A latched UART RX
+   error (`TCP.LSR_ACCUM`, cleared by `NET.ACTIVE_PREP` + at loop top) rejects the
+   whole stream. This makes a confirmed-`RES_NOT_CONN` download the norm — **and a
+   confirmed download is always byte-correct** (EOF is the real close event, never
+   a silence guess). A stall with no CLOSED is still reported incomplete →
+   retry/keep prompt; retrying has a fresh chance. Flow: `NET.CONNECT` →
+   `NET.ACTIVE_PREP` (clear LSR/parser, RTS up for the '>' prompt) → `NET.SEND`
+   selector → `DL_RECV_LOOP` → `NET.CLOSE`; the visible page is detached
+   (`DOC.SAVE_STATE`→`LINE_BUF` + `DOC.NEW`, restored via `DL_RESTORE_DOC` on every
+   exit). **INVARIANT — a receive loop must leave RTS ASSERTED on exit:**
+   `DL_RECV_LOOP`'s last act is `RX_PAUSE`, so both its `.done` and `.fail` exits
+   call `NET.RX_RESUME` before returning. Without it the ESP (RTS gates its UART
+   TX) can't answer `NET.CLOSE`'s `AT+CIPCLOSE` (stale socket lingers) NOR the next
+   fetch's first AT command — the transparent `RAW_CONNECT` does NOT re-assert RTS
+   itself (only `NET.CONNECT.prep` does), so after a download it would fail every
+   page with "Connect failed". (This bit v0.1.10 the moment the active loop
+   replaced the transparent one, which had resumed RTS in `RAW_FINISH`.)
+   Page fetches STILL use transparent `CIPMODE=1` (their `.`-terminator
+   arrives before the close, so the token IS reliable there — see below); the two
+   transports interleave cleanly because each restores `CIPMODE=0` when done.
+   **Residual limit:** if a server streams with no ≥250 ms gap right up to a
+   buffer-full flush that the FIN coincides with, a tail can still drop — then no
+   `RES_NOT_CONN`, so it fails VISIBLY (incomplete → retry), never silent
+   corruption. The only deterministic 100% fix is passive-receive firmware (or a
+   length-bearing protocol like the kit's HTTP wget). **File size is NOT capped:** at the `DOC_MAX_PAGES` (256 KB) cap
+   `DL_MIDFLUSH` writes the chain's whole sectors, carries the sub-sector tail
+   (0..511 B, via `DL_BUF`) into a fresh chain, and receiving continues — mid-
+   file FAT writes stay 512-aligned. The mid-flush RTS pause is safe **mid-stream**
+   (data still flowing, so no FIN is pending and no queued `+IPD` frame is at
+   risk); it is only the FIN-coincident append gap that the drain-gate guards.
+   Note DSS `Write #14` itself
+   flushes a sub-sector final write immediately (read-modify-write of the last
+   sector + `F_SIZE` update), so a non-sector-aligned file length is written
+   faithfully — sector-aligned truncation in a bad download is a symptom of an
+   OLDER streaming binary, not the current write path.
+   **Incomplete-transfer outcome is the user's choice** (`CONFIRM_KEEP`): when
+   a clean prefix was received but the transfer didn't finish (timeout, missing
+   `CLOSED`, post-flush purge), the status asks "R = delete + retry, any other
+   key = keep the file". Retry deletes and restarts the whole download
+   (`JP DOWNLOAD`); keep persists the received prefix via the normal write
+   phase, shows "Saved N KB ... (partial)" and suppresses the open-in-viewer
+   offer (`dl_partial`). Cancel and UART/disk/memory faults still auto-delete
+   (that data is untrustworthy or unwanted).
+   `doc_trunc` mid-receive now only means GetMem refused a page (→
+   `MSG_MEM_ERR`, code 4 in `dl_disk_err`). After `CLOSED`: `SHOW_WRITING`, then
+   `DL_WRITE_DOC` walks the chain and writes through `DL_BUF` in 4 KB staged
+   chunks (a DSS call must never read from a WIN3-mapped page) — every FAT
+   write is 8 whole sectors except the file's final chunk; FAT writes with RTS
+   low are safe here because the peer already closed. `DL_RESTORE_DOC`
+   (`DOC.RESET` + `DOC.LOAD_STATE`) runs on success and on every error path
+   after the detach. The clock `IDLE_CB` is disabled during receive. Each
+   `NET.RECV` stays capped at `TCP_ACTIVE_IPD_MAX-1` so `TCP.RECEIVE` can never
+   swallow `CLOSED` behind payload. Progress ("Receiving
+   N KB") updates on every whole-KB change (each `+IPD` frame is ≤ 1.5 KB, so
+   at least every ~1.5 KB) via `DL_PROGRESS_RX`/`DLP_DRAW` — painted **directly
+   into text VRAM** (WIN3→page `#50`, `PORT_Y #89` selects the column, symbol
+   `#C301+row*4`, attr next byte, park `#C0`, DI around the burst, save/restore
+   WIN3 via `IN A,(#E2)` — readable, the BIOS `LP_OPEN_PG` does the same): no
+   DSS/BIOS call, no RTS pause; the TL16C550 auto-RTS (AFE) covers the ~0.2 ms
+   burst. **The console's PORT_Y column base is a PLATFORM CONSTANT** (same
+   BIOS on every Sprinter, no per-machine variance): BIOS `WIN_OPEN_W1`
+   computes `H_BEG = 2*PLACE_H + 1 | #80` (the `|#80` half is the DISPLAYED
+   one), and the 80×32 console window (`LP_SCR_80` via `LP_SET_80`, `PLACE_H=0`)
+   gets `H_BEG = #81` → text column C = PORT_Y `#81+C`, so col 1 = `#82`
+   (`DLP_COL1`). The platform manual's "screen A, PORT_Y = col+1" formula is
+   the OTHER, non-displayed half — drawing there was why the first VRAM
+   progress build showed nothing. `DLP_CHECK` verifies the constant once per
+   download (reads back the 'R' of the DSS-drawn "Receiving" status at
+   `DLP_COL1`) — a sanity check of the invariant, not a search; a match locks
+   the zero-cost VRAM path; a mismatch (`dlp_base=0`) falls back to
+   `DLP_DRAW_DSS` — a normal DSS status draw with **NO RTS pause** (the ~1-2 ms
+   ride on the 16-byte FIFO + AFE, like a `DOC.APPEND`), rate-limited to every
+   2 KB. **Invariant: NOTHING in the receive loop may call `NET.RX_PAUSE`.**
+   The pre-0.1.7 fallback paused RTS around each draw and that was the
+   remaining tail-killer on real HW (ESP-AT V2.2.1): the firmware drops queued
+   `+IPD` frames when the peer's FIN is processed while the relay is blocked,
+   so every paused draw was a purge window — files of all sizes truncated by a
+   VARIABLE amount (repeat downloads gave different lengths). The real card's
+   V2.2.1 firmware has NO passive receive (`CIPRECVMODE`/`CIPRECVDATA` absent
+   per the kit's strings-scan of the images — see network/AGENTS.md), so
+   pull-paced receive is not available; if variable truncation ever survives a
+   genuinely pause-free receive, the remaining cure is firmware-level (flash an
+   AT build with passive receive, e.g. NONOS AT 1.7.5, and add a
+   `CIPRECVDATA` receive path gated on detection). (A historical hazard to keep in mind for any future buffer
+   compaction: `LDIR` with `BC=0` copies 64 KB — the old streaming flush hit
+   exactly that whenever the EOF remainder was a multiple of 512 and destroyed
+   the whole address space.)
+
+   A subtle kit behaviour was the immediate cause of false incomplete results:
+   `TCP.RECEIVE` normally peeks for another frame when at least 1500 bytes remain.
+   If that peek consumed `CLOSED` after already storing data, it returned the data
+   successfully and forgot the close reason; the next call could only time out.
+   Every receive is capped at 1499 bytes, forcing it to return after
+   the current length-framed payload so the following call observes `CLOSED`
+   explicitly. Only that real `RES_NOT_CONN` result is accepted as EOF; cancel,
+   disk error, or any latched UART OE/PE/FE/BI/RCVE bit deletes the partial
+   file, while a clean-prefix timeout/parser-error prompts retry-or-keep (see
+   above). This applies uniformly to ZIP, MOD, GIF, images and
+   arbitrary binary types; there is no format-specific completeness patch. The
+   progress/final byte counter is 32-bit.
+   **Open-in-viewer — DONE:**
    after a download `MAYBE_OPEN_DOWNLOAD` takes the file's extension (`DL_EXT_PTR`),
    `CFG.VIEWER_FOR_EXT` looks up the program; unless the `skip_ask_for_exec` setting
    is truthy (`SKIP_ASK`) it asks (`CONFIRM_OPEN`, Y/N), then `CFG.BUILD_CMD` expands
@@ -369,12 +512,62 @@ shutdown-on-exit (below). Awaiting a re-test.
    shown instead. Ctrl+D (item 6) appends.
 6c. **Ctrl+G — open an arbitrary address**: a text-input prompt (host[:port][/sel])
    then fetch it.
-7. **Empty doc after long Fetching** on a flaky fetch — investigate / harden
-   (treat tiny/whitespace-only results as an error; better timeout classify).
-   PARTIALLY DONE: the status bar now shows the loaded size and flags
-   "- INCOMPLETE" when the gopher "." terminator was never received
-   (`doc_complete`, `SHOW_LOADED`). Still want to auto-retry / resume truncated
-   transfers (likely a `RECV_TIMEOUT` / kit early-stop issue on slow servers).
+7. **Empty/truncated doc hardening — DONE, awaiting transparent-mode target
+   check.** The status
+   bar shows the loaded size and flags "- INCOMPLETE" when the gopher "."
+   terminator was never received (`doc_complete`, `SHOW_LOADED`). The recurring
+   ~2 KB truncation was the ESP-AT FIN/RTS tail-drop: `RECV_LOOP` manually lowered
+   RTS after every 2 KB `STAGE` block, and if FIN arrived while RTS was low the
+   ESP could discard queued `+IPD` tail bytes. Page receive now keeps manual RTS
+   asserted continuously until it sees the gopher dot terminator; between blocks
+   it only scans the terminator and does a fast `DOC.APPEND`. Receive uses the
+   shared 4 KB `DL_BUF` (safe after NETCFG init, and mutually exclusive with a
+   binary download), and the first doc page is preallocated before the request.
+   Per-block DSS progress/clock drawing is deferred until receive stops. The
+   terminator scanner is stateful across block boundaries and accepts CRLF/LF.
+   The first continuous-RTS version still truncated on target. Diagnostics were
+   decisive: `rx=6` = clean peer `CLOSED`, while `lsr=97` (`0x61`) has no UART
+   overrun/parity/framing bits. A resume-by-refetch experiment also reached the
+   identical prefix, proving the loss is inside jesperl's active `+IPD` FIN path,
+   not the browser's append/parser. The firmware has no passive-receive commands,
+   so **page fetches now use transparent `CIPMODE=1`** (the proven telnet raw-UART
+   transport): selector+CRLF is sent directly, response bytes bypass `+IPD`, and
+   `RECV_LOOP` drains until the gopher terminator plus ESP `CLOSED`. Cleanup
+   restores command mode/CIPMODE=0; timeout/cancel uses the guarded `+++` escape.
+   Applying that transparent transport to binary downloads was a failed
+   experiment: fresh target ZIPs were exact prefixes of their local-server
+   originals (8760/11095 and 24820/26676), and only about one transfer in ten
+   completed. Raw mode provides neither `+IPD` lengths nor a reliable close event
+   on this firmware, so its silence-based EOF guess was fundamentally unsafe.
+   **v0.1.5 returns binary downloads to active `+IPD` mode** while leaving page
+   fetches transparent. The active receiver is capped below the kit's 1500-byte
+   multi-frame-peek threshold so `CLOSED` cannot be swallowed after payload;
+   streaming, aligned FAT writes, progress, cancellation and UART-error rejection
+   remain in place for every binary type. **(v0.1.8/0.1.9 mistakenly re-tried
+   transparent mode for binary downloads and it failed on real HW exactly as this
+   note warned — hung with no `\r\nCLOSED`, still lost the tail. v0.1.10 reverted
+   to active `+IPD` for good; see the `DL_RECV_LOOP` section above. Do NOT put
+   binary downloads back on transparent mode: the firmware gives no reliable close
+   event there.)**
+   **Raw-connect latency fix:** the first transparent build still called the old
+   `CONNECT` wrapper, whose unconditional pre-`CIPCLOSE` waited 5 s when the peer
+   had already closed normally. `RAW_CONNECT` now tries `TCP.OPEN` directly on the
+   normal clean path; the close/drain/retry wrapper is used only after a genuine
+   open failure. This removes the repeatable ~5 s pause without weakening recovery.
+   **Post-terminator latency fix:** jesperl may return to AT mode silently, without
+   putting the expected `CLOSED` token in the UART. Waiting for it with the normal
+   15 s receive timeout made tiny pages appear to hang for ~12–13 s. Once the dot
+   terminator is owned, `RECV_LOOP` now waits only a 750 ms close grace. On silence,
+   `RAW_FINISH` probes `AT`: an immediate OK takes the fast cleanup path; only a
+   failed probe uses `+++`. Its standards-required guard is 1.2 s per side (was the
+   telnet utility's conservative 2 s), so even the exceptional escape is bounded.
+   A further target trace showed a complete page appearing only after the long
+   timeout: `COUNT_LINES` accepted a terminal `.` at quiet EOF, while the streaming
+   scanner was still waiting for its LF (`recv_line_state=1`). That pending-dot
+   state now also selects the 750 ms close grace and is promoted to a complete
+   terminator on quiet EOF. After `RAW_CONNECT`, the status changes from
+   `Fetching...` to `Loading 0 bytes`, giving an explicit phase marker if any
+   remaining delay is in init/connect versus receive/cleanup.
 
 12. **Startup network detection — DONE.** At launch (and on the home page) the
    status bar shows "Wi-Fi not up - run NETUP first" when `NET.CHECK_NET_UP` (fast
@@ -452,8 +645,9 @@ network kits' `macro.inc`.
 - Region ops: `Clear #56`, `Scroll #55` (full-width → use BIOS `#8A` instead).
 - Attribute byte = `INK[3:0] | PAPER[7:4]`, 16 colours each. Charset is CP866
   (box-drawing glyphs available; Cyrillic in `0x80–0xFF` is directly printable).
-- Direct VRAM (fast path, optional): VRAM page `#50` into WIN3, `PORT_Y #89`
-  selects column, 4 bytes per cell `(mode, sym, attr, modex)` at `#C300+row*4`.
+- Direct text VRAM (fast path): VRAM page `#50` into WIN3, `PORT_Y #89` selects
+  column; each row entry is `(mode, sym, attr, modex)` at `#C300+row*4`, so the
+  printable symbol is written at `#C301+row*4`. Park `PORT_Y=#C0` afterwards.
 
 **Keyboard.** DSS `WaitKey #30` (blocking), `ScanKey #31` (non-blocking; returns
 raw key codes, not ASCII — map nav keys by code). Use non-blocking in the main loop.
@@ -639,6 +833,10 @@ the app version.)
   `TCP.TCP_BSS_END <= 0x8000` and netcfg-within-`DL_BUF`, so future growth fails
   the build instead of corrupting at runtime. (If TCP BSS later nears 0x8000,
   relocate it too via `ESP_TCP_BSS_BASE_OVERRIDE`.)
+  When the image itself nears the limit, move runtime-only buffers into the
+  WIN2 scratch page instead (v0.1.6: `DL_NAME`/`DL_PATH` became WIN2 EQUs at
+  `0x9F80`/`0x9F90` for exactly this reason; headroom after that ≈ 35 bytes,
+  the ASSERT still guards it).
 - **`net_inited` caching can strand a stale ESP session.** `NET.INIT` runs once
   and is cached (`net_inited=1`); later fetches reuse the open UART/ESP session.
   If that session goes stale (e.g. after the user lingers on a local page — the

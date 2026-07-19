@@ -52,6 +52,14 @@ CLOSE
 	LD		(fh), A
 	RET
 
+; Delete the file at ASCIIZ path HL. Used to remove a partial download after a
+; cancel, timeout, or write/close error. Errors are intentionally ignored by the
+; caller because the original transfer error is more useful to the user.
+DELETE
+	LD		C, DSS_DELETE
+	RST		DSS
+	RET
+
 fh		DB NO_HANDLE
 
 	ENDMODULE
