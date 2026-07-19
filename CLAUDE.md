@@ -142,7 +142,13 @@ shutdown-on-exit (below). Awaiting a re-test.
   in the same WIN2 GetMem page as plain memory.)
 - `src/main.asm` rewritten: gopher rows parsed (`PARSE_ROW`: type/display/
   selector/host/port, TABs→NUL) and rendered straight from doc pages through the
-  30-row viewport. **Menu vs text documents:** `DOC_TYPE_CUR` holds the gopher
+  30-row viewport. **gopher+ menus (v0.1.11):** some servers (e.g. nihirash.net)
+  append a 5th TAB field `+` after the port to flag gopher+ support. `PARSE_ROW`
+  now calls `SCAN_FIELD` on the port field too, so the `+` tail is discarded;
+  without it `PORT_CUR` became `"70\t+"`, the `AT+CIPSTART` port was malformed and
+  EVERY link on such a menu failed to connect (and the link preview showed
+  `...:70⇥+/1/mod`). We only send plain selectors, so servers reply with plain
+  gopher (just the `+` line markers) — no gopher+ query handling is needed. **Menu vs text documents:** `DOC_TYPE_CUR` holds the gopher
   type of the current doc. Type `1` = menu (parse type byte + TAB fields, icon +
   display at col 2, links selectable). Type `0` = **plain text** — the line is raw
   text with NO type byte/fields, so `PARSE_ROW`/`DRAW_ROW` print the WHOLE line

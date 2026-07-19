@@ -3048,6 +3048,12 @@ PARSE_ROW
 	CALL	SCAN_FIELD
 	RET		NC
 	LD		(p_port), HL
+	; gopher+ servers (e.g. nihirash.net) append a 5th "\t+" field after the port
+	; to flag gopher+ support. Terminate the port field too so it does not inherit
+	; that "\t+" tail - otherwise PORT_CUR becomes "70\t+", the AT+CIPSTART port is
+	; malformed, and every link on such a menu fails to connect. (For a normal menu
+	; the port is the last field: SCAN_FIELD hits the line NUL and changes nothing.)
+	CALL	SCAN_FIELD
 	RET
 
 ; Advance HL to the next field. If a TAB is found it is replaced with NUL and
@@ -3845,7 +3851,7 @@ DLP_NUM			DS 16, ' '
 				DB 0
 DLP_NUM_LEN		EQU 16
 DLP_TXT_LEN		EQU 10 + DLP_NUM_LEN
-MSG_RECEIVING_ZERO DB "Receiving 0 KB (v", APP_VERSION, ")", 0
+MSG_RECEIVING_ZERO DB "Receiving 0 KB", 0
 MSG_SAVED		DB "Saved ", 0
 MSG_TO			DB " to ", 0
 MSG_OPEN_ASK	DB "Open in the associated program?  Y = yes,  any other key = no", 0
