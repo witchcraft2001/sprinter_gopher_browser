@@ -33,7 +33,6 @@ STACK_TOP		EQU 0x8000				; BOOT stack (WIN1): used only for early startup,
 DEFAULT_TIMEOUT	EQU 2000				; ms; also used by wcommon
 RECV_TIMEOUT	EQU 15000				; ms per byte/header wait (slow gopher servers)
 RAW_CLOSE_GRACE EQU 750					; ms to wait for CLOSED after gopher terminator
-FETCH_RETRY_DELAY EQU 250				; ms before one whole-page retry
 
 	DEVICE NOSLOT64K
 
@@ -1585,7 +1584,6 @@ DO_FETCH
 	CALL	DOC.RESET
 	XOR		A
 	LD		(WCOMMON.CANCELLED), A	; clear any stale cancel flag before we start
-	LD		(fetch_retry), A
 	CALL	SHOW_FETCHING
 	LD		A, (net_inited)
 	OR		A
@@ -1620,29 +1618,24 @@ DO_FETCH
 	LD		HL, (DOC.doc_lines)
 	LD		A, H
 	OR		L
-	JR		Z, .maybe_retry
+	JR		Z, .incomplete
 	LD		A, (DOC.doc_complete)
 	OR		A
 	JR		NZ, .ok
 	LD		A, (DOC.doc_trunc)
 	OR		A
-	JR		NZ, .ok					; local 256 KB cap: retry cannot improve it
-.maybe_retry
-	; Transparent mode removes the repeatable +IPD FIN-tail loss. Keep one ordinary
-	; whole-page retry for a genuinely transient timeout or empty response.
-	LD		A, (fetch_retry)
-	OR		A
-	JR		NZ, .retry_done
-	INC		A
-	LD		(fetch_retry), A
+	JR		NZ, .ok					; 256 KB cap: a reload cannot improve it
+.incomplete
+	; The transfer ended before the gopher "." terminator (empty response or a lost
+	; tail). Ask the user instead of auto-reloading: R = reload, any other key =
+	; show what loaded (rendered with "- INCOMPLETE"); if nothing loaded, it's empty.
+	CALL	CONFIRM_RELOAD			; CF=0 = reload, CF=1 = show what loaded
+	JR		C, .show_loaded
 	CALL	DOC.RESET
 	CALL	DOC.RESERVE
 	JP		C, .e_mem
-	CALL	SHOW_RETRYING
-	LD		HL, FETCH_RETRY_DELAY
-	CALL	UTIL.DELAY
 	JR		.attempt
-.retry_done
+.show_loaded
 	LD		HL, (DOC.doc_lines)
 	LD		A, H
 	OR		L
@@ -2812,6 +2805,29 @@ CONFIRM_KEEP
 	OR		A						; CF=0
 	RET
 
+; Incomplete page: ask whether to reload or show what loaded (replaces the old
+; silent auto-retry). Out: CF=0 = reload (R/r), CF=1 = show what loaded (any other
+; key - the safe default, so a stray keypress never re-hits the network).
+CONFIRM_RELOAD
+	LD		HL, MSG_ASK_RELOAD
+	CALL	SET_STATUS
+	CALL	INP_WAIT_RELEASE
+.poll
+	CALL	CLOCK_TICK
+	CALL	KBD.SCAN
+	JR		Z, .poll
+	CP		'R'
+	JR		Z, .reload
+	CP		'r'
+	JR		Z, .reload
+	CALL	INP_WAIT_RELEASE
+	SCF								; show what loaded
+	RET
+.reload
+	CALL	INP_WAIT_RELEASE
+	OR		A						; CF=0
+	RET
+
 ; Ask whether to open the file. Out: CF=0 if yes (Y/y), CF=1 otherwise.
 CONFIRM_OPEN
 	LD		HL, MSG_OPEN_ASK
@@ -3309,10 +3325,6 @@ SHOW_FETCHING
 	LD		HL, MSG_FETCHING
 	JP		SET_STATUS
 
-SHOW_RETRYING
-	LD		HL, MSG_RETRYING
-	JP		SET_STATUS
-
 SHOW_ERROR
 	LD		HL, (last_err)
 	JP		SET_STATUS
@@ -3757,7 +3769,6 @@ open_tpl		DW 0					; viewer command template during MAYBE_OPEN
 url_ptr			DW 0					; parse pointer for a type-'h' URL
 url_full		DW 0					; pointer to the full URL (scheme included)
 last_err		DW 0
-fetch_retry		DB 0					; one ordinary retry after transient incomplete data
 recv_line_state	DB 0					; 0=line start, 1=leading dot, 2=ordinary line
 recv_term_seen	DB 0					; protocol terminator seen during current receive
 recv_idle_cb	DW 0					; WCOMMON.IDLE_CB saved while active receive is lean
@@ -3826,7 +3837,7 @@ MSG_STATUS		DB "Up/Dn move  Enter open  Bksp back  ^B bookmarks  ^D add  Esc/F10
 MSG_NONET		DB "Wi-Fi not up - run NETUP first (you can still browse the home page)", 0
 MSG_CONFIRM_QUIT DB "Quit?  Y = yes,  any other key = no", 0
 MSG_FETCHING	DB "Fetching...", 0
-MSG_RETRYING	DB "Transfer incomplete - retrying...", 0
+MSG_ASK_RELOAD	DB "Page incomplete.  R = reload,  any other key = show what loaded", 0
 MSG_LOADING		DB "Loading ", 0
 MSG_LOADED		DB "Loaded ", 0
 MSG_INCOMPLETE	DB " - INCOMPLETE", 0

@@ -517,7 +517,15 @@ shutdown-on-exit (below). Awaiting a re-test.
 7. **Empty/truncated doc hardening — DONE, awaiting transparent-mode target
    check.** The status
    bar shows the loaded size and flags "- INCOMPLETE" when the gopher "."
-   terminator was never received (`doc_complete`, `SHOW_LOADED`). The recurring
+   terminator was never received (`doc_complete`, `SHOW_LOADED`).
+   **Incomplete page = user's choice (v0.1.12, replaced the silent auto-retry):**
+   `DO_FETCH` no longer auto-reloads once on an incomplete/empty page. `.incomplete`
+   now calls `CONFIRM_RELOAD` ("R = reload, any other key = show what loaded"):
+   R re-fetches (`DOC.RESET`+`DOC.RESERVE`→`.attempt`), any other key renders what
+   loaded (`.ok`, "- INCOMPLETE") or, if 0 lines, reports it empty (`.e_empty` →
+   restores the previous page). Cancel during receive still routes to `.e_cancel`
+   before the prompt. (Removed: `fetch_retry`, `SHOW_RETRYING`/`MSG_RETRYING`,
+   `FETCH_RETRY_DELAY`.) The recurring
    ~2 KB truncation was the ESP-AT FIN/RTS tail-drop: `RECV_LOOP` manually lowered
    RTS after every 2 KB `STAGE` block, and if FIN arrived while RTS was low the
    ESP could discard queued `+IPD` tail bytes. Page receive now keeps manual RTS
