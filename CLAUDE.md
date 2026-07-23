@@ -74,9 +74,11 @@ Toolchain: **sjasmplus**, output is a **DSS `.EXE`**. (Decision: assembly, not C
 - `file.asm` (DSS file API / `file://`) deferred to Phase 3 when it's first needed.
 
 **Phase 2 (ESP network backend + real fetch) — done, awaiting on-target check.**
-- `src/net.asm` (MODULE NET, `IFDEF BACKEND_ESP`): `INIT` (ISA reset, UART find,
-  `REQUIRE_NET_UP`, NETCFG load/baud, UART init, AT/ATE0, `SETUP_UART_FLOW`,
-  CIPMUX=0), `CONNECT`→`TCP.OPEN`, `SEND`→`TCP.SEND_BUFFER`, `RECV`→`TCP.RECEIVE`,
+- `src/net.asm` (MODULE NET, `IFDEF BACKEND_ESP`): `INIT` (UART find, `CHECK_NET_UP`
+  = env NET/NET_ESP_HW + `NET_ESP_FW` RX profile, `LOAD_BAUD` = env `NET_BAUD`→divisor,
+  UART init, AT/ATE0, `SETUP_UART_FLOW`, CIPMUX=0 — see the "Any baud + firmware
+  profile" note below; no ISA reset, no NET.CFG file), `CONNECT`→`TCP.OPEN`,
+  `SEND`→`TCP.SEND_BUFFER`, `RECV`→`TCP.RECEIVE`,
   `CLOSE`→`TCP.CLOSE`. Wraps the network-kit libs.
 - **Memory model changed for networking:** app now loads at `0x4100` (512-byte
   header), stack `0x8000` (grows down through the WIN1 code page); a 16 KB
@@ -210,10 +212,31 @@ shutdown-on-exit (below). Awaiting a re-test.
   a CF-returning `CHECK_NET_UP` instead of `WCOMMON.REQUIRE_NET_UP` (which exits).
   **Bring-up sped up:** `NET.INIT` runs once (`net_inited` flag) and is reused
   for every subsequent `TCP.OPEN`, so only the first fetch pays the ~30 s cost.
+- **Any baud + ESP-AT firmware profile (v0.1.13, env-driven config).** gopher NEVER
+  reads `NET.CFG` (it lives beside NETUP.EXE, not the browser's dir; re-parsing it
+  reverted to 115200 when absent, and worse let `SETUP_UART_FLOW`'s `AT+UART_CUR`
+  reprogram the ESP to the wrong speed). Instead `NET.INIT` takes everything from the
+  environment NETUP published: `LOAD_BAUD` reads **`NET_BAUD`** into `NETCFG.CFG_BAUD`
+  (consumed by `APPLY_UART_BAUD`→divisor and `BUILD_UART_FLOW_CMD`); `CHECK_NET_UP`
+  reads **`NET_ESP_FW`** (`2.2.1`/`2.2.2`) and sets both `WCOMMON.UART_ESP_PROFILE`
+  and `WIFI.UART_RX_PROFILE` via `WIFI.UART_SET_RX_PROFILE` (mirrors the kit's
+  `REQUIRE_NET_UP`). Missing/empty `NET_BAUD` or unknown `NET_ESP_FW` → CF=1 → "run
+  NETUP first" (no file fallback, no guessing). The kit's profile then drives FCR
+  trigger (2.2.1 TR8 / 2.2.2 TR4), `SETUP_UART_FLOW` (2.2.1 manual RTS flow=0 / 2.2.2
+  AFE flow=3) and `UART_RX_PAUSE/RESUME` — so gopher works at 57600/115200/230400/…
+  on either firmware. `RAW_SAFE_RX`/`RAW_NORMAL_RX` pick their FCR from the profile
+  too (`RAW_FCR_VALUE`). The receive/download logic itself is unchanged (active +IPD
+  on both firmwares; the kit's TCP path is identical for 2.2.1/2.2.2).
+  **`AT_RECOVER` must NEVER reset the ESP or force the default divisor.** A stalled
+  first AT is recovered by drain (`UART_EMPTY_RS`) + a 300 ms settle + one retry.
+  `WIFI.ESP_RESET` reverts the module to its flash 115200 and destroys NETUP's
+  volatile session (Wi-Fi join AND the negotiated baud), and `UART_SET_DEFAULT_DIVISOR`
+  pins the host at 115200 — both permanently break any non-115200 link (this was the
+  root cause of "no connection at BAUD≠115200").
 - **Link stability (mirrors the kit's wget) — fixed flaky "init/Send failed".**
   `NET.INIT` no longer calls `ISA.ISA_RESET` (it reset the card and broke the ESP
   session NETUP set up — the main cause); it drains stale UART bytes
-  (`UART_EMPTY_RS`) and recovers a stalled first AT (`ESP_RESET`+re-init, retry).
+  (`UART_EMPTY_RS`) and recovers a stalled first AT (drain + settle + retry).
   `NET.CONNECT` preps the socket (RX-resume, `TCP.CLOSE` stale, drain) and
   **retries `TCP.OPEN` once** after a settle. `NET.SEND` uses
   `TCP.SEND_BUFFER_NO_WAIT`. **RTS/CTS flow control during the transfer:**
@@ -296,6 +319,15 @@ shutdown-on-exit (below). Awaiting a re-test.
    retry/keep prompt; retrying has a fresh chance. Flow: `NET.CONNECT` →
    `NET.ACTIVE_PREP` (clear LSR/parser, RTS up for the '>' prompt) → `NET.SEND`
    selector → `DL_RECV_LOOP` → `NET.CLOSE`; the visible page is detached
+   **INVARIANT — the active download must FORCE `CIPMODE=0` (v0.1.14, the last
+   blocker; downloads now complete byte-exact on 2.2.2).** `AT+CIPMODE` is a GLOBAL
+   flag; page fetches set it to 1 (transparent) and `RAW_FINISH` only *requests* 0
+   best-effort (no verify — it can silently linger at 1, notably on ESP-AT 2.2.2).
+   With it stuck at 1 the active `AT+CIPSEND=<len>` never gets its `>` prompt →
+   timeout → "Send failed" shown at "Receiving 0 KB" (CONNECT already succeeded).
+   `NET.CONNECT.prep` therefore sends `AT+CIPMODE=0` unconditionally right after its
+   `TCP.CLOSE` (socket closed → the flag is writable), making the download robust to
+   whatever mode the previous op left; idempotent when already 0.
    (`DOC.SAVE_STATE`→`LINE_BUF` + `DOC.NEW`, restored via `DL_RESTORE_DOC` on every
    exit). **INVARIANT — a receive loop must leave RTS ASSERTED on exit:**
    `DL_RECV_LOOP`'s last act is `RX_PAUSE`, so both its `.done` and `.fail` exits

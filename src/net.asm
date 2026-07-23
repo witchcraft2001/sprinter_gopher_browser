@@ -19,14 +19,15 @@ RAW_RX_SPIN_BUDGET	EQU 200			; bridge gaps between raw UART FIFO bursts
 INIT
 	CALL	WIFI.UART_FIND
 	RET		C
-	CALL	CHECK_NET_UP				; CF=1 if NETUP not run (no program exit)
+	CALL	CHECK_NET_UP				; env: NET / NET_ESP_HW / NET_ESP_FW -> RX profile
 	RET		C
-	CALL	NETCFG.LOAD
+	CALL	LOAD_BAUD					; NET_BAUD env -> CFG_BAUD (never opens NET.CFG)
+	RET		C
 	CALL	NETCFG.APPLY_UART_BAUD
 	CALL	WIFI.UART_INIT
 	CALL	WIFI.UART_EMPTY_RS			; drop stale boot / +IPD bytes before talking
 	LD		HL, CMD_AT
-	CALL	AT_RECOVER					; AT, with one ESP-reset retry if it stalls
+	CALL	AT_RECOVER					; AT, with one drain+settle retry (no ESP reset)
 	RET		C
 	LD		HL, CMD_ECHO_OFF
 	CALL	TX_CMD
@@ -53,8 +54,16 @@ TX_CMD
 	SCF
 	RET
 
-; Send AT command HL; on failure reset the ESP + re-init the UART and retry once.
-; A user cancel (Esc/Ctrl+Z, kit sets WCOMMON.CANCELLED) aborts instead of retrying.
+; Send AT command HL; on failure drain + settle + retry ONCE (no ESP reset, no
+; baud change). A user cancel (Esc/Ctrl+Z, kit sets WCOMMON.CANCELLED) aborts.
+;
+; NEVER reset the ESP or force the default divisor here: WIFI.ESP_RESET reverts the
+; module to its flash 115200 and destroys NETUP's volatile session (Wi-Fi join AND
+; the negotiated baud), and UART_SET_DEFAULT_DIVISOR pins the host at 115200 - both
+; permanently break any non-115200 link. A stalled first AT is far more often a bit
+; of stale RX than a wedged module, so just clear the FIFO, settle, and retry; if it
+; still fails, propagate CF=1 and let NET.INIT report "run NETUP first".
+AT_RECOVER_SETTLE	EQU 300				; ms to settle before the single AT retry
 AT_RECOVER
 	PUSH	HL
 	CALL	TX_CMD
@@ -64,10 +73,11 @@ AT_RECOVER
 	OR		A
 	SCF
 	RET		NZ						; cancelled -> abort
-	CALL	WIFI.ESP_RESET
-	CALL	WIFI.UART_SET_DEFAULT_DIVISOR
-	CALL	WIFI.UART_INIT
-	CALL	WIFI.UART_EMPTY_RS
+	CALL	WIFI.UART_EMPTY_RS		; drop stale bytes that desynced the first AT
+	PUSH	HL
+	LD		HL, AT_RECOVER_SETTLE
+	CALL	UTIL.DELAY
+	POP		HL
 	JP		TX_CMD
 
 ; In: HL=host ASCIIZ, DE=port ASCIIZ. CF=0 connected. Prepares the socket (drops
@@ -99,6 +109,14 @@ CONNECT
 .prep
 	CALL	WIFI.UART_RX_RESUME
 	CALL	TCP.CLOSE					; drop any stale single-connection socket
+	; Force active mode. AT+CIPMODE is a GLOBAL flag: a preceding page fetch runs
+	; transparent (CIPMODE=1) and RAW_FINISH only "requests" CIPMODE=0 best-effort
+	; (it can silently fail, especially on 2.2.2). If it lingers at 1, the active
+	; AT+CIPSEND=<len> below never gets its '>' prompt -> "Send failed". Setting it
+	; here (socket already closed, so the flag is writable) makes the download robust
+	; to whatever mode the previous operation left. Idempotent when already 0.
+	LD		HL, CMD_CIPMODE_0
+	CALL	TX_CMD
 	CALL	WIFI.UART_EMPTY_RS
 	RET
 c_host	DW 0
@@ -267,14 +285,15 @@ RAW_DRAIN
 	XOR		A
 	RET
 
-; Receive setup for opaque binary data. Keep the normal TR8 trigger: lowering
-; the trigger to TR4 makes RTS fall earlier and lengthens the ESP back-pressure
-; window. On peer FIN that can make ESP-AT discard a clean (but still queued)
-; tail even though the UART reports no OE/PE/FE error. We still clear and latch
-; LSR diagnostics so genuine UART corruption is rejected.
+; Receive setup for opaque binary data. The FIFO trigger follows the firmware RX
+; profile (RAW_FCR_VALUE): 2.2.1 keeps TR8 - a later RTS fall shortens the ESP
+; back-pressure window, so on peer FIN ESP-AT is less likely to discard a clean but
+; still-queued tail (the 2.2.1 tail-drop guard); 2.2.2 uses TR4 to match the kit's
+; own UART_INIT for that firmware (which does not exhibit the drop). We still clear
+; and latch LSR diagnostics so genuine UART corruption is rejected.
 RAW_SAFE_RX
 	CALL	WIFI.UART_RX_PAUSE
-	LD		E, FCR_FIFO | FCR_TR8
+	CALL	RAW_FCR_VALUE			; E = FCR for the active RX profile
 	LD		HL, REG_FCR
 	CALL	WIFI.UART_WRITE
 	XOR		A
@@ -283,9 +302,19 @@ RAW_SAFE_RX
 	RET
 
 RAW_NORMAL_RX
-	LD		E, FCR_FIFO | FCR_TR8
+	CALL	RAW_FCR_VALUE
 	LD		HL, REG_FCR
 	JP		WIFI.UART_WRITE
+
+; E = FIFO control byte for the active RX profile (2.2.1 -> TR8, 2.2.2 -> TR4).
+; Trashes A.
+RAW_FCR_VALUE
+	LD		A, (WIFI.UART_RX_PROFILE)
+	CP		UART_RX_PROFILE_221
+	LD		E, FCR_FIFO | FCR_TR4
+	RET		NZ						; not 2.2.1 -> TR4
+	LD		E, FCR_FIFO | FCR_TR8
+	RET
 
 ; Out: ZF=1 if no UART receive error was observed, ZF=0/A=LSR error bits.
 RAW_ERRORS
@@ -378,9 +407,49 @@ raw_spin		DB 0
 raw_last_lsr	DB 0
 raw_lsr_err		DB 0
 
-; Verify NETUP joined Wi-Fi (env NET=WIFI and NET_ESP_HW set). Returns CF=1 on
-; failure instead of exiting the program (unlike WCOMMON.REQUIRE_NET_UP), so the
-; browser can report the error and stay running. Reuses the kit's env strings.
+; Load the UART baud from the NET_BAUD environment variable NETUP published - the
+; authoritative link speed for this session. We deliberately do NOT read NET.CFG:
+; that file lives beside NETUP.EXE (not the browser's dir), and re-parsing it here
+; would (a) silently fall back to 115200 when absent, and (b) let SETUP_UART_FLOW's
+; AT+UART_CUR reprogram the ESP to the wrong speed. Copies the ASCIIZ value into
+; NETCFG.CFG_BAUD (read by APPLY_UART_BAUD + BUILD_UART_FLOW_CMD).
+; Out: CF=0 filled; CF=1 if NET_BAUD is unset/empty (NET.INIT -> "run NETUP first").
+KEY_NET_BAUD	DB "NET_BAUD", 0
+LOAD_BAUD
+	LD		HL, KEY_NET_BAUD
+	LD		DE, WCOMMON.ENV_VAL_BUF
+	LD		B, ENV_GET
+	LD		C, DSS_ENVIRON
+	RST		DSS
+	OR		A
+	JR		Z, .fail					; NET_BAUD not set
+	LD		A, (WCOMMON.ENV_VAL_BUF)
+	OR		A
+	JR		Z, .fail					; NET_BAUD empty
+	LD		HL, WCOMMON.ENV_VAL_BUF
+	LD		DE, NETCFG.CFG_BAUD
+	LD		B, NETCFG.CFG_BAUD_SIZE - 1	; max digits; always leave room for the NUL
+.cpy
+	LD		A, (HL)
+	OR		A
+	JR		Z, .term
+	LD		(DE), A
+	INC		HL
+	INC		DE
+	DJNZ	.cpy
+.term
+	XOR		A
+	LD		(DE), A						; NUL-terminate CFG_BAUD
+	OR		A							; CF=0
+	RET
+.fail
+	SCF
+	RET
+
+; Verify NETUP joined Wi-Fi (env NET=WIFI, NET_ESP_HW set) and select the ESP-AT
+; firmware RX profile from NET_ESP_FW. Returns CF=1 on failure instead of exiting
+; the program (unlike WCOMMON.REQUIRE_NET_UP), so the browser can report the error
+; and stay running. Reuses the kit's env strings and profile setter.
 CHECK_NET_UP
 	LD		HL, WCOMMON.N_NET_KEY
 	LD		DE, WCOMMON.ENV_VAL_BUF
@@ -403,6 +472,32 @@ CHECK_NET_UP
 	LD		A, (WCOMMON.ENV_VAL_BUF)
 	OR		A
 	JR		Z, .fail					; NET_ESP_HW empty
+	; Firmware RX profile (NET_ESP_FW): selects the kit's UART receive/RTS algorithm
+	; (2.2.1 = manual RTS, flow=0, FCR TR8; 2.2.2 = AFE, flow=3, FCR TR4). Set both
+	; WCOMMON.UART_ESP_PROFILE (read by SETUP_UART_FLOW) and WIFI.UART_RX_PROFILE
+	; (read by UART_INIT/EMPTY_RS/receive), exactly like WCOMMON.REQUIRE_NET_UP.
+	LD		HL, WCOMMON.N_ESP_FW_KEY
+	LD		DE, WCOMMON.ENV_VAL_BUF
+	LD		B, ENV_GET
+	LD		C, DSS_ENVIRON
+	RST		DSS
+	OR		A
+	JR		Z, .fail					; NET_ESP_FW not set -> run a current NETUP
+	LD		HL, WCOMMON.ENV_VAL_BUF
+	LD		DE, WCOMMON.V_ESP_FW_221
+	CALL	.strmatch
+	JR		Z, .fw221
+	LD		HL, WCOMMON.ENV_VAL_BUF
+	LD		DE, WCOMMON.V_ESP_FW_222
+	CALL	.strmatch
+	JR		NZ, .fail					; unknown firmware string
+	LD		A, UART_RX_PROFILE_222
+	JR		.set_profile
+.fw221
+	LD		A, UART_RX_PROFILE_221
+.set_profile
+	LD		(WCOMMON.UART_ESP_PROFILE), A
+	CALL	WIFI.UART_SET_RX_PROFILE
 	OR		A							; CF=0 ok
 	RET
 .fail

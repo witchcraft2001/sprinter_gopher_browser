@@ -53,7 +53,16 @@ BM_LINE				EQU 0x8800			; bookmark record builder (352 B; ends 0x895F)
 ; space; the network-lib BSS must stay below 0x8000).
 DL_HOST				EQU 0x8960			; 64 B (ends 0x899F)
 DL_PORT				EQU 0x89A0			; 8 B (ends 0x89A7; 0x89A8..0x89FF spare)
-REQ_BUF				EQU 0x8A00			; outgoing selector + CRLF
+REQ_BUF				EQU 0x8A00			; outgoing selector + CRLF (<=256 B: SEL_CUR 200 + CRLF)
+; Runtime buffers relocated out of the WIN1 image (into the unused upper half of
+; REQ_BUF's 512 B slot, 0x8B00..0x8BFF) so the code image + network-lib BSS stay
+; below 0x8000. Referenced only by label, and disjoint from REQ_BUF's send use.
+; PChars from a WIN2 GetMem page is verified safe (see WEBLINK_BUF/LINE_BUF).
+NUMBUF				EQU 0x8B00			; 8 B: UTIL.UTOA decimal scratch
+URL_SCHEME			EQU 0x8B08			; 16 B: parsed URL scheme
+SEARCH_BUF			EQU 0x8B18			; 64 B: type-7 search query (SEARCH_MAX)
+DOC_TITLE			EQU 0x8B58			; 64 B: current page title (TITLE_MAX; header)
+PREVIEW_BUF			EQU 0x8B98			; 88 B: idle link-preview string (ends 0x8BEF)
 HIST_DATA			EQU 0x8C00			; history record array (ends ~0x97F0)
 ; GOPHER.CFG is streamed through STAGE; its line accumulator lives up here in the
 ; WIN2 scratch page (code is in WIN1 so it can never reach this). Only [settings]

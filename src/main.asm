@@ -3777,21 +3777,16 @@ raw_close_state DB 0					; cross-block matcher position
 recv_lo			DW 0					; document/download byte count (low 16)
 recv_hi			DW 0					; bytes written this download (high 16) -> 32-bit
 prog_suffix		DW 0					; suffix pointer while formatting byte counts
-NUMBUF			DS 8, 0					; UTIL.UTOA decimal scratch
 in_prompt		DW 0					; INPUT_LINE: prompt ASCIIZ
 in_buf			DW 0					; INPUT_LINE: destination buffer
 in_max			DB 0					; INPUT_LINE: max chars (excl. NUL)
 in_pos			DB 0					; INPUT_LINE: chars entered so far
 EMPTYSTR		DB 0
 
-; HOST_CUR / PORT_CUR / SEL_CUR now live in WIN2 (console.inc) to spare WIN1 stack.
-; Current page title shown in the header (the display text of the link we
-; followed; the home page sets a default). Saved/restored across history.
-DOC_TITLE		DS TITLE_MAX, 0
-
-; Type-7 search query (entered via INPUT_LINE). WIN1, so TERM.PUTS can echo it.
+; HOST_CUR / PORT_CUR / SEL_CUR / DOC_TITLE now live in WIN2 (console.inc) to spare
+; the WIN1 image. DOC_TITLE (header title, saved/restored across history) and
+; SEARCH_BUF (type-7 query) are PChars'd from WIN2, verified safe.
 SEARCH_MAX		EQU 64
-SEARCH_BUF		DS SEARCH_MAX, 0
 
 ; Binary/media download target (kept separate from the live page's nav so a
 ; download does not disturb the current document or history).
@@ -3849,10 +3844,8 @@ MSG_LINKPFX		DB "Web link: ", 0
 MSG_OPENURL		DB "Open URL: ", 0
 PFX_URL			DB "URL:", 0
 SCHEME_GOPHER	DB "gopher://", 0
-URL_SCHEME		DS 16, 0
-; WEBLINK_BUF is in the WIN2 scratch page (console.inc) - not used during a
-; download, so it frees WIN1 image space for the receive logic.
-PREVIEW_BUF		DS 88, 0				; idle link-preview string for the status bar
+; URL_SCHEME and PREVIEW_BUF (idle link-preview) now live in WIN2 (console.inc),
+; alongside WEBLINK_BUF, to free WIN1 image space for the receive logic.
 MSG_SEARCH		DB "Search (Enter=go  Esc=cancel): ", 0
 ; Fixed-width status text painted by DL_PROGRESS_RX (DLP_DRAW writes exactly
 ; DLP_TXT_LEN cells; the trailing NUL also keeps this buffer ASCIIZ).
