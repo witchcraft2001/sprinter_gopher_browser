@@ -27,7 +27,11 @@ DOC_W3			EQU 0xC000
 
 ; ---- state (lives in the WIN1 load image, mutated at runtime) ----
 doc_blocks	DS DOC_MAX_PAGES, 0xFF	; GetMem block handle per logical page (0xFF=none)
-doc_phys	DS DOC_MAX_PAGES, 0		; resolved physical page byte per logical page
+; EMM_FN5 writes every physical-page list with a trailing 0xFF.  A one-page
+; GetMem block therefore needs two destination bytes: its physical page and the
+; terminator.  Keep one byte beyond the logical page table so allocating page
+; 15 cannot overwrite doc_npages (which used to corrupt downloads near 240 KB).
+doc_phys	DS DOC_MAX_PAGES + 1, 0	; physical pages plus EMM_FN5 terminator slot
 doc_npages	DB 0					; pages allocated
 doc_trunc	DB 0					; set if the document overflowed the cap
 doc_wpage	DB 0					; current write page index
@@ -81,7 +85,7 @@ RESET
 ; The persistent part of the document = block handles, physical pages, and the
 ; metadata up to doc_complete (the read cursor / seek cache are transient). This
 ; whole block is saved/restored per history level so Back is instant (no refetch).
-DOC_STATE_SIZE	EQU doc_complete + 1 - doc_blocks	; = 40
+DOC_STATE_SIZE	EQU doc_complete + 1 - doc_blocks	; = 41 (includes phys-table terminator)
 
 ; ------------------------------------------------------
 ; SAVE_STATE - copy the live document state to (HL). Trashes BC, DE, HL.

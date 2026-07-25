@@ -63,10 +63,10 @@ $(DISTDIR):
 	@mkdir -p $(DISTDIR)
 
 $(DISTDIR)/howto.txt: $(ESP_HOWTO) | $(DISTDIR)
-	perl -CSDA -ne 's/\r\n\z/\n/; s/\r\z/\n/; s/^#{1,6}[ \t]*//; next if /^[|: \t-]+$$/; if (/^\|/) { s/^\|[ \t]*//; s/[ \t]*\|[ \t]*$$//; s/[ \t]*\|[ \t]*/  /g; } s/\*\*([^*]+)\*\*/$$1/g; s/`([^`]*)`/$$1/g; s/[“”]/"/g; s/[‘’]/\x27/g; s/[—–]/-/g; s/…/.../g; s/×/x/g; print;' "$<" | iconv -f UTF-8 -t CP866//TRANSLIT > "$@"
+	perl -CSDA -ne 's/\r\n\z/\n/; s/\r\z/\n/; s/^#{1,6}[ \t]*//; next if /^[|: \t-]+$$/; next if /^```/; if (/^\|/) { s/^\|[ \t]*//; s/[ \t]*\|[ \t]*$$//; s/[ \t]*\|[ \t]*/  /g; } s/\*\*([^*]+)\*\*/$$1/g; s/`([^`]*)`/$$1/g; s/[“”]/"/g; s/[‘’]/\x27/g; s/[—–]/-/g; s/…/.../g; s/×/x/g; print;' "$<" | iconv -f UTF-8 -t CP866//TRANSLIT > "$@"
 
 $(DISTDIR)/howto_ru.txt: $(ESP_HOWTO_RU) | $(DISTDIR)
-	perl -CSDA -ne 's/\r\n\z/\n/; s/\r\z/\n/; s/^#{1,6}[ \t]*//; next if /^[|: \t-]+$$/; if (/^\|/) { s/^\|[ \t]*//; s/[ \t]*\|[ \t]*$$//; s/[ \t]*\|[ \t]*/  /g; } s/\*\*([^*]+)\*\*/$$1/g; s/`([^`]*)`/$$1/g; s/[“”]/"/g; s/[‘’]/\x27/g; s/[—–]/-/g; s/…/.../g; s/×/x/g; print;' "$<" | iconv -f UTF-8 -t CP866//TRANSLIT > "$@"
+	perl -CSDA -ne 's/\r\n\z/\n/; s/\r\z/\n/; s/^#{1,6}[ \t]*//; next if /^[|: \t-]+$$/; next if /^```/; if (/^\|/) { s/^\|[ \t]*//; s/[ \t]*\|[ \t]*$$//; s/[ \t]*\|[ \t]*/  /g; } s/\*\*([^*]+)\*\*/$$1/g; s/`([^`]*)`/$$1/g; s/[“”]/"/g; s/[‘’]/\x27/g; s/[—–]/-/g; s/…/.../g; s/×/x/g; print;' "$<" | iconv -f UTF-8 -t CP866//TRANSLIT > "$@"
 
 # Copy GOPHER.EXE onto a fresh copy of the DSS floppy template (under /GOPHER).
 deploy: $(EXE)

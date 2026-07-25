@@ -63,8 +63,8 @@ HR_TYPE			EQU 273					; 1
 HR_SELIDX		EQU 274					; 2
 HR_TOPIDX		EQU 276					; 2
 HR_TITLE		EQU 278					; 64 (page title shown in the header)
-HR_DOCSTATE		EQU 342					; 40 (DOC.SAVE_STATE: page chain + metadata)
-HR_SIZE			EQU 382
+HR_DOCSTATE		EQU 342					; 41 (DOC.SAVE_STATE: page chain + metadata)
+HR_SIZE			EQU 383
 TITLE_MAX		EQU 64
 
 	ORG LOAD_ADDR - 0x0200
@@ -4032,6 +4032,8 @@ ESP_TCP_BSS_BASE	EQU STAGE
 	ASSERT WIFI.RS_BUFF + RS_BUFF_SIZE <= 0x8000	; ESP response BSS remains inside WIN1
 	ASSERT NETCFG.NETCFG_BSS_END <= DL_BUF + DL_BUF_SIZE	; netcfg BSS must fit inside DL_BUF
 	ASSERT NETCFG_BSS_BASE >= 0x8000		; ...and live wholly in the WIN2 page (no boundary split)
+	ASSERT MAIN.HR_SIZE - MAIN.HR_DOCSTATE == DOC.DOC_STATE_SIZE	; history copies the complete DOC descriptor
+	ASSERT HIST_DATA + MAIN.HIST_MAX * MAIN.HR_SIZE <= CFG_LINE	; history must not grow into CFG_LINE / DL_SEL
 
 ; End of the emitted image. The EXE header's LOADER field = IMAGE_END - LOAD_ADDR,
 ; The passive overlay follows in the file but is not loader-mapped into WIN1;

@@ -1,3 +1,14 @@
+```
+   ▄██████▄   ▄██████▄     ▄███████▄    ▄█    █▄       ▄████████    ▄████████ 
+  ███    ███ ███    ███   ███    ███   ███    ███     ███    ███   ███    ███ 
+  ███    █▀  ███    ███   ███    ███   ███    ███     ███    █▀    ███    ███ 
+ ▄███        ███    ███   ███    ███  ▄███▄▄▄▄███▄▄  ▄███▄▄▄      ▄███▄▄▄▄██▀ 
+▀▀███ ████▄  ███    ███ ▀█████████▀  ▀▀███▀▀▀▀███▀  ▀▀███▀▀▀     ▀▀███▀▀▀▀▀   
+  ███    ███ ███    ███   ███          ███    ███     ███    █▄  ▀███████████ 
+  ███    ███ ███    ███   ███          ███    ███     ███    ███   ███    ███ 
+  ████████▀   ▀██████▀   ▄████▀        ███    █▀      ██████████   ███    ███ 
+  Browser v.0.1.15                                                 ███    ███ 
+```
 # Gopher browser for Sprinter — quick start (ESP Wi-Fi)
 
 A Gopher-protocol browser for the Sprinter, running under DSS in the native
@@ -11,6 +22,10 @@ ESP-AT). For Wi-Fi it relies on the SprinterWiFi network kit.
 - A Sprinter with the **SprinterWiFi** Wi-Fi card.
 - The **SprinterWiFi network kit** installed (it provides `NETUP` and `NET.CFG`).
 - `GOPHER.EXE` (this program) on disk, e.g. in `C:\GOPHER\`.
+
+Supported ESP-AT firmware: **v2.2.1** and **v2.2.2.0**. For the best user
+experience, **v2.2.2.0** together with the **Sprinter ESP Network Kit v0.2.1 or
+newer** is recommended.
 
 ## Quick start
 

@@ -294,7 +294,7 @@ shutdown-on-exit (below). Awaiting a re-test.
 ## TODO (Phase 3 polish / Phase 4) — agreed on-target
 
 **High value / requested:**
-1. **Doc caching for instant Back — DONE.** Each history record carries a 40-byte
+1. **Doc caching for instant Back — DONE.** Each history record carries a 41-byte
    copy of the DOC descriptor (`HR_DOCSTATE`: block-ids + phys pages + metadata);
    follow = `PUSH_HIST` (`DOC.SAVE_STATE`) + `DOC.NEW` (detach, don't free); Back =
    `DOC.RESET` (free current) + `POP_HIST` (`DOC.LOAD_STATE`, restores the cached
