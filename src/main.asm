@@ -16,11 +16,11 @@
 ;   * Network errors are classified and shown on the status bar (no program
 ;     exit, no blocking "press a key"); NET.INIT runs once and is reused.
 ;
-;   The WIN1 image holds all code + small state + stack (top 0x8000, down). A
-;   GetMem page is mapped at WIN2 (0x8000) for the larger scratch buffers
-;   (STAGE/LINE_BUF/REQ_BUF/HIST_DATA, see console.inc). Document pages and the
-;   ISA window take turns in WIN3; we never SetWin2 over code because no code
-;   lives in WIN2 (the proven wget layout).
+;   The WIN1 image holds all code + small state and uses a short-lived boot
+;   stack at 0x8000. A GetMem page is mapped at WIN2 (0x8000) for the runtime
+;   stack and larger scratch buffers (STAGE/LINE_BUF/REQ_BUF/HIST_DATA, see
+;   console.inc). Document pages and the ISA window take turns in WIN3; we never
+;   SetWin2 over code because no code lives in WIN2 (the proven wget layout).
 ; ======================================================
 
 EXE_VERSION		EQU 1
@@ -92,7 +92,6 @@ START
 	LD		A, (IX-3)					; EXE file handle - DSS leaves a loader EXE open,
 	LD		(home_fm), A				; FM at (IX-3); used to read the appended home page
 	CALL	WCOMMON.INIT_VMODE			; record current mode so EXIT restores cleanly
-	CALL	INIT_PROGRESS_VRAM			; save screen 0/1 and derive direct status address
 	CALL	SHOW_BANNER					; version + build-date banner on load
 	CALL	INIT_RUNTIME_PAGE			; map a fresh WIN2 page for the scratch buffers
 	JP		C, MEM_ERROR
@@ -101,6 +100,8 @@ START
 	; boot frames on the WIN1 stack are done with (START exits via DSS, never
 	; RETs through them), so abandoning them is safe.
 	LD		SP, RUN_STACK_TOP
+	CALL	INIT_PROGRESS_VRAM			; save screen 0/1 in the mapped WIN2 state
+	CALL	INIT_DLP_TXT				; seed the WIN2 "Receiving " progress prefix
 	CALL	INIT_PATHS					; resolve the EXE dir for DOWNLOAD\ (AppInfo #47)
 	LD		HL, CLOCK_TICK_CB			; tick the clock during the kit's blocking waits
 	LD		(WCOMMON.IDLE_CB), HL		; (INIT/connect/receive). The wrapper preserves IX/IY
@@ -1507,7 +1508,30 @@ LOAD_DISK_GPH
 ; START); the appended bytes begin at file offset HOME_OFFSET = 0x200 + image size.
 ; We SEEK_END for the file size, take the tail (size - HOME_OFFSET) and read it.
 ; Out: CF=0 loaded (>0 B), CF=1 = no handle / nothing appended.
-HOME_OFFSET		EQU 0x200 + IMAGE_END - LOAD_ADDR
+PASSIVE_OVERLAY_OFFSET EQU 0x200 + IMAGE_END - LOAD_ADDR
+HOME_OFFSET		EQU PASSIVE_OVERLAY_OFFSET + PASSIVE_OVERLAY_SIZE
+
+; Load the 2.2.2-only passive parser into LINE_BUF immediately before a binary
+; download. The overlay is stored after the loader image and before INDEX.GPH;
+; LINE_BUF is not used again until the download has finished.
+LOAD_PASSIVE_OVERLAY
+	LD		A, (home_fm)
+	CP		FILE.NO_HANDLE
+	SCF
+	RET		Z
+	LD		B, 0					; SEEK_SET
+	LD		HL, 0
+	LD		IX, PASSIVE_OVERLAY_OFFSET
+	LD		C, DSS_MOVE_FP
+	RST		DSS
+	RET		C
+	LD		A, (home_fm)
+	LD		HL, LINE_BUF
+	LD		DE, PASSIVE_OVERLAY_SIZE
+	LD		C, DSS_READ_FILE
+	RST		DSS
+	RET
+
 LOAD_HOME_FILE
 	LD		A, (home_fm)
 	CP		FILE.NO_HANDLE
@@ -2093,6 +2117,9 @@ DOWNLOAD
 	LD		HL, DL_PATH
 	CALL	FILE.CREATE
 	JP		C, .e_file
+	LD		A, (WIFI.UART_RX_PROFILE)
+	CP		UART_RX_PROFILE_222
+	JP		Z, .passive222			; pull directly to disk; never touches DOC banks
 	; Detach the visible page; the download body gets its own page chain.
 	LD		HL, LINE_BUF			; free during downloads (no rendering runs)
 	CALL	DOC.SAVE_STATE
@@ -2100,6 +2127,7 @@ DOWNLOAD
 	CALL	DOC.RESERVE				; first page now - no GetMem once data streams
 	JP		C, .e_mem
 	CALL	NET.ACTIVE_PREP			; clear LSR/parser state; RTS up for the '>' prompt
+	JP		C, .e_send				; 2.2.2 passive-receive setup failed
 	LD		HL, MSG_RECEIVING_ZERO	; safe DSS draw: selector has not been sent yet
 	CALL	SET_STATUS
 	LD		HL, DL_SEL
@@ -2108,26 +2136,112 @@ DOWNLOAD
 	JP		C, .e_send
 	CALL	DL_RECV_LOOP			; whole body -> page chain via active +IPD
 	PUSH	AF						; close the socket on success, timeout, or cancel
+	CALL	INP_WAIT_RELEASE		; a held Esc must not abort CLOSE or leak into Quit?
 	CALL	NET.CLOSE
 	POP		AF
-	JR		C, .e_stream
+	JP		C, .e_stream
 	; Network phase over: now persist the body. The connection is closed; FAT
 	; writes are safe.
 	CALL	SHOW_WRITING
 	LD		HL, (DOC.doc_woff)
 	LD		(dw_last), HL			; EOF: the last page is written in full
 	CALL	DL_WRITE_DOC			; page chain -> file, 4 KB staged chunks
-	JR		C, .e_wr
+	JP		C, .e_wr
 	CALL	DL_RESTORE_DOC			; free the body chain, re-attach the page
 	CALL	FILE.CLOSE
 	JP		C, .e_close
 	OR		A
 	RET
 
+; ESP-AT 2.2.2 has passive receive. Pull bounded blocks into DL_BUF and write
+; each one immediately: ESP retains the rest in its socket buffer, so slow FAT
+; writes cannot lose UART data. This deliberately bypasses the DOC page chain
+; and the final "Writing N KB" pass used by the unchanged 2.2.1 algorithm.
+.passive222
+	CALL	LOAD_PASSIVE_OVERLAY
+	JR		C, .p_send
+	CALL	NET.ACTIVE_PREP			; selects CIPRECVMODE=1 only for profile 2.2.2
+	JR		C, .p_send
+	LD		HL, MSG_RECEIVING_ZERO
+	CALL	SET_STATUS
+	LD		HL, DL_SEL
+	CALL	BUILD_REQ_HL
+	CALL	NET.SEND
+	JR		C, .p_send
+	CALL	DL_RECV_FILE_222
+	PUSH	AF
+	CALL	INP_WAIT_RELEASE
+	CALL	NET.CLOSE				; also restores CIPRECVMODE=0
+	POP		AF
+	JR		C, .p_stream
+	CALL	FILE.CLOSE
+	JP		C, .e_close
+	OR		A
+	RET
+
+.p_stream
+	CALL	INVALIDATE_NET
+	LD		A, (WCOMMON.CANCELLED)
+	OR		A
+	JR		NZ, .p_discard
+	LD		A, (dl_disk_err)
+	OR		A
+	JR		NZ, .p_discard
+	; A clean prefix is already on disk. Keep the established retry/keep choice.
+	LD		A, (recv_lo)
+	LD		D, A
+	LD		A, (recv_lo + 1)
+	OR		D
+	LD		D, A
+	LD		A, (recv_hi)
+	OR		D
+	LD		D, A
+	LD		A, (recv_hi + 1)
+	OR		D
+	JR		Z, .p_discard
+	CALL	CONFIRM_KEEP
+	JR		C, .p_keep
+	CALL	FILE.CLOSE
+	LD		HL, DL_PATH
+	CALL	FILE.DELETE
+	JP		DOWNLOAD
+.p_keep
+	LD		A, 1
+	LD		(dl_partial), A
+	CALL	FILE.CLOSE
+	JP		C, .e_close
+	OR		A
+	RET
+
+.p_send
+	CALL	NET.CLOSE
+	LD		A, 3
+	LD		(dl_disk_err), A
+.p_discard
+	CALL	FILE.CLOSE
+	LD		HL, DL_PATH
+	CALL	FILE.DELETE
+	LD		A, (WCOMMON.CANCELLED)
+	OR		A
+	JP		NZ, .e_cancel
+	LD		A, (dl_disk_err)
+	CP		1
+	JP		Z, .e_disk
+	CP		2
+	JP		Z, .e_uart
+	CP		3
+	JR		Z, .p_send_msg
+	LD		HL, ERR_INCOMPLETE
+	JP		.fail
+.p_send_msg
+	LD		HL, ERR_SEND
+	JP		.fail
+
 .e_wr
 	LD		A, 1
 	LD		(dl_disk_err), A
 .e_stream
+	CALL	INVALIDATE_NET			; parser/socket may be desynchronised; re-init next op
 	LD		A, (WCOMMON.CANCELLED)
 	OR		A
 	JR		NZ, .discard			; user aborted: the partial is unwanted
@@ -2611,7 +2725,18 @@ DL_PROGRESS_RX
 	INC		HL
 	LD		(HL), 'B'
 	LD		A, (dlp_base)
-	; fall through to the VRAM paint, A = PORT_Y of the first cell
+	JP		DLP_DRAW					; A = PORT_Y of the first cell
+
+; Seed the WIN2 progress buffer once at START: copy the fixed "Receiving "
+; prefix (first 10 bytes of MSG_RECEIVING_ZERO) into DLP_TXT. The DLP_NUM tail
+; needs no init here - DL_PROGRESS_RX blanks it before every draw, and DLP_DRAW
+; paints a counted DLP_TXT_LEN cells (it does not rely on a NUL terminator).
+INIT_DLP_TXT
+	LD		HL, MSG_RECEIVING_ZERO
+	LD		DE, DLP_TXT
+	LD		BC, 10						; "Receiving "
+	LDIR
+	RET
 
 ; Paint DLP_TXT onto the status row via direct text VRAM access (see
 ; console.inc): WIN3 -> page #50, PORT_Y selects the column (base derived from
@@ -3764,23 +3889,6 @@ cur_kind		DB 0					; 0=home, 1=network
 DOC_TYPE_CUR	DB '1'
 net_inited		DB 0
 home_fm			DB 0xFF					; open EXE file handle (from (IX-3) at START)
-exec_sp			DW 0					; saved SP across Dss.Exec
-open_tpl		DW 0					; viewer command template during MAYBE_OPEN
-url_ptr			DW 0					; parse pointer for a type-'h' URL
-url_full		DW 0					; pointer to the full URL (scheme included)
-last_err		DW 0
-recv_line_state	DB 0					; 0=line start, 1=leading dot, 2=ordinary line
-recv_term_seen	DB 0					; protocol terminator seen during current receive
-recv_idle_cb	DW 0					; WCOMMON.IDLE_CB saved while active receive is lean
-raw_closed		DB 0					; transparent peer-close token received
-raw_close_state DB 0					; cross-block matcher position
-recv_lo			DW 0					; document/download byte count (low 16)
-recv_hi			DW 0					; bytes written this download (high 16) -> 32-bit
-prog_suffix		DW 0					; suffix pointer while formatting byte counts
-in_prompt		DW 0					; INPUT_LINE: prompt ASCIIZ
-in_buf			DW 0					; INPUT_LINE: destination buffer
-in_max			DB 0					; INPUT_LINE: max chars (excl. NUL)
-in_pos			DB 0					; INPUT_LINE: chars entered so far
 EMPTYSTR		DB 0
 
 ; HOST_CUR / PORT_CUR / SEL_CUR / DOC_TITLE now live in WIN2 (console.inc) to spare
@@ -3793,21 +3901,6 @@ SEARCH_MAX		EQU 64
 ; DL_HOST / DL_PORT / DL_SEL / DL_NAME / DL_PATH moved to the WIN2 scratch
 ; page (console.inc) to keep the WIN1 image + network-lib BSS below 0x8000
 ; (all are runtime-written per download; nothing reads them before that).
-dw_page			DB 0					; DL_WRITE_DOC: current logical page index
-dw_len			DW 0					; DL_WRITE_DOC: data bytes in that page
-dw_off			DW 0					; DL_WRITE_DOC: progress within the page
-dw_n			DW 0					; DL_WRITE_DOC: current chunk length
-dw_last			DW 0					; DL_WRITE_DOC: bytes of the LAST page to write
-dw_rem			DW 0					; DL_MIDFLUSH: sub-sector tail carried over
-dl_comb			DW 0					; accumulator fill (bytes buffered this window)
-dl_first		DB 0					; 1 = first read of an accumulation window
-dl_pending		DW 0					; accumulated-but-not-appended bytes (progress)
-dl_partial		DB 0					; 1 = user kept an incomplete transfer
-dl_last_kb		DW 0					; last whole-KB value drawn by DL_PROGRESS_RX
-video_page		DB 0					; DSS text screen 0/1, captured after INIT_VMODE
-dlp_base		DB 0x02					; PORT_Y status col 1: #02 (screen 0) / #82 (screen 1)
-dl_disk_err		DB 0					; 0=none, 1=DSS_WRITE, 2=UART LSR error, 4=no memory
-dl_net_err		DB 0					; raw receive result (unused vs timeout)
 DL_DIRMK		DB "DOWNLOAD", 0		; mkdir target (relative to the EXE dir)
 DL_DIRPFX		DB "DOWNLOAD", 0x5C, 0	; per-file path prefix (backslash separator)
 ; EXE_DIR / FILE_ABS now live in WIN2 (console.inc) to spare the WIN1 stack.
@@ -3848,11 +3941,10 @@ SCHEME_GOPHER	DB "gopher://", 0
 ; alongside WEBLINK_BUF, to free WIN1 image space for the receive logic.
 MSG_SEARCH		DB "Search (Enter=go  Esc=cancel): ", 0
 ; Fixed-width status text painted by DL_PROGRESS_RX (DLP_DRAW writes exactly
-; DLP_TXT_LEN cells; the trailing NUL also keeps this buffer ASCIIZ).
+; DLP_TXT_LEN cells; the trailing NUL also keeps this buffer ASCIIZ). DLP_TXT /
+; DLP_NUM now live in the WIN2 scratch page (console.inc) to keep the WIN1 image
+; below the network-lib BSS; INIT_DLP_TXT seeds the "Receiving " prefix at START.
 ; DLP_NUM holds "<n> KB" + space padding.
-DLP_TXT			DB "Receiving "
-DLP_NUM			DS 16, ' '
-				DB 0
 DLP_NUM_LEN		EQU 16
 DLP_TXT_LEN		EQU 10 + DLP_NUM_LEN
 MSG_RECEIVING_ZERO DB "Receiving 0 KB", 0
@@ -3885,11 +3977,7 @@ MSG_WRITING		DB "Writing ", 0
 WELCOME_DOC
 	DB "iGopher browser for Sprinter", 13, 10
 	DB "iBased on Moon Rabbit / Internet NEXTplorer by nihirash", 13, 10
-	DB "i", 13, 10
-	DB "i(Appended home page INDEX.GPH not found - using the built-in stub.)", 13, 10
-	DB "i", 13, 10
-	DB "1Virtual TR-DOS official gopher hole", 9, "/", 9, "vtrd.in", 9, "70", 13, 10
-	DB "1Nihirash's gopher hole", 9, "/", 9, "nihirash.net", 9, "70", 13, 10
+	DB "iINDEX.GPH is unavailable.", 13, 10
 WELCOME_END
 WELCOME_LEN		EQU WELCOME_END - WELCOME_DOC
 
@@ -3946,7 +4034,18 @@ ESP_TCP_BSS_BASE	EQU STAGE
 	ASSERT NETCFG_BSS_BASE >= 0x8000		; ...and live wholly in the WIN2 page (no boundary split)
 
 ; End of the emitted image. The EXE header's LOADER field = IMAGE_END - LOAD_ADDR,
-; and the Makefile appends INDEX.GPH starting at file offset 0x200 + that size.
+; The passive overlay follows in the file but is not loader-mapped into WIN1;
+; INDEX.GPH is appended after the overlay.
 IMAGE_END
+
+PASSIVE_OVERLAY_FILE
+	DISP LINE_BUF
+PASSIVE_OVERLAY_RUN
+	INCLUDE "passive_overlay.asm"
+PASSIVE_OVERLAY_RUN_END
+	ENT
+PASSIVE_OVERLAY_FILE_END
+PASSIVE_OVERLAY_SIZE EQU PASSIVE_OVERLAY_RUN_END - PASSIVE_OVERLAY_RUN
+	ASSERT PASSIVE_OVERLAY_SIZE <= 0x280	; LINE_BUF through 0x9FFF (640 B)
 
 	END MAIN.START

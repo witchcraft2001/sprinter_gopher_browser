@@ -75,7 +75,8 @@ Toolchain: **sjasmplus**, output is a **DSS `.EXE`**. (Decision: assembly, not C
 
 **Phase 2 (ESP network backend + real fetch) — done, awaiting on-target check.**
 - `src/net.asm` (MODULE NET, `IFDEF BACKEND_ESP`): `INIT` (UART find, `CHECK_NET_UP`
-  = env NET/NET_ESP_HW + `NET_ESP_FW` RX profile, `LOAD_BAUD` = env `NET_BAUD`→divisor,
+  = env NET/NET_ESP_HW + `NET_ESP_FW` RX profile and 2.2.1 flow contract,
+  `LOAD_BAUD` = env `NET_BAUD`→divisor,
   UART init, AT/ATE0, `SETUP_UART_FLOW`, CIPMUX=0 — see the "Any baud + firmware
   profile" note below; no ISA reset, no NET.CFG file), `CONNECT`→`TCP.OPEN`,
   `SEND`→`TCP.SEND_BUFFER`, `RECV`→`TCP.RECEIVE`,
@@ -139,8 +140,10 @@ shutdown-on-exit (below). Awaiting a re-test.
   out of `CFG_CMD_BUF` at `0x9BA0`). The original "garbage rows" bug was the
   `AT_END` HL-clobber (above), misattributed to the memory window. So buffers may
   freely be PChars sources from WIN2. Moving `LINE_BUF` there freed 512 bytes of
-  scarce WIN1 image space; during binary downloads its first 40 bytes temporarily
-  hold the detached visible page's DOC descriptor. (STAGE/REQ_BUF/HIST_DATA stay
+  scarce WIN1 image space; during 2.2.1 binary downloads its first 40 bytes
+  temporarily hold the detached visible page's DOC descriptor. During 2.2.2
+  downloads the whole 512-byte buffer holds the passive-RX code overlay, loaded
+  from the non-loader EXE tail immediately before receiving. (STAGE/REQ_BUF/HIST_DATA stay
   in the same WIN2 GetMem page as plain memory.)
 - `src/main.asm` rewritten: gopher rows parsed (`PARSE_ROW`: type/display/
   selector/host/port, TABs→NUL) and rendered straight from doc pages through the
@@ -217,22 +220,38 @@ shutdown-on-exit (below). Awaiting a re-test.
   reverted to 115200 when absent, and worse let `SETUP_UART_FLOW`'s `AT+UART_CUR`
   reprogram the ESP to the wrong speed). Instead `NET.INIT` takes everything from the
   environment NETUP published: `LOAD_BAUD` reads **`NET_BAUD`** into `NETCFG.CFG_BAUD`
-  (consumed by `APPLY_UART_BAUD`→divisor and `BUILD_UART_FLOW_CMD`); `CHECK_NET_UP`
+  (consumed by `APPLY_UART_BAUD`→divisor); `CHECK_NET_UP`
   reads **`NET_ESP_FW`** (`2.2.1`/`2.2.2`) and sets both `WCOMMON.UART_ESP_PROFILE`
-  and `WIFI.UART_RX_PROFILE` via `WIFI.UART_SET_RX_PROFILE` (mirrors the kit's
-  `REQUIRE_NET_UP`). Missing/empty `NET_BAUD` or unknown `NET_ESP_FW` → CF=1 → "run
-  NETUP first" (no file fallback, no guessing). The kit's profile then drives FCR
-  trigger (2.2.1 TR8 / 2.2.2 TR4), `SETUP_UART_FLOW` (2.2.1 manual RTS flow=0 / 2.2.2
-  AFE flow=3) and `UART_RX_PAUSE/RESUME` — so gopher works at 57600/115200/230400/…
-  on either firmware. `RAW_SAFE_RX`/`RAW_NORMAL_RX` pick their FCR from the profile
-  too (`RAW_FCR_VALUE`). The receive/download logic itself is unchanged (active +IPD
-  on both firmwares; the kit's TCP path is identical for 2.2.1/2.2.2).
+  and `WIFI.UART_RX_PROFILE` via `WIFI.UART_SET_RX_PROFILE`. A missing
+  `NET_ESP_FW` defaults to `2.2.1` for compatibility with older SprinterWiFi
+  packages. `CHECK_NET_UP` also restores the negotiated **`NET_ESP_FLOW`** for
+  both profiles (`3` = AFE, `0` = manual) before `WIFI.UART_INIT`. NETUP already
+  configured both ends correctly, but it and gopher are separate processes:
+  gopher's library state starts from its compiled default, and its own
+  `UART_INIT` re-writes the local 16550 MCR. The client contract is therefore to
+  reload the mode from the environment first; `SETUP_UART_FLOW` then verifies
+  the already-matched link. Without that reload, 2.2.2 could hang at
+  "Receiving 0 KB" with ESP flow=3 but gopher's local 16550 left manual.
+  If `NET_ESP_FLOW` is absent, gopher always selects `flow=3`, matching the
+  pre-profile package where hardware flow control was unconditional. Unknown
+  published profile/flow values still fail. Missing/empty `NET_BAUD` → CF=1 →
+  "run NETUP first". The RX profile drives the FCR trigger (2.2.1 TR8 / 2.2.2
+  TR4) and `UART_RX_PAUSE/RESUME`.
   **`AT_RECOVER` must NEVER reset the ESP or force the default divisor.** A stalled
   first AT is recovered by drain (`UART_EMPTY_RS`) + a 300 ms settle + one retry.
   `WIFI.ESP_RESET` reverts the module to its flash 115200 and destroys NETUP's
   volatile session (Wi-Fi join AND the negotiated baud), and `UART_SET_DEFAULT_DIVISOR`
   pins the host at 115200 — both permanently break any non-115200 link (this was the
   root cause of "no connection at BAUD≠115200").
+  **INVARIANT — on profile 2.2.1 gopher must NOT re-run `SETUP_UART_FLOW` (v0.1.15).**
+  NETUP already configured the ESP UART flow for the session. `CHECK_NET_UP`
+  restores the matching local `NET_ESP_FLOW` mode before `WIFI.UART_INIT`; old
+  packages that did not publish the flow variable use the historical `flow=3`
+  contract. Re-running the old `SETUP_UART_FLOW` path could resend
+  `AT+UART_CUR`, re-init, and disturb the live 2.2.1 session. `NET.INIT` therefore
+  skips it for `UART_RX_PROFILE_221`. **2.2.2 keeps its existing verification
+  call after restoring the published local mode.** General rule: the browser
+  reuses NETUP's session and must not reconfigure the ESP UART behind it.
 - **Link stability (mirrors the kit's wget) — fixed flaky "init/Send failed".**
   `NET.INIT` no longer calls `ISA.ISA_RESET` (it reset the card and broke the ESP
   session NETUP set up — the main cause); it drains stale UART bytes
@@ -244,10 +263,31 @@ shutdown-on-exit (below). Awaiting a re-test.
   before each `TCP.RECEIVE` and **drops it during the slow append/redraw**, so the
   ESP holds its TX and the UART FIFO never overruns. `SETUP_UART_FLOW` (ESP side)
   is set in `INIT`.
+- **Binary RX is deliberately split by firmware profile.** ESP-AT 2.2.1 keeps
+  the active `+IPD` download algorithm from `ff7c910` unchanged (TR8, whole body
+  in the DOC page chain, then the final `Writing N KB` pass). ESP-AT 2.2.2 uses
+  `CIPRECVMODE=1` + single-connection `CIPRECVDATA`: `RECV_PASSIVE_222` pulls a
+  bounded block into `DL_BUF`; `DL_RECV_FILE_222` accumulates and writes exact
+  4 KB FAT chunks (only the final chunk may be shorter). The ESP's 5760-byte
+  socket buffer retains the rest and applies TCP backpressure during disk I/O.
+  Thus 2.2.2 never stores a binary in DOC
+  banks and has no final `Writing` phase or 256 KB banking boundary. The mode is
+  forced back to active on close/next connect so transparent page fetches are
+  unaffected. `UART_INIT` remains profile-specific (2.2.1 TR8, 2.2.2 TR4);
+  `WIFI_STABLE_ACTIVE_RX` must not be defined because it forces TR8 on 2.2.2.
+  The 2.2.2-only receive and write routines are a 639-byte runtime overlay:
+  their bytes follow `IMAGE_END` in GOPHER.EXE and `LOAD_PASSIVE_OVERLAY` reads
+  them into `LINE_BUF..0x9FFE` only after the binary download has begun. They
+  therefore consume no WIN1 image/BSS space and do not alter startup. `DL_NAME`
+  and `DL_PATH` alias `BM_LINE`, whose bookmark-building lifetime cannot overlap
+  a binary download.
 - **Download progress** on the status bar: page fetches use `SHOW_PROGRESS`;
   binary receive paints `Receiving N KB` directly into text VRAM page `#50`
   (no DSS/BIOS call and no RTS pause), updating on whole-KB changes. Gopher has
   no content-length, so it is an amount, not a percent.
+  `DL_PROGRESS_RX` jumps explicitly to `DLP_DRAW`: when `INIT_DLP_TXT` was
+  inserted between them during the WIN2 relocation, the former fall-through
+  accidentally returned after re-seeding the text and never painted progress.
   `doc_lines` (total, from `COUNT_LINES`) is available for a future scroll
   position indicator.
 
@@ -337,6 +377,10 @@ shutdown-on-exit (below). Awaiting a re-test.
    itself (only `NET.CONNECT.prep` does), so after a download it would fail every
    page with "Connect failed". (This bit v0.1.10 the moment the active loop
    replaced the transparent one, which had resumed RTS in `RAW_FINISH`.)
+   After a cancelled/failed active receive, gopher waits for Esc release before
+   `NET.CLOSE` (so the held key cannot cancel cleanup or leak into the menu's
+   "Quit?" prompt) and invalidates `net_inited`; the next network operation
+   re-runs UART initialization instead of reusing a desynchronised parser/socket.
    Page fetches STILL use transparent `CIPMODE=1` (their `.`-terminator
    arrives before the close, so the token IS reliable there — see below); the two
    transports interleave cleanly because each restores `CIPMODE=0` when done.
@@ -521,11 +565,12 @@ shutdown-on-exit (below). Awaiting a re-test.
    fn/kode/tasm/spevosdk idiom). Key correction over the first plan: a `--raw` EXE does NOT
    ignore appended bytes — the no-loader DSS path (`Execute.ASM .RET_1`) reads to
    EOF and CLOSES the file. So instead we set the **`LOADER` header word at offset
-   `0x08`** = `IMAGE_END - LOAD_ADDR` (sjasmplus, ~`0x2DAB`); DSS then loads exactly
+   `0x08`** = `IMAGE_END - LOAD_ADDR`; DSS then loads exactly
    the image via the `PRELOAD`/`_RET_2` path and leaves the EXE **open** (FM at
    `(IX-3)`, FP right after the image). `IMAGE_END` is a label after the last
-   `INCLUDE`. The file is `[512 hdr][image LOADER bytes][INDEX.GPH]`; appended data
-   starts at file offset `HOME_OFFSET = 0x200 + LOADER`.
+   `INCLUDE`. The file is `[512 hdr][image LOADER bytes][passive overlay]
+   [INDEX.GPH]`; appended home data starts at `HOME_OFFSET = 0x200 + LOADER +
+   PASSIVE_OVERLAY_SIZE`.
    - **Build (Makefile):** `cat data/index.gph >> build/GOPHER.EXE` after sjasmplus
      (CRLF + real TABs; `NEXT_LINE` tolerates CRLF or LF).
    - **Runtime (`LOAD_HOME_FILE`):** capture `home_fm` = `(IX-3)` as the FIRST
@@ -876,9 +921,22 @@ the app version.)
   the build instead of corrupting at runtime. (If TCP BSS later nears 0x8000,
   relocate it too via `ESP_TCP_BSS_BASE_OVERRIDE`.)
   When the image itself nears the limit, move runtime-only buffers into the
-  WIN2 scratch page instead (v0.1.6: `DL_NAME`/`DL_PATH` became WIN2 EQUs at
-  `0x9F80`/`0x9F90` for exactly this reason; headroom after that ≈ 35 bytes,
-  the ASSERT still guards it).
+  WIN2 scratch page instead. `DL_NAME`/`DL_PATH` now alias `BM_LINE` at
+  `0x8800` because bookmarking and binary download lifetimes are disjoint.
+  The 2.2.2-only passive receive/write code is stored outside the loader image
+  and loaded as an overlay at `0x9D80..0x9FFE`; the ordinary WIN1 image plus
+  `RS_BUFF` currently ends at `0x7FF6`, and the ASSERT guards it.
+  v0.1.13 moved `NUMBUF`/`URL_SCHEME`/`SEARCH_BUF`/
+  `DOC_TITLE`/`PREVIEW_BUF` to `0x8B00..0x8BFF`; v0.1.15 moved the download-progress
+  text `DLP_TXT` (+ its `DLP_NUM` tail, which must stay **contiguous** — `DLP_DRAW`
+  paints `DLP_TXT_LEN` cells in one linear pass) to `0x89A8`, seeding the fixed
+  "Receiving " prefix at START via `INIT_DLP_TXT` (a WIN2 EQU has no init value),
+  then moved 51 bytes of runtime-only receive/download/exec state into the
+  remaining `0x89C3..0x89F5` gap. `INIT_PROGRESS_VRAM` now runs only after the
+  WIN2 page is mapped because `video_page`/`dlp_base` live in that state block.
+  The config parser's runtime-only `cfg_path` now overlays `STAGE`, while
+  `look_ext`/`CMD_TPL` overlay `REQ_BUF`; their lifetimes are disjoint from file
+  streaming and network sends. This removes another 288 bytes from WIN1.
 - **`net_inited` caching can strand a stale ESP session.** `NET.INIT` runs once
   and is cached (`net_inited=1`); later fetches reuse the open UART/ESP session.
   If that session goes stale (e.g. after the user lingers on a local page — the

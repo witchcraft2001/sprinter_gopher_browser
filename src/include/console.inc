@@ -43,8 +43,9 @@ SCR_W				EQU 80
 SCR_H				EQU 32
 
 ; --- WIN2 scratch layout (inside the GetMem page mapped at 0x8000) ---
-; Stack lives in WIN1 (top 0x8000, growing down), so the whole 0x8000..0xBFFF
-; WIN2 page is free for these runtime buffers. Plain EQUs so MAIN and DOC share.
+; After early startup the stack lives at the top of this GetMem-backed WIN2 page
+; (0xC000, growing through 0xBFFF..0xB000); 0x8000..0xAFFF holds these runtime
+; buffers. Plain EQUs so MAIN and DOC share them.
 WIN2_BASE			EQU 0x8000
 STAGE				EQU 0x8000			; DSS file/config streaming buffer
 STAGE_SIZE			EQU 2048
@@ -52,7 +53,49 @@ BM_LINE				EQU 0x8800			; bookmark record builder (352 B; ends 0x895F)
 ; Download target address, runtime-written per download (frees WIN1 image
 ; space; the network-lib BSS must stay below 0x8000).
 DL_HOST				EQU 0x8960			; 64 B (ends 0x899F)
-DL_PORT				EQU 0x89A0			; 8 B (ends 0x89A7; 0x89A8..0x89FF spare)
+DL_PORT				EQU 0x89A0			; 8 B (ends 0x89A7)
+; Download-progress status text "Receiving <n> KB" + padding, painted straight to
+; text VRAM by DLP_DRAW (WIN2 stays mapped there; never a DSS/BIOS arg). Lives in
+; WIN2 instead of the WIN1 image to keep the network-lib BSS below 0x8000. The
+; fixed "Receiving " prefix (10 B) is copied in once at START (INIT_DLP_TXT); the
+; number tail (DLP_NUM = DLP_TXT+10) is rewritten before each draw.
+DLP_TXT				EQU 0x89A8			; 27 B: 10 prefix + 16 num + NUL (ends 0x89C2)
+DLP_NUM				EQU DLP_TXT + 10	; 16 B variable tail; runtime state follows at 0x89C3
+; Runtime-only network/download state. All fields are initialized by their
+; owning operation before use; keeping them in the remaining gap avoids growing
+; the WIN1 image into the ESP response BSS.
+dw_page				EQU 0x89C3			; byte
+dw_len				EQU 0x89C4			; word
+dw_off				EQU 0x89C6			; word
+dw_n				EQU 0x89C8			; word
+dw_last				EQU 0x89CA			; word
+dw_rem				EQU 0x89CC			; word
+dl_comb				EQU 0x89CE			; word
+dl_first			EQU 0x89D0			; byte
+dl_pending			EQU 0x89D1			; word
+dl_partial			EQU 0x89D3			; byte
+dl_last_kb			EQU 0x89D4			; word
+video_page			EQU 0x89D6			; byte
+dlp_base			EQU 0x89D7			; byte
+dl_disk_err			EQU 0x89D8			; byte
+dl_net_err			EQU 0x89D9			; byte
+recv_line_state		EQU 0x89DA			; byte
+recv_term_seen		EQU 0x89DB			; byte
+recv_idle_cb			EQU 0x89DC			; word
+raw_closed			EQU 0x89DE			; byte
+raw_close_state		EQU 0x89DF			; byte
+recv_lo				EQU 0x89E0			; word
+recv_hi				EQU 0x89E2			; word
+prog_suffix			EQU 0x89E4			; word
+in_prompt			EQU 0x89E6			; word
+in_buf				EQU 0x89E8			; word
+in_max				EQU 0x89EA			; byte
+in_pos				EQU 0x89EB			; byte
+exec_sp				EQU 0x89EC			; word
+open_tpl			EQU 0x89EE			; word
+url_ptr				EQU 0x89F0			; word
+url_full			EQU 0x89F2			; word
+last_err			EQU 0x89F4			; word; ends 0x89F5
 REQ_BUF				EQU 0x8A00			; outgoing selector + CRLF (<=256 B: SEL_CUR 200 + CRLF)
 ; Runtime buffers relocated out of the WIN1 image (into the unused upper half of
 ; REQ_BUF's 512 B slot, 0x8B00..0x8BFF) so the code image + network-lib BSS stay
@@ -84,18 +127,19 @@ SEL_CUR				EQU 0x9CA8			; current page selector (200 B; ends 0x9D70)
 ; Parsed/rendered row. PChars has been verified with WIN2 sources; keeping this
 ; 512-byte buffer here frees scarce WIN1 image space for streaming logic.
 LINE_BUF			EQU 0x9D80			; 512 B; ends 0x9F7F
-; Download target name/path. Runtime-written (MAKE_DLNAME) before every
-; download; live here instead of the WIN1 image to keep the network-lib BSS
-; below 0x8000. Read by FILE.* (DSS args) and SHOW_SAVED (PChars-safe).
-DL_NAME				EQU 0x9F80			; 16 B: derived 8.3 filename
-DL_PATH				EQU 0x9F90			; 32 B: "DOWNLOAD\<name>" (ends 0x9FAF)
+; Download target name/path overlay the bookmark builder: bookmarking and a
+; binary download cannot run concurrently. This leaves 0x9F80..0x9FFF free to
+; extend the 2.2.2 passive-code overlay beyond LINE_BUF.
+DL_NAME				EQU BM_LINE			; 16 B: derived 8.3 filename
+DL_PATH				EQU BM_LINE + 16		; 32 B: "DOWNLOAD\<name>"
 ; Web-link status string (type-h URLs with no [urls] handler). Runtime-written,
 ; PChars'd from WIN2 (verified safe); disjoint from any download. Fills the gap
 ; between DL_PATH and DL_BUF (0x9FB0..0x9FFF = 80 B).
-WEBLINK_BUF			EQU 0x9FB0			; 80 B (ends 0x9FFF)
-; Shared network accumulator. Page fetches append it to DOC; binary downloads
-; fill it completely, then flush every complete 512-byte sector to FAT in one
-; maximal (4 KB) write, keeping the sub-sector remainder for the next round.
+WEBLINK_BUF			EQU 0x9FB0			; 80 B; overwritten only during binary download
+; Shared network accumulator. Page fetches append it to DOC. ESP-AT 2.2.1
+; binary downloads use it as the active-RX accumulator before appending to DOC;
+; 2.2.2 passive downloads fill it and write exact 4 KB chunks straight to FAT
+; (only the final write may be shorter).
 ; It also overlays NETCFG BSS, whose lifetime ends before either transfer.
 ; Sits above the small buffers and below the stack (0xA000..0xAFFF); never a
 ; PChars source (raw bytes only).

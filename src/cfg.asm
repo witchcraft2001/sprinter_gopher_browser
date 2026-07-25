@@ -571,7 +571,10 @@ STRCMP_CI
 	RET
 
 ; ------------------------------------------------------
-; Data (WIN1, small now that the viewers map isn't kept).
+; Data. The large temporary strings overlay WIN2 scratch buffers whose lifetimes
+; do not intersect config scanning: cfg_path is needed only until OPEN, before
+; STAGE receives file chunks; look_ext/CMD_TPL use REQ_BUF while no request is
+; being built or sent. CMD_TPL remains valid until BUILD_CMD consumes it.
 ; ------------------------------------------------------
 st_key			DS ST_MAX * 2, 0
 st_val			DS ST_MAX * 2, 0
@@ -590,9 +593,9 @@ p_val			DW 0
 look_key		DW 0
 bc_path			DW 0
 bc_dst			DW 0
-cfg_path		DS 144, 0				; "<EXE dir>GOPHER.CFG" (absolute open path)
-look_ext		DS EXT_MAX, 0			; the extension being looked up
-CMD_TPL			DS TPL_MAX, 0			; matched viewer command template
+cfg_path		EQU STAGE				; 144 B: "<EXE dir>GOPHER.CFG"; then file chunks
+look_ext		EQU REQ_BUF			; 16 B: extension / URL scheme being looked up
+CMD_TPL			EQU REQ_BUF + EXT_MAX	; 128 B: matched command template
 
 CFG_NAME		DB "GOPHER.CFG", 0
 S_SETTINGS		DB "settings", 0

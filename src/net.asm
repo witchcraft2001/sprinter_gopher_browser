@@ -32,6 +32,14 @@ INIT
 	LD		HL, CMD_ECHO_OFF
 	CALL	TX_CMD
 	RET		C
+	; ESP-AT 2.2.1: do NOT re-run SETUP_UART_FLOW. NETUP already established the
+	; ESP-side flow contract, CHECK_NET_UP restored the matching local mode (or
+	; legacy flow=3), and UART_INIT above applied it to the 16550. Reconfiguring
+	; the ESP UART again disturbed working 2.2.1 sessions. 2.2.2 keeps its
+	; established verification call after restoring the same published mode.
+	LD		A, (WIFI.UART_RX_PROFILE)
+	CP		UART_RX_PROFILE_221
+	JR		Z, .flow_ok					; 221: keep NETUP's config untouched
 	CALL	WCOMMON.SETUP_UART_FLOW
 	AND		A
 	JR		Z, .flow_ok
@@ -107,7 +115,7 @@ CONNECT
 	LD		DE, (c_port)
 	JP		TCP.OPEN
 .prep
-	CALL	WIFI.UART_RX_RESUME
+	CALL	RX_RESUME_COMPAT			; do not rewrite FCR with queued UART bytes
 	CALL	TCP.CLOSE					; drop any stale single-connection socket
 	; Force active mode. AT+CIPMODE is a GLOBAL flag: a preceding page fetch runs
 	; transparent (CIPMODE=1) and RAW_FINISH only "requests" CIPMODE=0 best-effort
@@ -117,6 +125,15 @@ CONNECT
 	; to whatever mode the previous operation left. Idempotent when already 0.
 	LD		HL, CMD_CIPMODE_0
 	CALL	TX_CMD
+	; Passive receive is used only by 2.2.2 downloads. Always return the ESP to
+	; active receive before opening a fresh socket; page fetches and 2.2.1 keep
+	; their historical transports.
+	LD		A, (WIFI.UART_RX_PROFILE)
+	CP		UART_RX_PROFILE_222
+	JR		NZ, .active_ready
+	LD		HL, CMD_CIPRECVMODE_0
+	CALL	TX_CMD
+.active_ready
 	CALL	WIFI.UART_EMPTY_RS
 	RET
 c_host	DW 0
@@ -129,10 +146,25 @@ SEND
 	JP		TCP.SEND_BUFFER_NO_WAIT
 
 RECV
+	LD		A, (WIFI.UART_RX_PROFILE)
+	CP		UART_RX_PROFILE_222
+	JP		Z, RECV_PASSIVE_222
+	; 2.2.1 remains on the active +IPD path from ff7c910. In that profile the
+	; kit's UART_SET_DATA_RX_MODE is a no-op, so its receive algorithm and TR8
+	; flow are unchanged.
 	JP		TCP.RECEIVE
 
 CLOSE
-	JP		TCP.CLOSE
+	CALL	TCP.CLOSE
+	PUSH	AF						; preserve CLOSE result while restoring global mode
+	LD		A, (WIFI.UART_RX_PROFILE)
+	CP		UART_RX_PROFILE_222
+	JR		NZ, .restore_done
+	LD		HL, CMD_CIPRECVMODE_0
+	CALL	TX_CMD					; best-effort: next CONNECT also forces active mode
+.restore_done
+	POP		AF
+	RET
 
 ; Prepare diagnostics/parser state immediately before a new active-mode request.
 ; Finish with RTS asserted because START_SEND_BUFFER must receive the '>' prompt.
@@ -144,7 +176,12 @@ ACTIVE_PREP
 	LD		(TCP.IPD_BAD_CHAR), A
 	LD		HL, 0
 	LD		(TCP.PAYLOAD_LEFT), HL
-	JP		WIFI.UART_RX_RESUME
+	CALL	RX_RESUME_COMPAT
+	LD		A, (WIFI.UART_RX_PROFILE)
+	CP		UART_RX_PROFILE_222
+	JP		Z, PASSIVE_SETUP_222
+	OR		A						; 2.2.1: active mode, CF=0, unchanged
+	RET
 
 ; ------------------------------------------------------
 ; Transparent/raw TCP transport for gopher page fetches only.
@@ -380,7 +417,22 @@ RAW_QUIET_GUARD
 RX_PAUSE
 	JP		WIFI.UART_RX_PAUSE
 RX_RESUME
-	JP		WIFI.UART_RX_RESUME
+	JP		RX_RESUME_COMPAT
+
+; Pre-UART_SET_DATA_RX_MODE UART_RX_RESUME. Only restore MCR/RTS; never touch
+; FCR after UART_INIT selected the firmware profile's trigger.
+RX_RESUME_COMPAT
+	PUSH	DE, HL
+	LD		A, (WIFI.UART_FLOW_MODE)
+	LD		E, MCR_RTS
+	AND		A
+	JR		Z, .write
+	LD		E, MCR_AFE | MCR_RTS
+.write
+	LD		HL, REG_MCR
+	CALL	WIFI.UART_WRITE
+	POP		HL, DE
+	RET
 
 ; Hand the ESP back in AT command mode for the next program: close any lingering
 ; socket (AT+CIPCLOSE) and re-assert echo-off. Best-effort; ignores errors. Call
@@ -397,6 +449,10 @@ CMD_ECHO_OFF	DB "ATE0", 13, 10, 0
 CMD_CIPMUX_0	DB "AT+CIPMUX=0", 13, 10, 0
 CMD_CIPMODE_1	DB "AT+CIPMODE=1", 13, 10, 0
 CMD_CIPMODE_0	DB "AT+CIPMODE=0", 13, 10, 0
+CMD_CIPRECVMODE_1 DB "AT+CIPRECVMODE=1", 13, 10, 0
+CMD_CIPRECVMODE_0 DB "AT+CIPRECVMODE=0", 13, 10, 0
+CMD_CIPDINFO_0	DB "AT+CIPDINFO=0", 13, 10, 0
+CMD_CIPRECVDATA_PREFIX DB "AT+CIPRECVDATA=", 0
 CMD_CIPSEND_RAW DB "AT+CIPSEND", 13, 10, 0
 STR_PLUS3		DB "+++", 0
 STR_CRLF		DB 13, 10, 0
@@ -415,6 +471,7 @@ raw_lsr_err		DB 0
 ; NETCFG.CFG_BAUD (read by APPLY_UART_BAUD + BUILD_UART_FLOW_CMD).
 ; Out: CF=0 filled; CF=1 if NET_BAUD is unset/empty (NET.INIT -> "run NETUP first").
 KEY_NET_BAUD	DB "NET_BAUD", 0
+KEY_NET_ESP_FLOW DB "NET_ESP_FLOW", 0
 LOAD_BAUD
 	LD		HL, KEY_NET_BAUD
 	LD		DE, WCOMMON.ENV_VAL_BUF
@@ -447,9 +504,11 @@ LOAD_BAUD
 	RET
 
 ; Verify NETUP joined Wi-Fi (env NET=WIFI, NET_ESP_HW set) and select the ESP-AT
-; firmware RX profile from NET_ESP_FW. Returns CF=1 on failure instead of exiting
-; the program (unlike WCOMMON.REQUIRE_NET_UP), so the browser can report the error
-; and stay running. Reuses the kit's env strings and profile setter.
+; firmware RX profile from NET_ESP_FW. Older NETUP versions did not publish that
+; variable, so absence selects 2.2.1; an unknown published value is still an error.
+; Returns CF=1 on failure instead of exiting the program (unlike
+; WCOMMON.REQUIRE_NET_UP), so the browser can report the error and stay running.
+; Reuses the kit's env strings and profile setter.
 CHECK_NET_UP
 	LD		HL, WCOMMON.N_NET_KEY
 	LD		DE, WCOMMON.ENV_VAL_BUF
@@ -472,17 +531,16 @@ CHECK_NET_UP
 	LD		A, (WCOMMON.ENV_VAL_BUF)
 	OR		A
 	JR		Z, .fail					; NET_ESP_HW empty
-	; Firmware RX profile (NET_ESP_FW): selects the kit's UART receive/RTS algorithm
-	; (2.2.1 = manual RTS, flow=0, FCR TR8; 2.2.2 = AFE, flow=3, FCR TR4). Set both
-	; WCOMMON.UART_ESP_PROFILE (read by SETUP_UART_FLOW) and WIFI.UART_RX_PROFILE
-	; (read by UART_INIT/EMPTY_RS/receive), exactly like WCOMMON.REQUIRE_NET_UP.
+	; Firmware RX profile (NET_ESP_FW): selects the kit's UART receive algorithm
+	; (2.2.1 = FCR TR8; 2.2.2 = FCR TR4). Set both WCOMMON.UART_ESP_PROFILE and
+	; WIFI.UART_RX_PROFILE (read by UART_INIT/EMPTY_RS/receive).
 	LD		HL, WCOMMON.N_ESP_FW_KEY
 	LD		DE, WCOMMON.ENV_VAL_BUF
 	LD		B, ENV_GET
 	LD		C, DSS_ENVIRON
 	RST		DSS
 	OR		A
-	JR		Z, .fail					; NET_ESP_FW not set -> run a current NETUP
+	JR		Z, .fw221					; old NETUP did not publish NET_ESP_FW
 	LD		HL, WCOMMON.ENV_VAL_BUF
 	LD		DE, WCOMMON.V_ESP_FW_221
 	CALL	.strmatch
@@ -498,6 +556,37 @@ CHECK_NET_UP
 .set_profile
 	LD		(WCOMMON.UART_ESP_PROFILE), A
 	CALL	WIFI.UART_SET_RX_PROFILE
+	; Restore the exact UART flow contract NETUP established for BOTH profiles.
+	; NETUP and gopher are separate processes: gopher's UART_FLOW_MODE starts at
+	; zero, then its UART_INIT would overwrite NETUP's local MCR state. The current
+	; client contract is to reload NET_ESP_FLOW first; SETUP_UART_FLOW then verifies
+	; the already-matched link. Otherwise ESP flow=3 + a manual local 16550 can
+	; overrun/desynchronise active +IPD at "Receiving 0 KB". Pre-flow-variable
+	; packages used flow=3 unconditionally.
+	LD		HL, KEY_NET_ESP_FLOW
+	LD		DE, WCOMMON.ENV_VAL_BUF
+	LD		B, ENV_GET
+	LD		C, DSS_ENVIRON
+	RST		DSS
+	OR		A
+	JR		NZ, .have_flow
+	JR		.flow3					; legacy NETUP: FLOW_MODE=3 was unconditional
+.have_flow
+	LD		A, (WCOMMON.ENV_VAL_BUF)
+	CP		'0'
+	JR		Z, .flow0
+	CP		'3'
+	JR		NZ, .fail					; invalid published flow contract
+.flow3
+	LD		A, 1
+	JR		.store_flow
+.flow0
+	XOR		A
+.store_flow
+	; CHECK_NET_UP is also used as a fast pre-init status probe. Seed only the
+	; library state here; WIFI.UART_INIT applies it to MCR after UART_FIND.
+	LD		(WIFI.UART_FLOW_MODE), A
+.ok
 	OR		A							; CF=0 ok
 	RET
 .fail

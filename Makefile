@@ -12,9 +12,10 @@ ASM        := sjasmplus
 SRC        := src/main.asm
 # All sources main.asm pulls in, so editing any module/include forces a rebuild.
 DEPS       := $(wildcard src/*.asm src/include/*.inc)
-# Home page: appended verbatim past the EXE image (the header's LOADER field makes
-# GOPHER.EXE a loader EXE, so DSS leaves the file open and the program reads this
-# tail back at startup -- see LOAD_HOME_FILE). Editing it forces a rebuild.
+# Home page: appended verbatim after the EXE image and the 2.2.2 passive overlay
+# (the header's LOADER field makes GOPHER.EXE a loader EXE, so DSS leaves the
+# file open and the program seeks to this tail at startup -- see LOAD_HOME_FILE).
+# Editing it forces a rebuild.
 HOMEPAGE   := data/index.gph
 CFG        := data/gopher.cfg
 ESP_HOWTO     := data/esp/howto.md
