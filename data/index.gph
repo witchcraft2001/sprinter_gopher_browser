@@ -6,13 +6,17 @@ iControls:
 i  Up / Down       - move the cursor
 i  Home / End       - start / end of document
 i  PgUp / PgDn      - page up / down (Left / Right too)
-i  Enter            - open the selected link
+i  Enter            - open link / search / download selected item
 i  Backspace        - go back
+i  Ctrl+G           - open address: host[:port][/selector]
+i  Ctrl+B           - open bookmarks
+i  Ctrl+D           - bookmark the current page
 i  Esc / F10        - quit (cancels a running download)
 i
 iThis home page is INDEX.GPH, appended to GOPHER.EXE - edit it freely.
 i
 iSome links to start exploring gopherspace:
+1Official Sprinter Gopher Server	/	go.sprinter.ru	70
 1Virtual TR-DOS official gopher hole	/	vtrd.in	70
 1Nihirash's gopher hole (lots of Speccy stuff)	/	nihirash.net	70
 1I-Logout.cz - phlog aggregator and more	/	i-logout.cz	70

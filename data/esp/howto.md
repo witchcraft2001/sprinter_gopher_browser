@@ -55,11 +55,17 @@ If the status line shows `Wi-Fi not up - run NETUP first`, repeat step 2.
 | PgUp / PgDn (or Left/Right)| page up / down                                 |
 | Enter                     | open the link / download a file / run a search  |
 | Backspace                 | go back                                         |
+| Ctrl+G                    | open `host[:port][/selector]`                   |
 | Ctrl+D                    | add the current page to bookmarks               |
 | Ctrl+B                    | open bookmarks                                  |
 | Esc / F10                 | quit (also cancels a running fetch/download)    |
 
 The clock (top-right of the header) reads the Sprinter's CMOS time.
+
+**Ctrl+G** opens a gopher address directly. Enter `host`, `host:port`, or
+`host[:port]/selector`; port 70 is the default and a bare host opens its root
+menu. The selector is sent exactly as typed after the first slash, so use `//x`
+when the selector itself begins with `/`.
 
 ## Bookmarks
 

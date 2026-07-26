@@ -95,6 +95,8 @@ START
 	CALL	SHOW_BANNER					; version + build-date banner on load
 	CALL	INIT_RUNTIME_PAGE			; map a fresh WIN2 page for the scratch buffers
 	JP		C, MEM_ERROR
+	XOR		A
+	LD		(open_addr_active), A
 	; The WIN2 page is now ours, so move the stack into its top 4 KB
 	; (RUN_STACK_TOP), away from the network lib's BSS under 0x8000. The early
 	; boot frames on the WIN1 stack are done with (START exits via DSS, never
@@ -146,6 +148,8 @@ MAINLOOP
 	JP		Z, ON_BOOKMARKS
 	CP		KEY_D					; Ctrl+D -> add the current page to bookmarks
 	JP		Z, ON_ADD_BOOKMARK
+	CP		KEY_G					; Ctrl+G -> open a typed gopher address
+	JP		Z, ON_OPEN_ADDRESS
 .navkeys
 	LD		A, D
 	CP		KEY_UP
@@ -626,6 +630,52 @@ CLAMP_SEL
 	RET
 
 ; ------------------------------------------------------
+; Ctrl+G: open a gopher address entered as host[:port][/selector]. The optional
+; path is sent verbatim as the selector; a bare host opens its root menu.
+; Save the current page before parsing: a failed connection restores that page
+; and reopens this input with the address intact.
+; ------------------------------------------------------
+ON_OPEN_ADDRESS
+	XOR		A
+	LD		(open_addr_active), A
+	LD		(REQ_BUF), A
+	JR		ON_OPEN_ADDRESS_INPUT
+; The previous Ctrl+G input is already restored to REQ_BUF. Keep it editable.
+ON_OPEN_ADDRESS_EDIT
+ON_OPEN_ADDRESS_INPUT
+	LD		HL, MSG_OPENURL
+	LD		DE, REQ_BUF
+	LD		B, OPEN_ADDR_MAX
+	CALL	INPUT_LINE
+	JR		C, .cancel
+	LD		A, (REQ_BUF)
+	OR		A
+	JR		Z, .cancel
+	LD		HL, REQ_BUF
+	LD		DE, OPEN_ADDR_SAVE
+	LD		B, OPEN_ADDR_MAX
+	CALL	STRCPYN
+	CALL	PUSH_HIST
+	CALL	DOC.NEW
+	LD		HL, REQ_BUF
+	LD		C, 1
+	CALL	PARSE_GOPHER_URL
+	LD		HL, HOST_CUR
+	LD		DE, DOC_TITLE
+	LD		B, TITLE_MAX
+	CALL	STRCPYN
+	LD		A, 1
+	LD		(open_addr_active), A
+	LD		A, 1
+	LD		(cur_kind), A
+	JP		GOTO_FETCH
+.cancel
+	XOR		A
+	LD		(open_addr_active), A
+	CALL	SHOW_DOC_STATUS
+	JP		MAINLOOP
+
+; ------------------------------------------------------
 ; Enter: open the link on the selected row.
 ; ------------------------------------------------------
 ON_ENTER
@@ -690,6 +740,8 @@ ON_ENTER
 	LD		HL, MSG_SEARCH
 	LD		DE, SEARCH_BUF
 	LD		B, SEARCH_MAX
+	XOR		A
+	LD		(SEARCH_BUF), A
 	CALL	INPUT_LINE
 	JR		C, .search_cancel		; Esc -> abort
 	CALL	PUSH_HIST
@@ -777,6 +829,7 @@ ON_ENTER
 	LD		B, TITLE_MAX
 	CALL	STRCPYN
 	LD		HL, (url_ptr)
+	LD		C, 0					; PARSE_GOPHER_URL's typed URL mode
 	CALL	PARSE_GOPHER_URL		; -> HOST_CUR / PORT_CUR / SEL_CUR / DOC_TYPE_CUR
 	LD		A, 1
 	LD		(cur_kind), A
@@ -847,6 +900,8 @@ COPY_NAV_FROM_ROW
 GOTO_FETCH
 	CALL	DO_FETCH
 	JR		C, .err
+	XOR		A
+	LD		(open_addr_active), A
 	LD		HL, 0
 	LD		(sel_index), HL
 	LD		(top_index), HL
@@ -854,6 +909,22 @@ GOTO_FETCH
 	CALL	SHOW_DOC_STATUS
 	JP		MAINLOOP
 .err
+	LD		A, (open_addr_active)
+	OR		A
+	JR		Z, .normal
+	LD		A, (WCOMMON.CANCELLED)
+	OR		A
+	JR		NZ, .normal				; Esc cancels rather than reopening the editor
+	LD		HL, OPEN_ADDR_SAVE
+	LD		DE, REQ_BUF
+	LD		B, OPEN_ADDR_MAX
+	CALL	STRCPYN
+	CALL	DOC.RESET
+	CALL	POP_HIST				; restore the page behind the failed manual open
+	CALL	CLAMP_SEL
+	CALL	REDRAW_FULL
+	JP		ON_OPEN_ADDRESS_EDIT
+.normal
 	CALL	DOC.RESET
 	CALL	POP_HIST				; restores the previous doc's pages (no re-fetch)
 	CALL	CLAMP_SEL
@@ -1063,8 +1134,17 @@ PARSE_GOPHER_URL
 	LD		A, (HL)
 	OR		A
 	JR		Z, .nopath				; "/" with nothing after -> defaults
+	LD		A, C
+	OR		A
+	JR		Z, .typed_path
+	LD		A, '1'					; Ctrl+G paths are raw selectors, not /<type><sel>
+	LD		(DOC_TYPE_CUR), A
+	JR		.short_path
+.typed_path
+	LD		A, (HL)
 	LD		(DOC_TYPE_CUR), A		; gopher type byte
 	INC		HL
+.short_path
 	LD		DE, SEL_CUR				; selector = the rest
 	LD		B, 199
 .s
@@ -1608,6 +1688,7 @@ DO_FETCH
 	CALL	DOC.RESET
 	XOR		A
 	LD		(WCOMMON.CANCELLED), A	; clear any stale cancel flag before we start
+	LD		(fetch_conn_retry), A
 	CALL	SHOW_FETCHING
 	LD		A, (net_inited)
 	OR		A
@@ -1674,6 +1755,18 @@ DO_FETCH
 	LD		HL, ERR_INIT
 	JP		FETCH_ERR
 .e_conn
+	LD		A, (WCOMMON.CANCELLED)
+	OR		A
+	JR		NZ, .e_cancel
+	LD		A, (fetch_conn_retry)
+	OR		A
+	JR		NZ, .conn_failed
+	INC		A
+	LD		(fetch_conn_retry), A
+	LD		HL, 300					; give ESP-AT/socket cleanup a short settle window
+	CALL	UTIL.DELAY
+	JP		.attempt
+.conn_failed
 	LD		HL, ERR_CONN
 	JP		FETCH_ERR
 .e_send
@@ -3455,12 +3548,12 @@ SHOW_ERROR
 	JP		SET_STATUS
 
 ; ------------------------------------------------------
-; Single-line text input on the status row (used for type-7 search queries).
+; Single-line text input on the status row (used for type-7 search and Ctrl+G).
 ; In:  HL = prompt ASCIIZ, DE = destination buffer, B = buffer size (incl. NUL).
 ; Out: CF=0 submitted (Enter), CF=1 cancelled (Esc). Buffer is ASCIIZ either way.
 ; Uses ScanKey (A=char code, E=ASCII) with a wait-for-release debounce so a held
-; key registers once. The buffer is kept NUL-terminated as it is edited so the
-; redraw can print it directly.
+; key registers once. The caller supplies an ASCIIZ initial value (empty for a
+; fresh prompt); the buffer is kept NUL-terminated as it is edited.
 ; ------------------------------------------------------
 INPUT_LINE
 	LD		(in_prompt), HL
@@ -3468,9 +3561,10 @@ INPUT_LINE
 	LD		A, B
 	DEC		A						; reserve one byte for the NUL
 	LD		(in_max), A
-	XOR		A
+	LD		HL, DE
+	CALL	UTIL.STRLEN
+	LD		A, C
 	LD		(in_pos), A
-	LD		(DE), A					; start empty
 	CALL	INP_WAIT_RELEASE		; don't read the Enter that opened the prompt
 .redraw
 	CALL	INP_DRAW
@@ -3895,6 +3989,7 @@ EMPTYSTR		DB 0
 ; the WIN1 image. DOC_TITLE (header title, saved/restored across history) and
 ; SEARCH_BUF (type-7 query) are PChars'd from WIN2, verified safe.
 SEARCH_MAX		EQU 64
+OPEN_ADDR_MAX		EQU 255					; REQ_BUF: 254 chars + terminating NUL
 
 ; Binary/media download target (kept separate from the live page's nav so a
 ; download does not disturb the current document or history).
@@ -3917,11 +4012,10 @@ LINE_BUF_END	EQU LINE_BUF + 510
 ; Text.
 ; ------------------------------------------------------
 MSG_TITLE		DB "Gopher browser for Sprinter", 0
-MSG_BANNER		DB "GOPHER Browser v.", APP_VERSION, " (", BUILD_DATETIME, ")", 13, 10
-				DB "by Dmitry Mikhalchenkov (SprinterTeam)", 13, 10, 0
+MSG_BANNER		DB "Gopher v.", APP_VERSION, 13, 10, 0
 MSG_RUNEXT		DB "Running external viewer:", 13, 10, 0
 MSG_CRLF		DB 13, 10, 0
-MSG_STATUS		DB "Up/Dn move  Enter open  Bksp back  ^B bookmarks  ^D add  Esc/F10 quit", 0
+MSG_STATUS		DB "Up/Dn move  Enter open  Bksp back  ^G addr  ^B marks  ^D add  Esc/F10 quit", 0
 MSG_NONET		DB "Wi-Fi not up - run NETUP first (you can still browse the home page)", 0
 MSG_CONFIRM_QUIT DB "Quit?  Y = yes,  any other key = no", 0
 MSG_FETCHING	DB "Fetching...", 0
@@ -3975,18 +4069,17 @@ MSG_WRITING		DB "Writing ", 0
 ; real home page lives in data/index.gph and is appended by the Makefile.
 ; ------------------------------------------------------
 WELCOME_DOC
-	DB "iGopher browser for Sprinter", 13, 10
-	DB "iBased on Moon Rabbit / Internet NEXTplorer by nihirash", 13, 10
-	DB "iINDEX.GPH is unavailable.", 13, 10
+	DB "iGopher", 13, 10
+	DB "iBased on Moon Rabbit by nihirash", 13, 10
+	DB "iNo INDEX.", 13, 10
 WELCOME_END
 WELCOME_LEN		EQU WELCOME_END - WELCOME_DOC
 
 ; Shown by Ctrl+B when BOOKMARK.GPH does not exist yet (or is empty).
 BM_EMPTY_DOC
-	DB "iNo bookmarks yet.", 13, 10
-	DB "i", 13, 10
-	DB "iOpen a gopher page, then press Ctrl+D to bookmark it.", 13, 10
-	DB "iPress Backspace to go back.", 13, 10
+	DB "iNo bookmarks.", 13, 10
+	DB "iCtrl+D adds.", 13, 10
+	DB "iBksp back.", 13, 10
 BM_EMPTY_END
 BM_EMPTY_LEN	EQU BM_EMPTY_END - BM_EMPTY_DOC
 

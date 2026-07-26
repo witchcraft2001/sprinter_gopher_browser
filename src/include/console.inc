@@ -96,6 +96,8 @@ open_tpl			EQU 0x89EE			; word
 url_ptr				EQU 0x89F0			; word
 url_full			EQU 0x89F2			; word
 last_err			EQU 0x89F4			; word; ends 0x89F5
+open_addr_active	EQU 0x89F6			; Ctrl+G fetch in flight; enables edit-on-error
+fetch_conn_retry	EQU 0x89F7			; one full page-connect retry already used
 REQ_BUF				EQU 0x8A00			; outgoing selector + CRLF (<=256 B: SEL_CUR 200 + CRLF)
 ; Runtime buffers relocated out of the WIN1 image (into the unused upper half of
 ; REQ_BUF's 512 B slot, 0x8B00..0x8BFF) so the code image + network-lib BSS stay
@@ -115,6 +117,7 @@ CFG_LINE			EQU 0x9800			; config line accumulator (256 B; ends 0x98FF)
 ; and during post-download / URL-launch lookups (VIEWER_FOR_EXT etc.), never
 ; inside the download flow that owns DL_SEL. 200 B <= 256 B.
 DL_SEL				EQU CFG_LINE
+OPEN_ADDR_SAVE		EQU CFG_LINE			; Ctrl+G input retained while a fetch is in progress
 ; Path/exec buffers kept in WIN2 (not WIN1) so they don't eat the tight stack
 ; headroom below 0x8000. Never PChars sources - only DSS file/exec args + Z80 ops.
 EXE_DIR				EQU 0x9900			; AppInfo #47 EXE home dir (256 B)
@@ -181,9 +184,10 @@ KEY_END				EQU 0x51			; in D
 KEY_F10				EQU 0x44			; in D (DSS XLAT: F1=#3B..F12=#46)
 ; Physical keycodes for letter keys (in D). With Ctrl held the symbolic code
 ; (A/E) is 0, so a Ctrl+letter shortcut is recognised by the letter's D code.
-; Values are the DSS XLAT_T outputs for the B/D keys (AT set-2 0x32/0x23);
+; Values are the DSS XLAT_T outputs for the B/D/G keys (AT set-2 0x32/0x23/0x34);
 ; verified against KEYINTER.ASM and the texteditor's Ctrl+Y/C/V/X codes.
 KEY_B				EQU 0x2E			; in D (B key)
 KEY_D				EQU 0x1F			; in D (D key)
+KEY_G				EQU 0x21			; in D (G key)
 
 	ENDIF

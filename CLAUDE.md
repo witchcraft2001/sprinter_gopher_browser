@@ -587,10 +587,16 @@ shutdown-on-exit (below). Awaiting a re-test.
    returns), then the shared `LOAD_DISK_GPH` (HL=name; refactored out of
    `LOAD_HOME_DISK`) reads the whole file into the doc. `cur_kind=0`/empty
    `HOST_CUR` mark it local (no "Loaded N bytes", not re-bookmarkable). If the file
-   is absent/empty a built-in `BM_EMPTY_DOC` placeholder ("No bookmarks yet…") is
+   is absent/empty a built-in `BM_EMPTY_DOC` placeholder ("No bookmarks.") is
    shown instead. Ctrl+D (item 6) appends.
-6c. **Ctrl+G — open an arbitrary address**: a text-input prompt (host[:port][/sel])
-   then fetch it.
+6c. **Ctrl+G — open an arbitrary address — DONE.** A text-input prompt accepts
+   `host[:port][/selector]`, defaults the port to 70 and opens the result as a
+   gopher menu. The optional path is sent verbatim as the selector (type `//x`
+   for a selector beginning with `/`); an empty input leaves the current page
+   untouched. A failed manual fetch restores the prior page and reopens the input
+   with the address intact for correction. A page fetch retries one final
+   `RAW_CONNECT` after a 300 ms settle only when connection establishment fails;
+   cancel/send/receive errors are not retried.
 7. **Empty/truncated doc hardening — DONE, awaiting transparent-mode target
    check.** The status
    bar shows the loaded size and flags "- INCOMPLETE" when the gopher "."
