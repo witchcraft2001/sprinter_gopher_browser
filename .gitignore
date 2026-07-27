@@ -4,3 +4,4 @@ distr/*.zip
 .DS_Store
 *.lst
 .claude/
+test_files/

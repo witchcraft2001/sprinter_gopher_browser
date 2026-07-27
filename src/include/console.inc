@@ -98,6 +98,18 @@ url_full			EQU 0x89F2			; word
 last_err			EQU 0x89F4			; word; ends 0x89F5
 open_addr_active	EQU 0x89F6			; Ctrl+G fetch in flight; enables edit-on-error
 fetch_conn_retry	EQU 0x89F7			; one full page-connect retry already used
+; ESP-AT 2.2.2 passive-receive state. Kept here rather than inside the overlay
+; itself so the overlay budget (LINE_BUF..0x9FFF) stays code-only. pv_closed /
+; pv_first / pv_live persist across NET.RECV calls and are (re)initialised by
+; PASSIVE_SETUP_222; the rest are per-call scratch.
+pv_closed			EQU 0x89F8			; CLOSED seen on this connection
+pv_first			EQU 0x89F9			; first receive must wait out AT+CIPSEND
+pv_live				EQU 0x89FA			; a probe is outstanding (no terminal yet)
+pv_poll				EQU 0x89FB			; remaining quiet ticks this call
+pv_wake				EQU 0x89FC			; PASSIVE_RESPONSE mode: 1 = idle wake
+pv_lch				EQU 0x89FD			; first char of the line being scanned
+pv_llen				EQU 0x89FE			; its length so far
+; 0x89FF is free (REQ_BUF starts at 0x8A00)
 REQ_BUF				EQU 0x8A00			; outgoing selector + CRLF (<=256 B: SEL_CUR 200 + CRLF)
 ; Runtime buffers relocated out of the WIN1 image (into the unused upper half of
 ; REQ_BUF's 512 B slot, 0x8B00..0x8BFF) so the code image + network-lib BSS stay

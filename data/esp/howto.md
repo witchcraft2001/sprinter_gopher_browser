@@ -7,8 +7,9 @@
   ███    ███ ███    ███   ███          ███    ███     ███    █▄  ▀███████████ 
   ███    ███ ███    ███   ███          ███    ███     ███    ███   ███    ███ 
   ████████▀   ▀██████▀   ▄████▀        ███    █▀      ██████████   ███    ███ 
-  Browser v.0.1.15                                                 ███    ███ 
+  Browser v.0.1.19                                                 ███    ███ 
 ```
+
 # Gopher browser for Sprinter — quick start (ESP Wi-Fi)
 
 A Gopher-protocol browser for the Sprinter, running under DSS in the native

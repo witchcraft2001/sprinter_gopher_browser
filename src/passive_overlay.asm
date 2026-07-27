@@ -1,13 +1,54 @@
 ; ESP-AT 2.2.2 passive single-connection receive overlay.
 ; Assembled to LINE_BUF and loaded from the non-loader tail of GOPHER.EXE only
 ; while a 2.2.2 binary download is active. LINE_BUF is not used during download.
+;
+; PROBE-DRIVEN POLLING: AT+CIPRECVDATA is issued directly for whatever the
+; caller can store; +IPD values are never parsed. Control waits run on a short
+; PASSIVE_POLL_MS tick with a PASSIVE_POLL_TRIES budget per RECV call: a wake
+; (+IPD/CLOSED line) probes immediately, and a QUIET tick probes anyway.
+; CIPRECVDATA works regardless of the firmware's +IPD "reported" flag, so a
+; missing/suppressed notification (the flag survives NO DATA replies and gates
+; the link OUT of the firmware's select() set - disassembly-verified) can stall
+; this design for at most one tick, never kill the transfer. The first receive
+; after the request never probes: SEND_BUFFER_NO_WAIT returns while the ESP is
+; still inside AT+CIPSEND, and a command in that busy window is DISCARDED
+; ("busy p..."); the first wait absorbs the send chatter. CLOSED only sets a
+; flag: buffered data survives the peer FIN in passive mode, so EOF is reported
+; strictly as closed AND probe-confirmed-drained. That is what makes a passive
+; download tail-exact.
+;
+; NEVER ABANDON A DATA BLOCK (v0.1.19). The control tick paces PROBES, not
+; payload: once "+CIPRECVDATA:<len>," is seen, the length digits and all <len>
+; bytes are read on the long PASSIVE_DATA_MS timeout, and a block that does not
+; fit the caller's buffer is RESUMED by the next call (TCP.PAYLOAD_LEFT
+; persists, exactly as the kit's active reader does). A probe is re-sent only
+; while none is outstanding, or after its tick expired with nothing stored -
+; and pv_live makes the next call continue the outstanding one instead of
+; starting a new scan. Earlier builds could consume a header inside an idle
+; wait and then re-probe, which silently dropped the whole block behind it and
+; resynchronised on the next OK: a >1.5 s ESP hiccup mid-response (Wi-Fi
+; retransmits) was enough, so the odds grew with transfer length - files past
+; ~0.5 MB came out complete-looking but with holes.
 
 	MODULE NET
 
+PASSIVE_POLL_MS		EQU 1500		; control tick: paces probes only
+PASSIVE_DATA_MS		EQU 10000		; length + payload bytes of a live block
+; Quiet ticks tolerated per RECV call (~60 s). A gateway that buffers the whole
+; upstream file before answering (gopher-gate does) can leave the socket silent
+; for tens of seconds on a big item; Esc still cancels at any point.
+PASSIVE_POLL_TRIES	EQU 40
+
 ; ACTIVE_PREP reaches these entries only after this overlay has been loaded.
-; HL is still zero from clearing TCP.PAYLOAD_LEFT.
 PASSIVE_SETUP_222
-	LD		(passive_pending), HL
+	XOR		A
+	LD		(pv_closed), A
+	LD		(pv_live), A
+	LD		(pv_llen), A			; the line scanner starts at a line boundary
+	LD		HL, 0
+	LD		(TCP.PAYLOAD_LEFT), HL	; no block is in flight on a fresh socket
+	LD		A, 1
+	LD		(pv_first), A			; first RECV must wait out the send window
 	LD		HL, CMD_CIPRECVMODE_1
 	CALL	TX_CMD
 	RET		C
@@ -17,46 +58,30 @@ PASSIVE_SETUP_222
 RECV_PASSIVE_222
 	LD		(TCP.RECV_PTR), HL
 	LD		(TCP.RECV_REMAIN), BC
-	LD		(TCP.RECV_TIMEOUT), DE
 	LD		HL, 0
 	LD		(TCP.RECV_STORED), HL
+	LD		A, PASSIVE_POLL_TRIES
+	LD		(pv_poll), A
 
-	LD		HL, (passive_pending)
+	CALL	ISA.ISA_OPEN			; every resume path starts by reading the UART
+	LD		HL, (TCP.PAYLOAD_LEFT)
 	LD		A, H
 	OR		L
-	JR		NZ, .choose_len
-
-	CALL	ISA.ISA_OPEN
-	CALL	PASSIVE_WAIT_IPD_OR_CLOSE
-	JP		C, .fail_open
-	CALL	PASSIVE_READ_DEC
-	JP		C, .fail_open
-	LD		A, (passive_delim)
-	CP		13
-	JP		NZ, .protocol_open
-	LD		A, H
-	OR		L
-	JP		Z, .protocol_open
-	LD		(passive_pending), HL
-	CALL	ISA.ISA_CLOSE
-
-.choose_len
-	LD		HL, (passive_pending)
-	LD		DE, (TCP.RECV_REMAIN)
+	JP		NZ, .payload			; finish the block split by the last call
+	LD		A, (pv_live)
 	OR		A
-	SBC		HL, DE
-	JR		C, .pending_smaller
-	LD		H, D
-	LD		L, E
-	JR		.have_len
-.pending_smaller
-	ADD		HL, DE
-.have_len
-	LD		A, H
-	OR		L
-	JP		Z, .protocol
-	LD		(TCP.IPD_REMOTE_LEN), HL
+	JP		NZ, .resp				; a probe is outstanding: keep reading its reply
+	LD		A, (pv_first)
+	OR		A
+	JR		Z, .rearm				; no probe out: close the window and send one
+	XOR		A
+	LD		(pv_first), A
+	LD		HL, PASSIVE_POLL_MS
+	LD		(TCP.RECV_TIMEOUT), HL
+	JP		.empty_eval				; wait first: the CIPSEND busy window is live
 
+.probe
+	LD		HL, (TCP.RECV_REMAIN)
 	LD		DE, TCP.NUM_BUFFER
 	CALL	UTIL.UTOA
 	LD		HL, TCP.CMD_BUFFER
@@ -68,61 +93,88 @@ RECV_PASSIVE_222
 	CALL	TCP.APPEND_STR
 	LD		HL, TCP.CMD_BUFFER
 	CALL	WIFI.UART_TX_STRING
-	JR		C, .tx_fail
-
+	JP		C, .tx_fail
+	LD		A, 1
+	LD		(pv_live), A
 	CALL	ISA.ISA_OPEN
-	CALL	PASSIVE_WAIT_DATA_PREFIX
-	JR		C, .fail_open
-	CALL	PASSIVE_READ_DEC
-	JR		C, .fail_open
-	LD		A, (passive_delim)
-	CP		','
-	JR		NZ, .protocol_open
-	LD		(TCP.LAST_IPD_LEN), HL
-	LD		DE, (TCP.IPD_REMOTE_LEN)
+.resp
+	; Read the outstanding probe's reply: a data header, or its OK/ERROR end.
+	LD		HL, PASSIVE_POLL_MS
+	LD		(TCP.RECV_TIMEOUT), HL
+	XOR		A
+	CALL	PASSIVE_RESPONSE
+	JR		C, .resp_quiet
 	OR		A
-	SBC		HL, DE
-	JR		C, .actual_ok
+	JR		Z, .data
+	XOR		A
+	LD		(pv_live), A			; OK/ERROR terminates the probe
+	LD		HL, (TCP.RECV_STORED)
 	LD		A, H
 	OR		L
-	JR		NZ, .protocol_open
-.actual_ok
-	LD		HL, (TCP.LAST_IPD_LEN)
+	JP		NZ, .stored_ok
+.empty_eval
+	; Nothing buffered for us (empty probe, or the first-call send window).
+	LD		A, (pv_closed)
+	OR		A
+	JR		NZ, .eof_open			; closed + drained = byte-exact EOF
+	LD		A, 1
+	CALL	PASSIVE_RESPONSE		; tick: wake on +IPD/CLOSED or time out
+	JR		C, .tick				; quiet -> spend a tick and probe again
+	OR		A
+	JR		Z, .data				; a late reply arrived: take its block
+	JR		.rearm					; woken: probe now, no tick spent
+.resp_quiet
+	; The outstanding probe stayed silent for a tick. Bytes already stored are
+	; returned as they are; pv_live keeps the next call reading the same reply.
+	LD		HL, (TCP.RECV_STORED)
 	LD		A, H
 	OR		L
-	JR		Z, .protocol_open
-	LD		(TCP.PAYLOAD_LEFT), HL
-	CALL	TCP.READ_PAYLOAD
+	JR		NZ, .stored_ok
+.tick
+	LD		A, (WCOMMON.CANCELLED)
+	OR		A
+	JR		NZ, .quiet_fail			; cancel must not turn into another probe
+	LD		HL, pv_poll
+	DEC		(HL)
+	JR		Z, .quiet_fail			; budget exhausted with no data at all
+.rearm
+	CALL	ISA.ISA_CLOSE
+	JP		.probe					; probe regardless: data may sit unannounced
+.quiet_fail
+	LD		A, RES_RS_TIMEOUT
+	JR		.fail_open
+
+.data
+	LD		HL, PASSIVE_DATA_MS		; a live block is never abandoned mid-way
+	LD		(TCP.RECV_TIMEOUT), HL
+	CALL	PASSIVE_READ_DEC		; digits up to the ',' (anything else = error)
 	JR		C, .fail_open
+	LD		A, H
+	OR		L
+	JP		Z, .resp				; empty block: just wait for its terminal
+	LD		(TCP.PAYLOAD_LEFT), HL
+.payload
+	LD		HL, PASSIVE_DATA_MS
+	LD		(TCP.RECV_TIMEOUT), HL
+	CALL	TCP.READ_PAYLOAD		; stores at most RECV_REMAIN: no overrun
+	JR		C, .quiet_fail			; CF only when nothing at all was stored
 	LD		HL, (TCP.PAYLOAD_LEFT)
 	LD		A, H
 	OR		L
-	JR		NZ, .protocol_open
-	CALL	PASSIVE_WAIT_OK
-	JR		C, .fail_open
+	JR		NZ, .stored_ok			; buffer full: the next call resumes the block
+	JP		.resp					; block complete -> read its trailing OK
+.stored_ok
 	CALL	ISA.ISA_CLOSE
-
-	LD		HL, (passive_pending)
-	LD		DE, (TCP.LAST_IPD_LEN)
-	OR		A
-	SBC		HL, DE
-	JR		C, .protocol
-	LD		(passive_pending), HL
 	LD		BC, (TCP.RECV_STORED)
 	XOR		A
 	RET
 
-.protocol_open
-	LD		A, RES_ERROR
-	SCF
+.eof_open
+	LD		A, RES_NOT_CONN
 .fail_open
 	PUSH	AF
 	CALL	ISA.ISA_CLOSE
 	POP		AF
-	SCF
-	RET
-.protocol
-	LD		A, RES_ERROR
 	SCF
 	RET
 .tx_fail
@@ -130,52 +182,100 @@ RECV_PASSIVE_222
 	SCF
 	RET
 
-PASSIVE_WAIT_IPD_OR_CLOSE
-	LD		IX, TCP.IPD_PREFIX
-	LD		IY, TCP.CLOSED_PREFIX
+; Scan the AT control stream after (or between) CIPRECVDATA probes.
+; In: A = 0 normal (finish on OK/ERROR or a data header), 1 = idle-wait (also
+; return on a completed "+..." line - i.e. +IPD - or on CLOSED, so the prober
+; re-probes exactly when data may be available; noise lines such as "Recv N
+; bytes"/"SEND OK"/"busy p..." never wake it).
+; Out: CF=1 timeout/cancel (A=RES_RS_TIMEOUT); CF=0 with A: 0 = "+CIPRECVDATA:"
+; header consumed (length follows), 1 = OK/ERROR line (no data), 2 = woken
+; (idle-wait only). A CLOSED line anywhere sets pv_closed; +IPD payload
+; lengths are never parsed (the probe asks the ESP directly).
+;
+; The scan state (pv_lch/pv_llen) is the position inside the CURRENT line and
+; deliberately SURVIVES a timeout return: the AT stream is continuous, so a
+; control tick that expires halfway through a line must resume where it stopped.
+; Resetting it per call used to drop the "+CIPRECVDATA:" header when an ESP
+; stall split it, and the whole data block behind it went to the line scanner.
+; The header is recognised from that same state - a ':' closing a 12-char line
+; that began with '+' - so no separate prefix matcher (or its string) is needed;
+; no other '+' line can appear on this connection.
+PASSIVE_RESPONSE
+	LD		(pv_wake), A
 .next
 	CALL	TCP.READ_BYTE_RECV_TIMEOUT_OPEN
 	JR		C, .timeout
 	LD		E, A
-	LD		A, (IX+0)
-	CP		E
-	JR		NZ, .ipd_reset
-	INC		IX
-	LD		A, (IX+0)
-	OR		A
-	JR		Z, .ipd
-	JR		.closed_check
-.ipd_reset
-	LD		IX, TCP.IPD_PREFIX
-	LD		A, E
+	CP		':'
+	JR		NZ, .classify
+	LD		A, (pv_lch)
 	CP		'+'
-	JR		NZ, .closed_check
-	INC		IX
-.closed_check
-	LD		A, (IY+0)
-	CP		E
-	JR		NZ, .closed_reset
-	INC		IY
-	LD		A, (IY+0)
-	OR		A
-	JR		Z, .closed
-	JR		.next
-.closed_reset
-	LD		IY, TCP.CLOSED_PREFIX
-	LD		A, E
-	CP		'C'
-	JR		NZ, .next
-	INC		IY
-	JR		.next
-.ipd
+	JR		NZ, .classify
+	LD		A, (pv_llen)
+	CP		12						; "+CIPRECVDATA" -> the length follows
+	JR		NZ, .classify
 	XOR		A
+	LD		(pv_llen), A
+	RET								; A=0, CF=0
+.classify
+	LD		A, E
+	CP		13
+	JR		Z, .next				; CR ignored; LF terminates a line
+	CP		10
+	JR		Z, .eol
+	LD		A, (pv_llen)
+	OR		A
+	JR		NZ, .not_first
+	LD		A, E
+	LD		(pv_lch), A
+.not_first
+	LD		HL, pv_llen
+	INC		(HL)
+	JR		.next
+.eol
+	LD		A, (pv_llen)
+	OR		A
+	JR		Z, .next				; blank line
+	LD		D, A
+	XOR		A
+	LD		(pv_llen), A			; the line ends here whatever it turns out to be
+	LD		A, (pv_lch)
+	CP		'O'						; "OK"
+	JR		NZ, .not_ok
+	LD		A, D
+	CP		2
+	JR		NZ, .next
+.done_line
+	LD		A, 1
 	RET
-.closed
-	LD		A, RES_NOT_CONN
-	SCF
+.not_ok
+	CP		'E'						; "ERROR" (empty buffer probes may answer this)
+	JR		NZ, .not_err
+	LD		A, D
+	CP		5
+	JR		Z, .done_line
+	JR		.next
+.not_err
+	CP		'C'						; "CLOSED"
+	JR		NZ, .async
+	LD		A, D
+	CP		6
+	JR		NZ, .async
+	LD		A, 1
+	LD		(pv_closed), A
+	JR		.wake_chk				; CLOSED wakes the idle-wait (drain follows)
+.async
+	LD		A, (pv_lch)
+	CP		'+'						; only +IPD-style lines signal buffered data
+	JR		NZ, .next
+.wake_chk
+	LD		A, (pv_wake)
+	OR		A
+	JR		Z, .next
+	LD		A, 2					; idle-wait: wake the prober
 	RET
 .timeout
-	LD		A, RES_RS_TIMEOUT
+	LD		A, RES_RS_TIMEOUT		; mid-line state is kept for the next call
 	SCF
 	RET
 
@@ -184,11 +284,7 @@ PASSIVE_READ_DEC
 .next
 	CALL	TCP.READ_BYTE_RECV_TIMEOUT_OPEN
 	JR		C, .timeout
-	CP		','
-	JR		Z, .delim
-	CP		':'
-	JR		Z, .delim
-	CP		13
+	CP		','						; the header's ':' was eaten by the matcher
 	JR		Z, .delim
 	CP		'0'
 	JR		C, .error
@@ -206,7 +302,6 @@ PASSIVE_READ_DEC
 	ADD		HL, DE
 	JR		.next
 .delim
-	LD		(passive_delim), A
 	XOR		A
 	RET
 .timeout
@@ -217,66 +312,6 @@ PASSIVE_READ_DEC
 	LD		A, RES_ERROR
 	SCF
 	RET
-
-PASSIVE_WAIT_DATA_PREFIX
-	LD		IX, PASSIVE_DATA_PREFIX
-.next
-	CALL	TCP.READ_BYTE_RECV_TIMEOUT_OPEN
-	JR		C, .timeout
-	LD		E, A
-	LD		A, (IX+0)
-	CP		E
-	JR		NZ, .reset
-	INC		IX
-	LD		A, (IX+0)
-	OR		A
-	RET		Z
-	JR		.next
-.reset
-	LD		IX, PASSIVE_DATA_PREFIX
-	LD		A, E
-	CP		'+'
-	JR		NZ, .next
-	INC		IX
-	JR		.next
-.timeout
-	LD		A, RES_RS_TIMEOUT
-	SCF
-	RET
-
-PASSIVE_WAIT_OK
-.seek
-	CALL	TCP.READ_BYTE_RECV_TIMEOUT_OPEN
-	JR		C, .timeout
-	CP		13
-	JR		Z, .seek
-	CP		10
-	JR		Z, .seek
-	CP		'O'
-	JR		NZ, .error
-	CALL	TCP.READ_BYTE_RECV_TIMEOUT_OPEN
-	JR		C, .timeout
-	CP		'K'
-	JR		NZ, .error
-.eol
-	CALL	TCP.READ_BYTE_RECV_TIMEOUT_OPEN
-	JR		C, .timeout
-	CP		10
-	JR		NZ, .eol
-	XOR		A
-	RET
-.timeout
-	LD		A, RES_RS_TIMEOUT
-	SCF
-	RET
-.error
-	LD		A, RES_ERROR
-	SCF
-	RET
-
-passive_pending	DW 0
-passive_delim	DB 0
-PASSIVE_DATA_PREFIX DB "+CIPRECVDATA:", 0
 
 	ENDMODULE
 

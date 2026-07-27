@@ -270,17 +270,89 @@ shutdown-on-exit (below). Awaiting a re-test.
   bounded block into `DL_BUF`; `DL_RECV_FILE_222` accumulates and writes exact
   4 KB FAT chunks (only the final chunk may be shorter). The ESP's 5760-byte
   socket buffer retains the rest and applies TCP backpressure during disk I/O.
+  **INVARIANT — the passive receive is PROBE-DRIVEN POLLING (v0.1.18).**
+  Verified firmware semantics (disassembled `at_ipCmd.c.obj` — handlers
+  `at_setup_cmd_ciprecvdata`, `at_process_passive_read_event`,
+  `at_socket_task` — from the exact ESP8266 v2.2 `libesp8266_at_core.a` at
+  `/Users/dmitry/dev/esp/esp-at`, branch `release/v2.2.0.0_esp8266`, plus that
+  branch's docs): (a) `AT+CIPRECVDATA=<len>` CLAMPS — `len` may exceed the
+  buffered amount, the reply is `+CIPRECVDATA:<actual>,<data>` + `OK`; (b) an
+  EMPTY-buffer probe answers `ERROR` (a `NO DATA` line may precede it); (c)
+  after a read that leaves data buffered the firmware immediately re-prints
+  `+IPD,<remaining>`; the per-link "reported" flag clears ONLY when a read
+  empties the buffer — and the `NO DATA` path does NOT clear it; (d) the socket
+  task EXCLUDES from its `select()` set any passive link whose data is buffered
+  with `reported=1`, so in a reported-but-unread state no `+IPD` and no `CLOSED`
+  can ever surface — a client that only ever WAITS can stall forever; (e)
+  `CLOSED` is emitted only when a select-readable link has zero available bytes
+  (i.e. drained). Design (`RECV_PASSIVE_222`): probe `CIPRECVDATA` for the
+  caller's free space directly, never parse `+IPD` values; ALL control waits
+  run on a short `PASSIVE_POLL_MS` (1.5 s) timeout with a `PASSIVE_POLL_TRIES`
+  (40, ~60 s — a gateway that buffers the whole upstream file before answering
+  can be silent for tens of seconds; Esc still cancels) budget per RECV call —
+  a wake (`+`-line or `CLOSED`; noise like `Recv N bytes`/`SEND OK`/`busy p...`
+  never wakes) probes immediately, and a QUIET
+  tick probes anyway, so ANY missing/suppressed `+IPD` costs at most one tick,
+  never the transfer. A lost probe response is also just a quiet tick (retry);
+  a payload whose trailing `OK` goes missing is still returned (bytes are
+  length-framed and counted) and the next probe's line scanner resynchronises.
+  `CLOSED` anywhere only sets `pv_closed`; EOF (`RES_NOT_CONN`) = closed
+  AND probe-confirmed-empty. The FIRST receive after the request never probes —
+  `SEND_BUFFER_NO_WAIT` returns while the ESP is still inside `AT+CIPSEND`, and
+  a command in that busy window is DISCARDED (`busy p...`; this was v0.1.16's
+  total failure: 0 KB + "Transfer ended before…") — it enters the poll loop
+  directly (`pv_first`), absorbing the send chatter. History: v0.1.17
+  (wake-only waits, no quiet-tick probes) still stalled downloads #2+ at <1 KB
+  on target — state (d) above is reachable in ways the wake-only design cannot
+  see, which is why polling is mandatory. Validated against a firmware-
+  semantics simulator (400 KB steady/bursty, FIN races, stalls, slow starts,
+  and a worst-case firmware that never emits `+IPD` at all). (The kit's own
+  passive parser in `esp_tcp_multi.asm` is marked not-hardware-tested and is
+  NOT enabled in universal FTP/WGET builds — they download via the active path,
+  so "FTP works" was never evidence for any passive design.)
+  **INVARIANT — the poll tick paces PROBES ONLY; a data block and the line
+  scanner are NEVER abandoned (v0.1.19; this is what broke ~900 KB files).**
+  v0.1.18 restarted its scan state on every `PASSIVE_RESPONSE` entry and could
+  re-probe with a reply still in flight, so a single ESP stall longer than the
+  1.5 s tick (Wi-Fi retransmits — rare per second, near-certain across the ~90 s
+  a 900 KB transfer takes at UART speed) desynchronised the parser: the tick
+  expired part-way through `+CIPRECVDATA:`, the header was lost, and the whole
+  data block behind it was eaten by the line scanner until the next `OK`. The
+  file still finished with a clean `CLOSED` and looked complete — silent holes,
+  exactly the "downloads but the player rejects it" report. The rules now:
+  (1) `PASSIVE_DATA_MS` (10 s) covers the length digits and every payload byte;
+  the tick applies only to control reads. (2) `pv_live` marks an outstanding
+  probe: the next `NET.RECV` call CONTINUES reading its reply instead of
+  starting a new scan, and a probe is re-sent only when its tick expired with
+  nothing stored (a discarded busy-window command). (3) `TCP.PAYLOAD_LEFT`
+  persists across calls, so a block bigger than the caller's free space (or cut
+  by a stall) is RESUMED — `TCP.READ_PAYLOAD` is bounded by `RECV_REMAIN`, so
+  the old "longer than requested" cap check (which failed the download) is gone
+  and no overrun is possible. (4) The line scanner state (`pv_lch`/`pv_llen`,
+  in the WIN2 state block, not the overlay) SURVIVES a timeout return: the AT
+  stream is continuous, so a tick that expires mid-line resumes where it
+  stopped. The data header is recognised from that same state — a `:` closing a
+  12-char line that started with `+` — which removed the separate prefix matcher
+  and its string (no other `+` line can appear on this connection). A deep stall
+  (> `PASSIVE_DATA_MS`) still fails VISIBLY (incomplete → retry/keep), never
+  silently. The simulator (`tools/sim_passive.py`) models these firmware semantics plus
+  injected stalls and reproduces the v0.1.18 corruption; re-run it (`python3
+  tools/sim_passive.py`) whenever the overlay's state machine changes.
   Thus 2.2.2 never stores a binary in DOC
   banks and has no final `Writing` phase or 256 KB banking boundary. The mode is
   forced back to active on close/next connect so transparent page fetches are
   unaffected. `UART_INIT` remains profile-specific (2.2.1 TR8, 2.2.2 TR4);
   `WIFI_STABLE_ACTIVE_RX` must not be defined because it forces TR8 on 2.2.2.
-  The 2.2.2-only receive and write routines are a 639-byte runtime overlay:
-  their bytes follow `IMAGE_END` in GOPHER.EXE and `LOAD_PASSIVE_OVERLAY` reads
-  them into `LINE_BUF..0x9FFE` only after the binary download has begun. They
-  therefore consume no WIN1 image/BSS space and do not alter startup. `DL_NAME`
-  and `DL_PATH` alias `BM_LINE`, whose bookmark-building lifetime cannot overlap
-  a binary download.
+  The 2.2.2-only receive and write routines are a 607-byte runtime overlay
+  (budget 640 = `LINE_BUF..0x9FFF`, guarded by an `ASSERT`): their bytes follow
+  `IMAGE_END` in GOPHER.EXE and `LOAD_PASSIVE_OVERLAY` reads them into
+  `LINE_BUF..0x9FFF` only after the binary download has begun. They therefore
+  consume no WIN1 image/BSS space and do not alter startup. Its persistent
+  state (`pv_closed`/`pv_first`/`pv_live`/`pv_poll`/`pv_wake`/`pv_lch`/`pv_llen`)
+  lives in the WIN2 runtime block at `0x89F8..0x89FE` so the overlay budget
+  stays code-only — and so parser state survives between `NET.RECV` calls.
+  `DL_NAME` and `DL_PATH` alias `BM_LINE`, whose bookmark-building lifetime
+  cannot overlap a binary download.
 - **Download progress** on the status bar: page fetches use `SHOW_PROGRESS`;
   binary receive paints `Receiving N KB` directly into text VRAM page `#50`
   (no DSS/BIOS call and no RTS pause), updating on whole-KB changes. Gopher has
@@ -930,8 +1002,11 @@ the app version.)
   WIN2 scratch page instead. `DL_NAME`/`DL_PATH` now alias `BM_LINE` at
   `0x8800` because bookmarking and binary download lifetimes are disjoint.
   The 2.2.2-only passive receive/write code is stored outside the loader image
-  and loaded as an overlay at `0x9D80..0x9FFE`; the ordinary WIN1 image plus
-  `RS_BUFF` currently ends at `0x7FF6`, and the ASSERT guards it.
+  and loaded as an overlay at `0x9D80..0x9FFF` (607 of 640 B used); the ordinary
+  WIN1 image plus `RS_BUFF` currently ends at `0x7FFA`, and the ASSERT guards it.
+  v0.1.19 put the overlay's own state in the last gap of the WIN2 runtime block
+  (`pv_*` at `0x89F8..0x89FE`, `0x89FF` still free) — that both freed overlay
+  bytes and made the AT-stream parser state persist across `NET.RECV` calls.
   v0.1.13 moved `NUMBUF`/`URL_SCHEME`/`SEARCH_BUF`/
   `DOC_TITLE`/`PREVIEW_BUF` to `0x8B00..0x8BFF`; v0.1.15 moved the download-progress
   text `DLP_TXT` (+ its `DLP_NUM` tail, which must stay **contiguous** — `DLP_DRAW`
