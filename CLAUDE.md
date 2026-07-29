@@ -287,13 +287,15 @@ shutdown-on-exit (below). Awaiting a re-test.
   `CLOSED` is emitted only when a select-readable link has zero available bytes
   (i.e. drained). Design (`RECV_PASSIVE_222`): probe `CIPRECVDATA` for the
   caller's free space directly, never parse `+IPD` values; ALL control waits
-  run on a short `PASSIVE_POLL_MS` (1.5 s) timeout with a `PASSIVE_POLL_TRIES`
-  (40, ~60 s — a gateway that buffers the whole upstream file before answering
-  can be silent for tens of seconds; Esc still cancels) budget per RECV call —
-  a wake (`+`-line or `CLOSED`; noise like `Recv N bytes`/`SEND OK`/`busy p...`
-  never wakes) probes immediately, and a QUIET
-  tick probes anyway, so ANY missing/suppressed `+IPD` costs at most one tick,
-  never the transfer. A lost probe response is also just a quiet tick (retry);
+  run on a short `PASSIVE_POLL_MS` (1.5 s) timeout with a TWO-PHASE quiet-tick
+  budget per RECV call (v0.1.20): `PASSIVE_POLL_FIRST` (120, ~3 min) until the
+  transfer's first payload byte (`pv_started`) — a gateway whose upstream
+  connection hangs and is retried can legitimately be silent for minutes
+  (measured >2 min on gopher-gate; Esc still cancels) — then
+  `PASSIVE_POLL_TRIES` (40, ~60 s) for mid-transfer stalls. A wake (`+`-line or
+  `CLOSED`; noise like `Recv N bytes`/`SEND OK`/`busy p...` never wakes) probes
+  immediately, and a QUIET tick probes anyway, so ANY missing/suppressed `+IPD`
+  costs at most one tick, never the transfer. A lost probe response is also just a quiet tick (retry);
   a payload whose trailing `OK` goes missing is still returned (bytes are
   length-framed and counted) and the next probe's line scanner resynchronises.
   `CLOSED` anywhere only sets `pv_closed`; EOF (`RES_NOT_CONN`) = closed
@@ -348,8 +350,8 @@ shutdown-on-exit (below). Awaiting a re-test.
   `IMAGE_END` in GOPHER.EXE and `LOAD_PASSIVE_OVERLAY` reads them into
   `LINE_BUF..0x9FFF` only after the binary download has begun. They therefore
   consume no WIN1 image/BSS space and do not alter startup. Its persistent
-  state (`pv_closed`/`pv_first`/`pv_live`/`pv_poll`/`pv_wake`/`pv_lch`/`pv_llen`)
-  lives in the WIN2 runtime block at `0x89F8..0x89FE` so the overlay budget
+  state (`pv_closed`/`pv_first`/`pv_live`/`pv_poll`/`pv_wake`/`pv_lch`/`pv_llen`/
+  `pv_started`) lives in the WIN2 runtime block at `0x89F8..0x89FF` so the overlay budget
   stays code-only — and so parser state survives between `NET.RECV` calls.
   `DL_NAME` and `DL_PATH` alias `BM_LINE`, whose bookmark-building lifetime
   cannot overlap a binary download.
@@ -1005,8 +1007,9 @@ the app version.)
   and loaded as an overlay at `0x9D80..0x9FFF` (607 of 640 B used); the ordinary
   WIN1 image plus `RS_BUFF` currently ends at `0x7FFA`, and the ASSERT guards it.
   v0.1.19 put the overlay's own state in the last gap of the WIN2 runtime block
-  (`pv_*` at `0x89F8..0x89FE`, `0x89FF` still free) — that both freed overlay
-  bytes and made the AT-stream parser state persist across `NET.RECV` calls.
+  (`pv_*` at `0x89F8..0x89FF`, now full — v0.1.20 took the last byte for
+  `pv_started`) — that both freed overlay bytes and made the AT-stream parser
+  state persist across `NET.RECV` calls.
   v0.1.13 moved `NUMBUF`/`URL_SCHEME`/`SEARCH_BUF`/
   `DOC_TITLE`/`PREVIEW_BUF` to `0x8B00..0x8BFF`; v0.1.15 moved the download-progress
   text `DLP_TXT` (+ its `DLP_NUM` tail, which must stay **contiguous** — `DLP_DRAW`

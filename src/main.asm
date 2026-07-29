@@ -4011,8 +4011,8 @@ LINE_BUF_END	EQU LINE_BUF + 510
 ; ------------------------------------------------------
 ; Text.
 ; ------------------------------------------------------
-MSG_TITLE		DB "Gopher browser for Sprinter", 0
-MSG_BANNER		DB "Gopher v.", APP_VERSION, 13, 10, 0
+MSG_TITLE		DB "Gopher browser v.", APP_VERSION, 0
+MSG_BANNER		DB "Gopher browser v.", APP_VERSION, 13, 10, 0
 MSG_RUNEXT		DB "Running external viewer:", 13, 10, 0
 MSG_CRLF		DB 13, 10, 0
 MSG_STATUS		DB "Up/Dn move  Enter open  Bksp back  ^G addr  ^B marks  ^D add  Esc/F10 quit", 0

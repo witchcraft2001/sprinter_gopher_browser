@@ -34,10 +34,13 @@
 
 PASSIVE_POLL_MS		EQU 1500		; control tick: paces probes only
 PASSIVE_DATA_MS		EQU 10000		; length + payload bytes of a live block
-; Quiet ticks tolerated per RECV call (~60 s). A gateway that buffers the whole
-; upstream file before answering (gopher-gate does) can leave the socket silent
-; for tens of seconds on a big item; Esc still cancels at any point.
-PASSIVE_POLL_TRIES	EQU 40
+; Quiet-tick budgets per RECV call. Before the FIRST payload byte of the
+; transfer a gateway may legitimately be silent for minutes (gopher-gate's
+; upstream connection can hang and be retried; measured >2 min on target), so
+; the pre-data phase gets ~3 min. Once data has flowed, a long silence is a
+; real stall: ~60 s. Esc still cancels at any point of either phase.
+PASSIVE_POLL_TRIES	EQU 40			; mid-transfer stall budget (~60 s)
+PASSIVE_POLL_FIRST	EQU 120			; before the first payload byte (~3 min)
 
 ; ACTIVE_PREP reaches these entries only after this overlay has been loaded.
 PASSIVE_SETUP_222
@@ -45,6 +48,7 @@ PASSIVE_SETUP_222
 	LD		(pv_closed), A
 	LD		(pv_live), A
 	LD		(pv_llen), A			; the line scanner starts at a line boundary
+	LD		(pv_started), A			; no payload yet: RECV uses the long budget
 	LD		HL, 0
 	LD		(TCP.PAYLOAD_LEFT), HL	; no block is in flight on a fresh socket
 	LD		A, 1
@@ -60,7 +64,12 @@ RECV_PASSIVE_222
 	LD		(TCP.RECV_REMAIN), BC
 	LD		HL, 0
 	LD		(TCP.RECV_STORED), HL
+	LD		A, (pv_started)
+	OR		A
 	LD		A, PASSIVE_POLL_TRIES
+	JR		NZ, .budget
+	LD		A, PASSIVE_POLL_FIRST	; server may be slow to produce the body
+.budget
 	LD		(pv_poll), A
 
 	CALL	ISA.ISA_OPEN			; every resume path starts by reading the UART
@@ -164,6 +173,8 @@ RECV_PASSIVE_222
 	JR		NZ, .stored_ok			; buffer full: the next call resumes the block
 	JP		.resp					; block complete -> read its trailing OK
 .stored_ok
+	LD		A, 1
+	LD		(pv_started), A			; data flowed: later stalls get the short budget
 	CALL	ISA.ISA_CLOSE
 	LD		BC, (TCP.RECV_STORED)
 	XOR		A

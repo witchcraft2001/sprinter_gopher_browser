@@ -7,13 +7,15 @@
   ███    ███ ███    ███   ███          ███    ███     ███    █▄  ▀███████████ 
   ███    ███ ███    ███   ███          ███    ███     ███    ███   ███    ███ 
   ████████▀   ▀██████▀   ▄████▀        ███    █▀      ██████████   ███    ███ 
-  Browser v.0.1.19                                                 ███    ███ 
+  Browser v.0.1.18                                                 ███    ███ 
 ```
 
 # Gopher browser for Sprinter — quick start (ESP Wi-Fi)
 
 A Gopher-protocol browser for the Sprinter, running under DSS in the native
 80×32 text mode. Based on nihirash's Moon Rabbit / Internet NEXTplorer.
+
+Author: Dmitry Mikhalchenkov, SprinterTeam. FidoNet: 2:5030/1997.10
 
 This build uses the **ESP Wi-Fi** network backend (SprinterWiFi, ESP8266 /
 ESP-AT). For Wi-Fi it relies on the SprinterWiFi network kit.

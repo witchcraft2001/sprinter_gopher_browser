@@ -10,7 +10,7 @@ transfers rot on target.
 import itertools, random, sys
 
 PREFIX = b"+CIPRECVDATA:"
-POLL_MS, DATA_MS, TRIES = 1500, 10000, 10
+POLL_MS, DATA_MS, TRIES, TRIES_FIRST = 1500, 10000, 40, 120
 
 class Timeout(Exception):
     pass
@@ -66,6 +66,7 @@ class Sim:
         self.esp = esp
         self.pv_closed = self.pv_live = 0
         self.pv_first = 1
+        self.pv_started = 0
         self.payload_left = 0
         self.pv_lch, self.pv_llen = 0, 0   # line-scan state: survives timeouts
         self.timeout = POLL_MS
@@ -149,7 +150,7 @@ class Sim:
     # --- RECV_PASSIVE_222 ------------------------------------------------
     def recv(self, free):
         self.remain, self.stored = free, 0
-        poll = TRIES
+        poll = TRIES if self.pv_started else TRIES_FIRST
         sink = bytearray()
 
         if self.payload_left:
@@ -174,6 +175,7 @@ class Sim:
                     r = self.response(0)
                 except Timeout:
                     if self.stored:
+                        self.pv_started = 1
                         return bytes(sink)          # pv_live stays 1
                     state = 'tick'
                     continue
@@ -182,6 +184,7 @@ class Sim:
                     continue
                 self.pv_live = 0
                 if self.stored:
+                    self.pv_started = 1
                     return bytes(sink)
                 state = 'empty_eval'
             elif state == 'empty_eval':
@@ -213,6 +216,7 @@ class Sim:
                 except Timeout:
                     raise
                 if self.payload_left:
+                    self.pv_started = 1
                     return bytes(sink)              # resumed by the next call
                 state = 'resp'
 
@@ -257,5 +261,12 @@ for s in range(1, 4):
 for s_ in range(1, 6):
     r = run(f"deep-stall s{s_}", 400000, itertools.repeat(1460), hiccup=0.0008, seed=s_, deep=True)
     # a "BAD" (wrong bytes at full length) would be the fatal outcome
+# Slow gateway: the server is silent for a long time before the first byte
+# (upstream fetch through a flaky route), then streams normally. Must succeed
+# with the long pre-data budget; a truly dead server still fails visibly.
+fails += not run("slow-gate-90tick", 347582, itertools.chain([0]*90, itertools.repeat(1460)))
+r = run("dead-gate", 347582, itertools.repeat(0))
+if r:
+    print("dead-gate unexpectedly succeeded"); fails += 1
 print("FAILURES:", fails)
 sys.exit(1 if fails else 0)

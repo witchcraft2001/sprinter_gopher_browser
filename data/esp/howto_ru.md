@@ -7,13 +7,15 @@
   ███    ███ ███    ███   ███          ███    ███     ███    █▄  ▀███████████ 
   ███    ███ ███    ███   ███          ███    ███     ███    ███   ███    ███ 
   ████████▀   ▀██████▀   ▄████▀        ███    █▀      ██████████   ███    ███ 
-  Browser v.0.1.19                                                 ███    ███ 
+  Browser v.0.1.18                                                 ███    ███ 
 ```
 
 # Gopher-браузер для Sprinter — быстрый старт (ESP Wi-Fi)
 
 Браузер протокола Gopher для компьютера Sprinter, работает под DSS в текстовом
 режиме 80×32. Основан на Moon Rabbit / Internet NEXTplorer (автор — nihirash).
+
+Автор: Dmitry Mikhalchenkov, SprinterTeam. FidoNet: 2:5030/1997.10
 
 Эта сборка использует сетевой бэкенд **ESP Wi-Fi** (SprinterWiFi, ESP8266 /
 ESP-AT). Для Wi-Fi нужен сетевой кит SprinterWiFi.

@@ -20,6 +20,7 @@ HOMEPAGE   := data/index.gph
 CFG        := data/gopher.cfg
 ESP_HOWTO     := data/esp/howto.md
 ESP_HOWTO_RU  := data/esp/howto_ru.md
+MD2TXT        := tools/md_to_txt.pl
 BUILD      := build
 EXE        := $(BUILD)/GOPHER.EXE
 LST        := $(BUILD)/GOPHER.lst
@@ -28,10 +29,10 @@ DIST_FILES := gopher.exe gopher.cfg index.gph
 
 BACKEND    ?= ESP
 
-# ESP-only quick-start docs (bundled in the dist only for the ESP backend).
+# ESP-only README docs (bundled in the dist only for the ESP backend).
 ifeq ($(BACKEND),ESP)
-HOWTO_TXT  := $(DISTDIR)/howto.txt $(DISTDIR)/howto_ru.txt
-DIST_FILES += howto.txt howto_ru.txt
+README_TXT := $(DISTDIR)/readme.txt $(DISTDIR)/readmeru.txt
+DIST_FILES += readme.txt readmeru.txt
 endif
 
 # Sprinter-WiFi network kit (ESP backend libs: isa/esplib/esp_tcp/netcfg/wcommon).
@@ -62,11 +63,11 @@ $(BUILD):
 $(DISTDIR):
 	@mkdir -p $(DISTDIR)
 
-$(DISTDIR)/howto.txt: $(ESP_HOWTO) | $(DISTDIR)
-	perl -CSDA -ne 's/\r\n\z/\n/; s/\r\z/\n/; s/^#{1,6}[ \t]*//; next if /^[|: \t-]+$$/; next if /^```/; if (/^\|/) { s/^\|[ \t]*//; s/[ \t]*\|[ \t]*$$//; s/[ \t]*\|[ \t]*/  /g; } s/\*\*([^*]+)\*\*/$$1/g; s/`([^`]*)`/$$1/g; s/[“”]/"/g; s/[‘’]/\x27/g; s/[—–]/-/g; s/…/.../g; s/×/x/g; print;' "$<" | iconv -f UTF-8 -t CP866//TRANSLIT > "$@"
+$(DISTDIR)/readme.txt: $(ESP_HOWTO) $(MD2TXT) | $(DISTDIR)
+	perl "$(MD2TXT)" "$<" | iconv -f UTF-8 -t CP866//TRANSLIT > "$@"
 
-$(DISTDIR)/howto_ru.txt: $(ESP_HOWTO_RU) | $(DISTDIR)
-	perl -CSDA -ne 's/\r\n\z/\n/; s/\r\z/\n/; s/^#{1,6}[ \t]*//; next if /^[|: \t-]+$$/; next if /^```/; if (/^\|/) { s/^\|[ \t]*//; s/[ \t]*\|[ \t]*$$//; s/[ \t]*\|[ \t]*/  /g; } s/\*\*([^*]+)\*\*/$$1/g; s/`([^`]*)`/$$1/g; s/[“”]/"/g; s/[‘’]/\x27/g; s/[—–]/-/g; s/…/.../g; s/×/x/g; print;' "$<" | iconv -f UTF-8 -t CP866//TRANSLIT > "$@"
+$(DISTDIR)/readmeru.txt: $(ESP_HOWTO_RU) $(MD2TXT) | $(DISTDIR)
+	perl "$(MD2TXT)" "$<" | iconv -f UTF-8 -t CP866//TRANSLIT > "$@"
 
 # Copy GOPHER.EXE onto a fresh copy of the DSS floppy template (under /GOPHER).
 deploy: $(EXE)
@@ -78,7 +79,7 @@ deploy: $(EXE)
 
 # Build a zip distribution with the files expected next to GOPHER.EXE.
 # The howto docs are converted to CP866 plain text only for the ESP backend.
-dist: $(EXE) $(CFG) $(HOMEPAGE) $(HOWTO_TXT) | $(DISTDIR)
+dist: $(EXE) $(CFG) $(HOMEPAGE) $(README_TXT) | $(DISTDIR)
 	@mkdir -p distr
 	cp "$(EXE)" "$(DISTDIR)/gopher.exe"
 	cp "$(CFG)" "$(DISTDIR)/gopher.cfg"

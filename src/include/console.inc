@@ -109,7 +109,7 @@ pv_poll				EQU 0x89FB			; remaining quiet ticks this call
 pv_wake				EQU 0x89FC			; PASSIVE_RESPONSE mode: 1 = idle wake
 pv_lch				EQU 0x89FD			; first char of the line being scanned
 pv_llen				EQU 0x89FE			; its length so far
-; 0x89FF is free (REQ_BUF starts at 0x8A00)
+pv_started			EQU 0x89FF			; first payload byte of the transfer seen
 REQ_BUF				EQU 0x8A00			; outgoing selector + CRLF (<=256 B: SEL_CUR 200 + CRLF)
 ; Runtime buffers relocated out of the WIN1 image (into the unused upper half of
 ; REQ_BUF's 512 B slot, 0x8B00..0x8BFF) so the code image + network-lib BSS stay
