@@ -45,12 +45,12 @@ every build — see §5 and §7.
 
 **v0.2.0 shipped: full migration from a statically-linked ESP-AT kit to the
 runtime UNET-DLL architecture described above.** `make` / `make deploy` /
-`make dist` all build and package cleanly (0 errors). On-target regression
-(MAME ESP + real hardware for both backends) is the next step — see the
-verification checklist in the migration plan history below if you need the
-exact test matrix; day-to-day, just: build, deploy, run the usual browsing/
-download/bookmark/search flows over Wi-Fi, and separately smoke-test RTL in
-MAME (`NETCFG -i; IFUP` per `extern/rtl`'s docs).
+`make dist` all build and package cleanly (0 errors). The ESP/Wi-Fi backend
+has been confirmed working on-target (NETUP, home page, and a network fetch
+all succeed). RTL on-target verification (`NETCFG -i; IFUP` per `extern/rtl`'s
+docs) is still outstanding. See §7's `CALL_UNET` note for a bug that blocked
+every UNET call until fixed — worth knowing if a future symptom looks similar
+(a network op fails with a "clean" but impossible-looking error).
 
 Everything from menu parsing, the paged document buffer, history/back-cache,
 downloads, bookmarks, config file, and the appended-home-page loader-EXE trick
@@ -283,23 +283,6 @@ short, thoroughly commented, and the single source of truth. Summary:
   diagnostic tail; available for richer error messages but not yet wired into
   every status-bar error path (a reasonable follow-up, not required for
   correctness).
-- **`NET.DIAG_TEXT` + `init_stage`/`init_code`** — a bring-up failure is
-  otherwise a single opaque "init failed" covering seven distinct causes, so
-  `NET.INIT` records *which* stage failed (`IST_*` in `net.asm`) with its
-  result code, and `DIAG_TEXT` appends that plus libman's own breadcrumbs to
-  the status line (`main.asm`'s `INIT_ERR_TEXT`, built into `WEBLINK_BUF`):
-  ```
-  Net init failed - run NETUP/NETCFG. st=2 e=32 lr=1 ls=3 dss=3 is=0
-  ```
-  `st` = `IST_ENV`(1)/`LOAD`(2)/`GETCAPS`(3)/`ABI`(4)/`CAPS`(5)/`STATUS`(6)/
-  `NETINIT`(7); `e` = the accompanying code (a `NERR_*` for `st=7`, the ABI
-  major byte for `st=4`, the caps low byte for `st=5`); `lr`/`ls`/`dss`/`is`
-  are `LIBMAN.l_reason` (1=OPEN i.e. file not found, 2=LOAD i.e. bad format,
-  3=WINDOW), `l_load_stage` (`LS_*`: 1 temp-alloc, 2 temp-map, 3 open, 4 I/O,
-  5 format, 6 copy, 7 target, 8 DLL-INIT, 9 cleanup), `l_dss_error` and
-  `l_init_status` — all meaningful only for `st=2`. Read `st` first: it says
-  whether the DLL was even found (2), whether it is the wrong build (3/4/5),
-  or whether the card/link is down (7).
 
 **Config contract with the user:** the browser reads `NET` and nothing else —
 Wi-Fi join / RTL bring-up is entirely the DLL + `NETUP`/`NETCFG -i`+`IFUP`'s
@@ -416,15 +399,10 @@ these use the UNET/libman pattern, they predate it):
 
 ## 9. Known follow-ups (not blocking, not yet done)
 
-- `data/esp/howto.md`/`howto_ru.md` (bundled as `readme.txt`/`readmeru.txt`)
-  still describe the old ESP-AT-kit setup story; rewrite for the DLL/`NET` env
-  var world (mention `NETCFG -i`/`IFUP` for RTL too).
-- `NET.LAST_ERROR`'s text (the DLL's own last AT/driver response) is still not
-  appended to `ERR_CONN`/`ERR_SEND`. `ERR_INIT` now carries the structured
-  `NET.DIAG_TEXT` breadcrumbs instead (see §5), which is what a bring-up
-  failure actually needs; `LAST_ERROR` would add backend-specific detail.
-- On-target regression across both backends (§2) — MAME + real hardware for
-  ESP, MAME for RTL (real RTL hardware is a nice-to-have, not required).
+- `NET.LAST_ERROR` diagnostic text is not yet appended to any status-bar error
+  message (see §5) — would make `ERR_INIT`/`ERR_CONN` more actionable.
+- RTL on-target regression (§2) — MAME smoke test via `NETCFG -i; IFUP` (real
+  RTL hardware is a nice-to-have, not required). ESP/Wi-Fi is confirmed.
 - UTF-8 → CP866 recode for gopher content (never implemented; pre-existing
   gap, unrelated to this migration).
 - Cursor does not yet skip non-selectable (`i`/`.`) rows on Up/Down in menus

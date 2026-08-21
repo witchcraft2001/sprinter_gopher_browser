@@ -7,48 +7,71 @@
   ███    ███ ███    ███   ███          ███    ███     ███    █▄  ▀███████████ 
   ███    ███ ███    ███   ███          ███    ███     ███    ███   ███    ███ 
   ████████▀   ▀██████▀   ▄████▀        ███    █▀      ██████████   ███    ███ 
-  Browser v.0.1.18                                                 ███    ███ 
+  Browser v.0.2.0                                                  ███    ███ 
 ```
 
-# Gopher browser for Sprinter — quick start (ESP Wi-Fi)
+# Gopher browser for Sprinter — quick start
 
 A Gopher-protocol browser for the Sprinter, running under DSS in the native
 80×32 text mode. Based on nihirash's Moon Rabbit / Internet NEXTplorer.
 
 Author: Dmitry Mikhalchenkov, SprinterTeam. FidoNet: 2:5030/1997.10
 
-This build uses the **ESP Wi-Fi** network backend (SprinterWiFi, ESP8266 /
-ESP-AT). For Wi-Fi it relies on the SprinterWiFi network kit.
+The browser talks to the network through a small runtime-loaded DLL, so a
+single `GOPHER.EXE` supports two different Sprinter network cards:
+
+- **SprinterWiFi** (ESP8266 / ESP-AT) via `UNETESP.DLL`.
+- **NE2000 / RTL8019A** ISA Ethernet via `UNETRTL.DLL`.
+
+Which one is used is decided automatically, per session, by whichever network
+kit you brought the link up with beforehand — the browser itself never talks
+to the card directly.
 
 ## What you need
 
-- A Sprinter with the **SprinterWiFi** Wi-Fi card.
-- The **SprinterWiFi network kit** installed (it provides `NETUP` and `NET.CFG`).
-- `GOPHER.EXE` (this program) on disk, e.g. in `C:\GOPHER\`.
-
-Supported ESP-AT firmware: **v2.2.1** and **v2.2.2.0**. For the best user
-experience, **v2.2.2.0** together with the **Sprinter ESP Network Kit v0.2.1 or
-newer** is recommended.
+- A Sprinter with a **SprinterWiFi** card, an **NE2000/RTL8019A** card, or
+  both.
+- The matching network kit installed:
+  - Wi-Fi: the **SprinterWiFi network kit** (provides `NETUP` and `NET.CFG`).
+  - RTL: the **sprinter-rtl8019a kit** (provides `NETCFG` and `IFUP`).
+- `GOPHER.EXE` together with **both** `UNETESP.DLL` and `UNETRTL.DLL` in the
+  same directory, e.g. `C:\GOPHER\`.
 
 ## Quick start
 
-1. **Configure Wi-Fi.** This is handled entirely by the SprinterWiFi network kit
-   (its `NET.CFG`); see that package's documentation for how to set your network.
+1. **Bring exactly one link up before starting the browser** (once per
+   session) — pick whichever card you have:
 
-2. **Bring the link up** (once per session), before starting the browser:
+   - **Wi-Fi:** configure `NET.CFG` once (see the SprinterWiFi kit's own
+     docs), then
 
-       NETUP
+         NETUP
 
-   This joins Wi-Fi and publishes the link state so programs can open TCP.
+   - **RTL8019A:** configure `NET.CFG` once (see the Sprinter RTL8019A kit's own
+     docs), then
 
-3. **Run the browser:**
+         NETCFG -i
+         IFUP
+
+   Either command publishes which backend is active; the browser reads that
+   automatically the next time it needs the network — there is nothing to
+   select inside the browser itself.
+
+2. **Run the browser:**
 
        GOPHER\GOPHER.EXE
 
    It opens on a built-in home page (no network needed) with a few starter
    links. Select one and press Enter to fetch it.
 
-If the status line shows `Wi-Fi not up - run NETUP first`, repeat step 2.
+If the status line shows `Network not set up - run NETUP (Wi-Fi) or NETCFG -i
++ IFUP (RTL)`, repeat step 1 — no network kit has published a link yet.
+
+If a fetch instead shows `Network init failed (no DLL, bad link, or
+NETUP/NETCFG not run).`, the network kit ran but the browser could not bring
+the link up through the DLL — check that the matching `UNET*.DLL` is present
+next to `GOPHER.EXE` and that the link is actually up (`NETUP`/`IFUP` reported
+success).
 
 ## Keys
 
@@ -93,6 +116,9 @@ it to another Sprinter.
 - **`BOOKMARK.GPH`** — the bookmarks file (created by Ctrl+D, opened by Ctrl+B).
   See the "Bookmarks" section above.
 
+- **`UNETESP.DLL` / `UNETRTL.DLL`** — the network backends. Keep both next to
+  `GOPHER.EXE`; only the one matching your active link is ever loaded.
+
 - **`GOPHER.CFG`** — settings and program associations. Three sections:
 
       [settings]
@@ -131,4 +157,6 @@ only through a `[viewers]` association above, on your confirmation.
 
 ## Notes
 
-- The browser only opens TCP connections; joining Wi-Fi is done once by `NETUP`.
+- The browser only opens TCP connections; bringing the link up (Wi-Fi join or
+  Ethernet interface up) is entirely the job of `NETUP` or `NETCFG -i` +
+  `IFUP`, run once per session before the browser needs the network.

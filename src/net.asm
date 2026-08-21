@@ -26,21 +26,6 @@ NERR_DLL_CALL		EQU 34		; libman dispatch failure (bad handle/window)
 NERR_NOCONFIG		EQU 35		; env NET missing/not WIFI or RTL
 NERR_SHORT_SEND	EQU 36		; DLL confirmed fewer bytes sent than requested
 
-; INIT failure stages, recorded in init_stage and shown by DIAG_TEXT. A bring-up
-; failure is otherwise indistinguishable from the outside ("init failed" covers
-; a missing DLL, an ABI mismatch and a dead link alike), so the status bar gets
-; the stage plus libman's own reason/DSS-error breadcrumbs.
-IST_ENV			EQU 1		; env NET unset or not WIFI/RTL
-IST_LOAD		EQU 2		; LIBMAN.l_load failed (see lr/ls/dss in DIAG_TEXT)
-IST_GETCAPS		EQU 3		; GETCAPS dispatch/status failure
-IST_ABI			EQU 4		; ABI major mismatch (code = the major byte seen)
-IST_CAPS		EQU 5		; no UNET_CAP_TCP (code = caps low byte seen)
-IST_STATUS		EQU 6		; STATUS(0xFF) env probe failed
-IST_NETINIT		EQU 7		; NETINIT failed (link/hardware not up)
-
-init_stage			DB 0		; IST_* of the last INIT failure
-init_code			DB 0		; result code that accompanied it
-
 dll_handle			DW 0
 dll_loaded			DB 0		; DLL loaded into WIN1 (stays loaded until SHUTDOWN)
 net_caps			DW 0		; cached GETCAPS bitmask (valid once dll_loaded=1)
@@ -62,23 +47,17 @@ net_cancelled		DB 0
 ; a full reload. Out: CF=0 ok; CF=1, A=result code.
 ; ------------------------------------------------------
 INIT
-	XOR		A
-	LD		(init_stage), A
-	LD		(init_code), A
 	LD		A, (dll_loaded)
 	OR		A
 	JR		NZ, .have_dll
 	CALL	SELECT_DLL				; -> HL=DLL filename; CF=1/A=NERR_NOCONFIG
-	JR		NC, .got_name
-	LD		B, IST_ENV
-	JR		.fail
-.got_name
+	RET		C
 	LD		A, 1					; target window 1
 	CALL	LIBMAN.l_load
 	JR		NC, .loaded
 	LD		A, NERR_DLL_LOAD		; libman's own l_reason/l_dss_error say why
-	LD		B, IST_LOAD
-	JR		.fail
+	SCF
+	RET
 .loaded
 	LD		(dll_handle), HL
 	LD		A, 1
@@ -86,24 +65,17 @@ INIT
 	XOR		A
 	LD		B, UNET_FN_GETCAPS
 	CALL	CALL_UNET
-	JR		C, .caps_fail
+	JR		C, .abi_fail
 	OR		A
-	JR		NZ, .caps_fail
+	JR		NZ, .abi_fail
 	LD		(net_caps), DE
 	BIT		0, E					; UNET_CAP_TCP - gopher is useless without it
-	JR		NZ, .have_tcp
-	LD		A, E					; report the caps low byte we actually saw
-	LD		B, IST_CAPS
-	JR		.unload
-.have_tcp
+	JR		Z, .abi_fail
 	PUSH	IX
 	POP		HL
 	LD		A, H
 	CP		HIGH UNET_ABI_VERSION
-	JR		Z, .abi_ok
-	LD		B, IST_ABI				; A = the ABI major byte we saw
-	JR		.unload
-.abi_ok
+	JR		NZ, .abi_fail
 	LD		A, UNET_OPT_CANCELKEYS
 	LD		DE, 1
 	LD		B, UNET_FN_SETOPT
@@ -111,14 +83,11 @@ INIT
 	LD		A, 0xFF					; STATUS(0xFF): env-only probe, no hardware
 	LD		B, UNET_FN_STATUS
 	CALL	CALL_UNET
-	JR		C, .status_fail
+	JR		C, .init_fail
 	CP		NERR_OK
 	JR		Z, .have_dll
 	CP		NERR_NONET
-	JR		Z, .have_dll
-.status_fail
-	LD		B, IST_STATUS
-	JR		.fail
+	JR		NZ, .init_fail
 .have_dll
 	XOR		A
 	LD		B, UNET_FN_NETDONE
@@ -126,27 +95,15 @@ INIT
 	XOR		A
 	LD		B, UNET_FN_NETINIT
 	CALL	CALL_UNET
-	JR		C, .netinit_fail
+	JR		C, .init_fail
 	OR		A
 	RET		Z
-.netinit_fail
-	LD		B, IST_NETINIT
-.fail
-	; In: A = result code, B = stage. Records both and returns CF=1, A=code.
-	LD		(init_code), A
-	LD		A, B
-	LD		(init_stage), A
-	LD		A, (init_code)
+.init_fail
 	SCF
 	RET
-.caps_fail
-	LD		B, IST_GETCAPS
-.unload
+.abi_fail
 	; An unusable DLL must not stay resident: free it so a later retry (after
-	; the user fixes the setup) starts from a clean l_load.
-	LD		(init_code), A
-	LD		A, B
-	LD		(init_stage), A
+	; the user fixes the setup, e.g. NETUP with a different card) l_loads clean.
 	LD		HL, (dll_handle)
 	CALL	LIBMAN.l_free
 	XOR		A
@@ -365,61 +322,6 @@ CALL_UNET
 	LD		A, NERR_DLL_CALL
 	SCF
 	RET
-
-; Append a compact breadcrumb tail for the last INIT failure to the ASCIIZ
-; buffer HL points into: " st=<stage> e=<code> lr=<libman reason> ls=<libman
-; load stage> dss=<DSS error> is=<DLL INIT status>". Writes at most 40 bytes.
-; In: HL = destination (where the NUL should go). Out: buffer NUL-terminated.
-DIAG_TEXT
-	EX		DE, HL					; DE = write cursor
-	LD		HL, diag_tbl
-.next
-	LD		A, (HL)
-	OR		A
-	JR		Z, .done
-.label
-	LD		A, (HL)
-	INC		HL
-	OR		A
-	JR		Z, .value
-	LD		(DE), A
-	INC		DE
-	JR		.label
-.value
-	LD		C, (HL)
-	INC		HL
-	LD		B, (HL)
-	INC		HL						; BC = address of the byte to print
-	PUSH	HL
-	LD		A, (BC)
-	LD		L, A
-	LD		H, 0
-	CALL	UTIL.UTOA				; HL=value, DE=dest -> DE past the written NUL
-	DEC		DE						; step back onto it: the next label overwrites it
-	POP		HL
-	JR		.next
-.done
-	XOR		A
-	LD		(DE), A
-	RET
-
-; label (ASCIIZ) + address of the byte to print after it; 0 ends the table.
-; The LIBMAN.* fields resolve to their WIN2 run addresses (libman is assembled
-; via the DISP block in main.asm), which is where they actually live at runtime.
-diag_tbl
-	DB " st=", 0
-	DW init_stage
-	DB " e=", 0
-	DW init_code
-	DB " lr=", 0
-	DW LIBMAN.l_reason
-	DB " ls=", 0
-	DW LIBMAN.l_load_stage
-	DB " dss=", 0
-	DW LIBMAN.l_dss_error
-	DB " is=", 0
-	DW LIBMAN.l_init_status
-	DB 0
 
 ; Compare ASCIIZ at HL and DE. Out: ZF=1 if equal. Trashes A, HL, DE.
 STREQ

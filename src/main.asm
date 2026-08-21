@@ -1734,7 +1734,7 @@ DO_FETCH
 	LD		HL, ERR_CANCEL
 	JP		FETCH_ERR
 .e_init
-	CALL	INIT_ERR_TEXT			; ERR_INIT + the NET.INIT breadcrumb tail
+	LD		HL, ERR_INIT
 	JP		FETCH_ERR
 .e_conn
 	LD		A, (NET.net_cancelled)
@@ -1761,28 +1761,6 @@ DO_FETCH
 .e_mem
 	LD		HL, MSG_MEM_ERR
 	JP		FETCH_ERR
-
-; Build the network-init error line into WEBLINK_BUF: the fixed advice plus
-; NET's breadcrumb tail (which stage failed, with libman's own reason/DSS-error
-; codes), so a bring-up failure is diagnosable from the status bar alone.
-; WEBLINK_BUF (80 B) is free here - a download that fails at NET.INIT has not
-; started transferring, and a page fetch never uses it. Out: HL = the message.
-INIT_ERR_TEXT
-	LD		HL, ERR_INIT
-	LD		DE, WEBLINK_BUF
-.copy
-	LD		A, (HL)
-	OR		A
-	JR		Z, .tail
-	LD		(DE), A
-	INC		HL
-	INC		DE
-	JR		.copy
-.tail
-	EX		DE, HL					; HL = write cursor, just past the text
-	CALL	NET.DIAG_TEXT
-	LD		HL, WEBLINK_BUF
-	RET
 
 ; HL = default error message; if a user cancel was flagged by the kit
 ; (NET.net_cancelled, set on Esc/Ctrl+Z), report "Cancelled" instead. CF=1.
@@ -2215,7 +2193,7 @@ DOWNLOAD
 	LD		HL, MSG_MEM_ERR
 	JR		.fail
 .e_init
-	CALL	INIT_ERR_TEXT			; ERR_INIT + the NET.INIT breadcrumb tail
+	LD		HL, ERR_INIT
 	JP		FETCH_ERR
 .e_conn
 	LD		HL, ERR_CONN
@@ -3754,7 +3732,7 @@ MSG_BM_NONE		DB "Nothing to bookmark (open a gopher page first).", 0
 MSG_BM_FAIL		DB "Could not write the bookmarks file.", 0
 MSG_EXEC_FAIL	DB "Could not launch the associated program.", 0
 MSG_MEM_ERR		DB "Cannot allocate work page.", 0
-ERR_INIT		DB "Net init failed - run NETUP/NETCFG.", 0
+ERR_INIT		DB "Network init failed (no DLL, bad link, or NETUP/NETCFG not run).", 0
 ERR_CONN		DB "Connect failed (check host / port / network).", 0
 ERR_SEND		DB "Send failed.", 0
 ERR_EMPTY		DB "No data received.", 0
