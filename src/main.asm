@@ -2,25 +2,31 @@
 ; Gopher browser for Sprinter (DSS, 80x32 text)
 ; A port of nihirash's Moon Rabbit / Internet NEXTplorer (Z80) + agon-snail ideas.
 ;
-; PHASE 3 - gopher engine (end-to-end browsing).
 ;   * Paged document buffer (src/doc.asm): fetched bytes live in a chain of
-;     GetMem 16 KB pages, time-sharing WIN3 with the ISA window (CLAUDE.md §4a).
-;     No 16 KB document limit; cap 16 pages (256 KB), then truncated.
+;     GetMem 16 KB pages, time-sharing WIN3 with the DLL/doc pages (CLAUDE.md
+;     §4a). No 16 KB document limit; cap 16 pages (256 KB), then truncated.
 ;   * Gopher menus/text are parsed row-by-row (type/display/selector/host/port)
 ;     and rendered through the 30-row viewport directly from the doc pages.
 ;   * Enter follows a link (NET connect/send/recv into a fresh document);
-;     Backspace goes back (history of navigation records, re-fetched on return);
-;     Up/Down move, Left/Right page, Esc quits.
-;   * Built-in "home" menu (WELCOME_DOC) is loaded at startup with no network,
-;     so the browser is usable before the first fetch.
+;     Backspace goes back (history of navigation records, cached per level so
+;     Back is instant); Up/Down move, Left/Right page, Esc quits.
+;   * Built-in "home" menu (WELCOME_DOC / INDEX.GPH) is loaded at startup with
+;     no network, so the browser is usable before the first fetch.
 ;   * Network errors are classified and shown on the status bar (no program
 ;     exit, no blocking "press a key"); NET.INIT runs once and is reused.
 ;
-;   The WIN1 image holds all code + small state and uses a short-lived boot
-;   stack at 0x8000. A GetMem page is mapped at WIN2 (0x8000) for the runtime
-;   stack and larger scratch buffers (STAGE/LINE_BUF/REQ_BUF/HIST_DATA, see
-;   console.inc). Document pages and the ISA window take turns in WIN3; we never
-;   SetWin2 over code because no code lives in WIN2 (the proven wget layout).
+;   Networking (src/net.asm) is a runtime-loaded UNET-ABI DLL (UNETESP.DLL for
+;   Wi-Fi, UNETRTL.DLL for NE2000/RTL8019A), selected by env NET (WIFI/RTL) and
+;   loaded via libman (extern/libman). The DLL loads into WIN1 (gopher's own
+;   code window - libman restores it before returning from every call); libman
+;   itself, which must survive while WIN1 is displaced, is copied into the
+;   WIN2 GetMem page at LIBMAN_W2_BASE once at startup (see console.inc). The
+;   WIN1 image holds all other code + small state and uses a short-lived boot
+;   stack at 0x8000; the runtime stack lives in the tail of the WIN2 page.
+;   Document pages use WIN3 (OUT PAGE3); libman's loader also uses WIN3 as
+;   scratch, but only transiently inside l_load (once, at NET.INIT), never
+;   while a doc page's raw pointer is in flight - same discipline as any other
+;   DSS/BIOS call while WIN3 holds a doc page.
 ; ======================================================
 
 EXE_VERSION		EQU 1
@@ -29,10 +35,6 @@ STACK_TOP		EQU 0x8000				; BOOT stack (WIN1): used only for early startup,
 										; before the WIN2 page is mapped. The runtime stack is
 										; RUN_STACK_TOP in the WIN2 page (START switches SP to
 										; it once INIT_RUNTIME_PAGE has mapped the page).
-
-DEFAULT_TIMEOUT	EQU 2000				; ms; also used by wcommon
-RECV_TIMEOUT	EQU 15000				; ms per byte/header wait (slow gopher servers)
-RAW_CLOSE_GRACE EQU 750					; ms to wait for CLOSED after gopher terminator
 
 	DEVICE NOSLOT64K
 
@@ -91,24 +93,26 @@ EXE_HEADER
 START
 	LD		A, (IX-3)					; EXE file handle - DSS leaves a loader EXE open,
 	LD		(home_fm), A				; FM at (IX-3); used to read the appended home page
-	CALL	WCOMMON.INIT_VMODE			; record current mode so EXIT restores cleanly
+	CALL	INIT_VMODE					; record current mode so EXIT restores cleanly
 	CALL	SHOW_BANNER					; version + build-date banner on load
 	CALL	INIT_RUNTIME_PAGE			; map a fresh WIN2 page for the scratch buffers
 	JP		C, MEM_ERROR
 	XOR		A
 	LD		(open_addr_active), A
-	; The WIN2 page is now ours, so move the stack into its top 4 KB
-	; (RUN_STACK_TOP), away from the network lib's BSS under 0x8000. The early
-	; boot frames on the WIN1 stack are done with (START exits via DSS, never
-	; RETs through them), so abandoning them is safe.
+	; The WIN2 page is now ours, so move the stack into its top part
+	; (RUN_STACK_TOP), and copy libman's assembled code+state (LIBMAN_STORE,
+	; near IMAGE_END) into the page at LIBMAN_W2_BASE - see console.inc. The
+	; early boot frames on the WIN1 stack are done with (START exits via DSS,
+	; never RETs through them), so abandoning them is safe.
 	LD		SP, RUN_STACK_TOP
+	LD		HL, LIBMAN_STORE
+	LD		DE, LIBMAN_W2_BASE
+	LD		BC, LIBMAN_STORE_SIZE
+	LDIR
 	CALL	INIT_PROGRESS_VRAM			; save screen 0/1 in the mapped WIN2 state
 	CALL	INIT_DLP_TXT				; seed the WIN2 "Receiving " progress prefix
-	CALL	INIT_PATHS					; resolve the EXE dir for DOWNLOAD\ (AppInfo #47)
-	LD		HL, CLOCK_TICK_CB			; tick the clock during the kit's blocking waits
-	LD		(WCOMMON.IDLE_CB), HL		; (INIT/connect/receive). The wrapper preserves IX/IY
-										; (the kit restores only AF/BC/DE/HL around IDLE_CB).
-										; Stack safety is now handled by RUN_STACK_TOP in WIN2.
+	CALL	INIT_PATHS					; resolve the EXE dir for DOWNLOAD\ (AppInfo #47);
+										; also LIBMAN_APP_DIR (net.asm DLL search path)
 	CALL	CFG.LOAD					; read GOPHER.CFG (viewers + settings); ignore if absent
 	CALL	DOC.RESET
 	CALL	TERM.CLS
@@ -249,7 +253,7 @@ QUIT
 	CALL	TERM.LOCATE
 	CALL	SHOW_BANNER				; version + build-date banner on exit
 	LD		B, 0
-	JP		WCOMMON.EXIT
+	JP		EXIT
 
 ; Print the program banner (version + build date) at the cursor.
 SHOW_BANNER
@@ -259,7 +263,7 @@ SHOW_BANNER
 MEM_ERROR
 	PRINTLN	MSG_MEM_ERR
 	LD		B, 3
-	JP		WCOMMON.EXIT
+	JP		EXIT
 
 ; Allocate one 16 KB page and map it into WIN2 (0x8000) for the scratch buffers
 ; and the runtime stack. No need to remember the handle for after Dss.Exec: DSS
@@ -912,7 +916,7 @@ GOTO_FETCH
 	LD		A, (open_addr_active)
 	OR		A
 	JR		Z, .normal
-	LD		A, (WCOMMON.CANCELLED)
+	LD		A, (NET.net_cancelled)
 	OR		A
 	JR		NZ, .normal				; Esc cancels rather than reopening the editor
 	LD		HL, OPEN_ADDR_SAVE
@@ -1588,29 +1592,7 @@ LOAD_DISK_GPH
 ; START); the appended bytes begin at file offset HOME_OFFSET = 0x200 + image size.
 ; We SEEK_END for the file size, take the tail (size - HOME_OFFSET) and read it.
 ; Out: CF=0 loaded (>0 B), CF=1 = no handle / nothing appended.
-PASSIVE_OVERLAY_OFFSET EQU 0x200 + IMAGE_END - LOAD_ADDR
-HOME_OFFSET		EQU PASSIVE_OVERLAY_OFFSET + PASSIVE_OVERLAY_SIZE
-
-; Load the 2.2.2-only passive parser into LINE_BUF immediately before a binary
-; download. The overlay is stored after the loader image and before INDEX.GPH;
-; LINE_BUF is not used again until the download has finished.
-LOAD_PASSIVE_OVERLAY
-	LD		A, (home_fm)
-	CP		FILE.NO_HANDLE
-	SCF
-	RET		Z
-	LD		B, 0					; SEEK_SET
-	LD		HL, 0
-	LD		IX, PASSIVE_OVERLAY_OFFSET
-	LD		C, DSS_MOVE_FP
-	RST		DSS
-	RET		C
-	LD		A, (home_fm)
-	LD		HL, LINE_BUF
-	LD		DE, PASSIVE_OVERLAY_SIZE
-	LD		C, DSS_READ_FILE
-	RST		DSS
-	RET
+HOME_OFFSET		EQU 0x200 + IMAGE_END - LOAD_ADDR
 
 LOAD_HOME_FILE
 	LD		A, (home_fm)
@@ -1679,6 +1661,8 @@ READ_INTO_DOC
 hf_rem			DW 0
 disk_fm			DB 0
 rid_fm			DB 0
+recv_idle_count	DB 0				; RECV_LOOP: consecutive silent NET.RECV polls
+dl_idle_count	DB 0				; DL_RECV_LOOP: consecutive silent NET.RECV polls
 
 ; ------------------------------------------------------
 ; Fetch HOST_CUR/SEL_CUR/PORT_CUR into a fresh document. CF=1 on error
@@ -1687,38 +1671,35 @@ rid_fm			DB 0
 DO_FETCH
 	CALL	DOC.RESET
 	XOR		A
-	LD		(WCOMMON.CANCELLED), A	; clear any stale cancel flag before we start
+	LD		(NET.net_cancelled), A	; clear any stale cancel flag before we start
 	LD		(fetch_conn_retry), A
 	CALL	SHOW_FETCHING
 	LD		A, (net_inited)
 	OR		A
 	JR		NZ, .haveinit
-	CALL	NET.INIT				; AT/connect waits poll Esc/Ctrl+Z internally
+	CALL	NET.INIT				; blocking waits poll Esc/Ctrl+Z internally
 	JP		C, .e_init
 	LD		A, 1
 	LD		(net_inited), A
 .haveinit
-	; Allocate the first doc page before the request. During the transfer every
-	; normal APPEND is then only a map+LDIR, so RTS can stay asserted until the
-	; gopher terminator arrives (see RECV_LOOP).
+	; Allocate the first doc page before the request, so every ordinary
+	; RECV_LOOP append is a fast map+LDIR.
 	CALL	DOC.RESERVE
 	JP		C, .e_mem
 .attempt
 	LD		HL, HOST_CUR
 	LD		DE, PORT_CUR
-	CALL	NET.RAW_CONNECT
+	CALL	NET.CONNECT
 	JR		C, .e_conn
-	CALL	NET.RAW_SAFE_RX			; TR8 + clean LSR diagnostics; leaves RTS low
 	CALL	SHOW_PROGRESS			; phase marker: connected, waiting/receiving body
 	CALL	BUILD_REQ				; HL=REQ_BUF, BC=len
-	CALL	NET.RAW_SEND
+	CALL	NET.SEND
 	JR		C, .e_send
 	CALL	RECV_LOOP				; appends every block into the document
-	PUSH	AF						; leave raw mode on success, timeout, or cancel
-	LD		A, (raw_closed)
-	CALL	NET.RAW_FINISH
+	PUSH	AF
+	CALL	NET.CLOSE
 	POP		AF
-	JR		C, .e_cancel			; cancelled mid-download
+	JR		C, .e_cancel			; cancelled mid-fetch
 	CALL	DOC.COUNT_LINES
 	LD		HL, (DOC.doc_lines)
 	LD		A, H
@@ -1736,6 +1717,7 @@ DO_FETCH
 	; show what loaded (rendered with "- INCOMPLETE"); if nothing loaded, it's empty.
 	CALL	CONFIRM_RELOAD			; CF=0 = reload, CF=1 = show what loaded
 	JR		C, .show_loaded
+	; NET.CLOSE already ran unconditionally above; just reset the doc and retry.
 	CALL	DOC.RESET
 	CALL	DOC.RESERVE
 	JP		C, .e_mem
@@ -1752,10 +1734,10 @@ DO_FETCH
 	LD		HL, ERR_CANCEL
 	JP		FETCH_ERR
 .e_init
-	LD		HL, ERR_INIT
+	CALL	INIT_ERR_TEXT			; ERR_INIT + the NET.INIT breadcrumb tail
 	JP		FETCH_ERR
 .e_conn
-	LD		A, (WCOMMON.CANCELLED)
+	LD		A, (NET.net_cancelled)
 	OR		A
 	JR		NZ, .e_cancel
 	LD		A, (fetch_conn_retry)
@@ -1763,15 +1745,14 @@ DO_FETCH
 	JR		NZ, .conn_failed
 	INC		A
 	LD		(fetch_conn_retry), A
-	LD		HL, 300					; give ESP-AT/socket cleanup a short settle window
+	LD		HL, 300					; give the backend/socket cleanup a short settle window
 	CALL	UTIL.DELAY
 	JP		.attempt
 .conn_failed
 	LD		HL, ERR_CONN
 	JP		FETCH_ERR
 .e_send
-	XOR		A						; send failed while raw pipe may be active -> +++
-	CALL	NET.RAW_FINISH
+	CALL	NET.CLOSE
 	LD		HL, ERR_SEND
 	JP		FETCH_ERR
 .e_empty
@@ -1781,10 +1762,32 @@ DO_FETCH
 	LD		HL, MSG_MEM_ERR
 	JP		FETCH_ERR
 
+; Build the network-init error line into WEBLINK_BUF: the fixed advice plus
+; NET's breadcrumb tail (which stage failed, with libman's own reason/DSS-error
+; codes), so a bring-up failure is diagnosable from the status bar alone.
+; WEBLINK_BUF (80 B) is free here - a download that fails at NET.INIT has not
+; started transferring, and a page fetch never uses it. Out: HL = the message.
+INIT_ERR_TEXT
+	LD		HL, ERR_INIT
+	LD		DE, WEBLINK_BUF
+.copy
+	LD		A, (HL)
+	OR		A
+	JR		Z, .tail
+	LD		(DE), A
+	INC		HL
+	INC		DE
+	JR		.copy
+.tail
+	EX		DE, HL					; HL = write cursor, just past the text
+	CALL	NET.DIAG_TEXT
+	LD		HL, WEBLINK_BUF
+	RET
+
 ; HL = default error message; if a user cancel was flagged by the kit
-; (WCOMMON.CANCELLED, set on Esc/Ctrl+Z), report "Cancelled" instead. CF=1.
+; (NET.net_cancelled, set on Esc/Ctrl+Z), report "Cancelled" instead. CF=1.
 FETCH_ERR
-	LD		A, (WCOMMON.CANCELLED)
+	LD		A, (NET.net_cancelled)
 	OR		A
 	JR		Z, .set
 	LD		HL, ERR_CANCEL
@@ -1794,153 +1797,58 @@ FETCH_ERR
 	RET
 
 ; Receive blocks into the shared 4 KB DL_BUF until the gopher end marker (a line
-; containing only ".") arrives, the connection closes/times out, or the document
-; hits its cap.
-;
-; Crucial ESP-AT detail: do NOT manually pause RTS between ordinary blocks. If
-; the peer sends FIN while RTS is low, ESP-AT can discard queued-but-not-yet-sent
-; +IPD tail data (the common symptom was a page ending around the old 2 KB STAGE
-; boundary). DL_BUF is safe to reuse here: its NETCFG overlay is dead after INIT,
-; and a page fetch cannot overlap a binary download. The first doc page is
-; preallocated, so the between-block work is normally just a fast map+LDIR;
-; TL16C550 auto-flow still deasserts RTS at the FIFO trigger if a byte arrives
-; while the CPU is copying. Slow DSS progress/clock drawing is deferred until the
-; terminator/end has made it safe to pause explicitly.
+; containing only ".") arrives, the connection closes, or the document hits its
+; cap. The UNET DLL owns all transport framing/backpressure internally (length-
+; framed NET.RECV, a reliable NERR_CLOSED with any trailing bytes attached) -
+; this loop is a plain poll, not a byte-level protocol scanner.
+RECV_IDLE_TICKS	EQU 15				; ~15 x 1 s of pure silence -> incomplete
 RECV_LOOP
 	XOR		A
 	LD		(recv_term_seen), A
 	LD		(recv_line_state), A
-	LD		(raw_closed), A
-	LD		(raw_close_state), A
-	; CLOCK_TICK_CB may perform several DSS/BIOS calls during a byte-wait. Keep
-	; active receive as lean as possible; the callback is restored on every exit.
-	LD		HL, (WCOMMON.IDLE_CB)
-	LD		(recv_idle_cb), HL
-	LD		HL, 0
-	LD		(WCOMMON.IDLE_CB), HL
-	CALL	NET.RX_RESUME			; keep manual RTS asserted for the whole stream
+	LD		(recv_idle_count), A
 .l
 	LD		A, (DOC.doc_trunc)
 	OR		A
 	JR		NZ, .end
 	LD		HL, DL_BUF
 	LD		BC, DL_BUF_SIZE
-	LD		A, (recv_term_seen)
-	OR		A
-	JR		NZ, .close_grace
-	LD		A, (recv_line_state)
-	CP		1						; final "." (or ".\r") may be closed without LF
-	JR		Z, .close_grace
-	LD		DE, RECV_TIMEOUT
-	JR		.recv
-.close_grace
-	LD		DE, RAW_CLOSE_GRACE		; payload is complete; only CLOSED may remain
-.recv
-	CALL	NET.RAW_RECV			; raw UART pipe: no +IPD FIN-tail queue
-	JR		NC, .have_raw
-	; Some jesperl transparent sessions return to command mode silently without
-	; emitting CLOSED. After a complete gopher terminator and a short quiet grace,
-	; treat that as a probable peer close; RAW_FINISH verifies AT mode and falls
-	; back to guarded +++ if the socket is unexpectedly still transparent.
-	LD		A, (recv_term_seen)
-	OR		A
-	JR		NZ, .quiet_complete
-	LD		A, (recv_line_state)
-	CP		1
-	JR		NZ, .end				; timeout/error before a complete document
-.quiet_complete
-	LD		A, 1
-	LD		(recv_term_seen), A		; accept terminal "." at quiet EOF without LF
-	LD		A, 1
-	LD		(raw_closed), A
-	JR		.end
-.have_raw
+	LD		DE, 1000				; 1 s per NET.RECV poll
+	CALL	NET.RECV
+	JR		C, .end					; cancel / lost / dispatch failure
+	PUSH	AF						; A = 0 (NERR_OK) or NERR_CLOSED
 	LD		A, B
 	OR		C
-	JR		Z, .end					; no more data
+	JR		Z, .idle
+	XOR		A
+	LD		(recv_idle_count), A	; data arrived -> reset the idle budget
 	LD		HL, DL_BUF
-	PUSH	HL
-	PUSH	BC
-	CALL	WATCH_RAW_CLOSED		; peer CLOSED -> ESP has returned to command mode
-	POP		BC
-	POP		HL
-	LD		A, (recv_term_seen)
-	OR		A
-	JR		NZ, .after_data			; terminator owned: only drain until CLOSED
 	PUSH	HL
 	CALL	SCAN_GOPHER_TERM		; preserves BC; latches recv_term_seen
 	POP		HL
 	CALL	DOC.APPEND
-.after_data
-	LD		A, (raw_closed)
-	OR		A
-	JR		NZ, .end				; CLOSED token consumed; commands are safe again
+	POP		AF
+	CP		NERR_CLOSED
+	JR		Z, .end					; peer closed after delivering its tail
 	JR		.l
-.end
-	CALL	NET.RX_PAUSE			; transfer stopped/complete: slow UI work is safe
-	LD		HL, (recv_idle_cb)
-	LD		(WCOMMON.IDLE_CB), HL
-	CALL	SHOW_PROGRESS			; one final amount update (no per-block DSS stalls)
+.idle
+	POP		AF
+	CP		NERR_CLOSED
+	JR		Z, .end					; closed with nothing further to deliver
 	CALL	CLOCK_TICK
-	CALL	NET.RX_RESUME			; leave RX resumed for the CLOSE handshake
-	LD		A, (WCOMMON.CANCELLED)	; CF=1 only if the user cancelled the download
+	LD		HL, recv_idle_count
+	INC		(HL)
+	LD		A, (HL)
+	CP		RECV_IDLE_TICKS
+	JR		C, .l
+.end
+	CALL	SHOW_PROGRESS			; one final amount update
+	CALL	CLOCK_TICK
+	LD		A, (NET.net_cancelled)	; CF=1 only if the user cancelled the fetch
 	OR		A
 	RET		Z						; normal end (CF=0)
 	SCF
 	RET
-
-; Detect the ESP transparent-mode close notification "\r\nCLOSED". State spans
-; raw receive blocks. Once matched, ESP is back in command mode; normal AT
-; cleanup can be used instead of the guarded +++ escape. In: HL=data, BC=len.
-WATCH_RAW_CLOSED
-.l
-	LD		A, B
-	OR		C
-	RET		Z
-	LD		A, (HL)
-	INC		HL
-	DEC		BC
-	PUSH	HL
-	PUSH	BC
-	LD		C, A						; current byte
-	LD		A, (raw_close_state)
-	LD		L, A
-	LD		H, 0
-	LD		DE, RAW_CLOSED_TOK
-	ADD		HL, DE
-	LD		A, (HL)
-	CP		C
-	JR		NZ, .miss
-	LD		A, (raw_close_state)
-	INC		A
-	CP		RAW_CLOSED_LEN
-	JR		Z, .closed
-	LD		(raw_close_state), A
-	JR		.cont
-.miss
-	LD		A, C
-	CP		13						; a CR may start a fresh token
-	JR		Z, .cr
-	XOR		A
-	LD		(raw_close_state), A
-	JR		.cont
-.cr
-	LD		A, 1
-	LD		(raw_close_state), A
-	JR		.cont
-.closed
-	XOR		A
-	LD		(raw_close_state), A
-	LD		A, 1
-	LD		(raw_closed), A
-.cont
-	POP		BC
-	POP		HL
-	JR		.l
-
-RAW_CLOSED_TOK
-	DB 13, 10, "CLOSED"
-RAW_CLOSED_LEN EQU $ - RAW_CLOSED_TOK
 
 ; Scan one received block for the gopher terminator. The state crosses receive
 ; boundaries and accepts both CRLF and LF line endings. A terminator is a dot as
@@ -2026,9 +1934,10 @@ SHOW_DOC_STATUS
 	LD		A, (cur_kind)
 	OR		A
 	JP		NZ, SHOW_LOADED
-	; home page: warn up front if the network is not configured (NETUP not run),
-	; so the user knows before clicking a link - otherwise show the key help.
-	CALL	NET.CHECK_NET_UP		; fast env check (NET=WIFI / NET_ESP_HW), no UART
+	; home page: warn up front if the network is not configured (env NET unset
+	; or not WIFI/RTL), so the user knows before clicking a link - otherwise
+	; show the key help.
+	CALL	NET.CHECK_NET_UP		; fast env check, no DLL/hardware access
 	JR		C, .nonet
 	LD		HL, MSG_STATUS
 	JP		SET_STATUS
@@ -2168,24 +2077,18 @@ IS_BIN_TYPE
 	RET
 BIN_TYPES		DB "95gIs;dp", 0
 
-; Download DL_SEL to DL_PATH through normal ESP-AT +IPD frames. Each frame
-; supplies an exact payload length; EOF is accepted only when TCP.RECEIVE
-; reports the peer's CLOSED notification.
+; Download DL_SEL to DL_PATH. NET.RECV is length-framed and reports a
+; reliable NERR_CLOSED (with any trailing bytes attached) - the UNET DLL owns
+; all tail/backpressure protection internally, so unlike the old ESP-AT-kit
+; version this loop needs no drain-gate/accumulator of its own.
 ;
-; The WHOLE body is first received into a fresh GetMem page chain (the visible
+; The WHOLE body is still received into a fresh GetMem page chain (the visible
 ; page is detached DOC.SAVE_STATE-style for the duration) and written to FAT
-; only after CLOSED. Rationale (proven by byte-comparing broken downloads
-; against their originals - every one was an exact prefix cut at a 1460-byte
-; frame boundary): jesperl's ESP-AT discards its queued +IPD frames when the
-; peer's FIN is processed while RTS blocks the UART relay. Any FAT write pauses
-; RTS for tens of ms, so a mid-transfer write is a roulette window for the tail
-; of the file. With no disk I/O during the network phase the ESP drains at full
-; line rate and FIN almost always finds an empty queue - the same reason the
-; kit's wget holds its final 8 KB in RAM (we just can't know where "final"
-; starts without Content-Length, so we hold everything; cap 256 KB).
+; only after the close, so a mid-transfer FAT write can never race the network
+; phase; DL_MIDFLUSH still exists for files over the 256 KB page-chain cap.
 DOWNLOAD
 	XOR		A
-	LD		(WCOMMON.CANCELLED), A	; clear any stale cancel flag
+	LD		(NET.net_cancelled), A	; clear any stale cancel flag
 	LD		(dl_disk_err), A
 	LD		(dl_partial), A
 	LD		HL, 0
@@ -2203,31 +2106,26 @@ DOWNLOAD
 .haveinit
 	LD		HL, DL_HOST
 	LD		DE, DL_PORT
-	CALL	NET.CONNECT				; active +IPD (CIPMODE=0): the kit's RES_NOT_CONN
-	JP		C, .e_conn				; is a reliable EOF (transparent's token was flaky)
+	CALL	NET.CONNECT
+	JP		C, .e_conn
 	LD		HL, DL_DIRMK			; create the destination before asking for data
 	CALL	FILE.ENSURE_DIR
 	LD		HL, DL_PATH
 	CALL	FILE.CREATE
 	JP		C, .e_file
-	LD		A, (WIFI.UART_RX_PROFILE)
-	CP		UART_RX_PROFILE_222
-	JP		Z, .passive222			; pull directly to disk; never touches DOC banks
 	; Detach the visible page; the download body gets its own page chain.
 	LD		HL, LINE_BUF			; free during downloads (no rendering runs)
 	CALL	DOC.SAVE_STATE
 	CALL	DOC.NEW
 	CALL	DOC.RESERVE				; first page now - no GetMem once data streams
 	JP		C, .e_mem
-	CALL	NET.ACTIVE_PREP			; clear LSR/parser state; RTS up for the '>' prompt
-	JP		C, .e_send				; 2.2.2 passive-receive setup failed
 	LD		HL, MSG_RECEIVING_ZERO	; safe DSS draw: selector has not been sent yet
 	CALL	SET_STATUS
 	LD		HL, DL_SEL
 	CALL	BUILD_REQ_HL			; HL=REQ_BUF, BC=len
 	CALL	NET.SEND
 	JP		C, .e_send
-	CALL	DL_RECV_LOOP			; whole body -> page chain via active +IPD
+	CALL	DL_RECV_LOOP			; whole body -> page chain
 	PUSH	AF						; close the socket on success, timeout, or cancel
 	CALL	INP_WAIT_RELEASE		; a held Esc must not abort CLOSE or leak into Quit?
 	CALL	NET.CLOSE
@@ -2246,96 +2144,12 @@ DOWNLOAD
 	OR		A
 	RET
 
-; ESP-AT 2.2.2 has passive receive. Pull bounded blocks into DL_BUF and write
-; each one immediately: ESP retains the rest in its socket buffer, so slow FAT
-; writes cannot lose UART data. This deliberately bypasses the DOC page chain
-; and the final "Writing N KB" pass used by the unchanged 2.2.1 algorithm.
-.passive222
-	CALL	LOAD_PASSIVE_OVERLAY
-	JR		C, .p_send
-	CALL	NET.ACTIVE_PREP			; selects CIPRECVMODE=1 only for profile 2.2.2
-	JR		C, .p_send
-	LD		HL, MSG_RECEIVING_ZERO
-	CALL	SET_STATUS
-	LD		HL, DL_SEL
-	CALL	BUILD_REQ_HL
-	CALL	NET.SEND
-	JR		C, .p_send
-	CALL	DL_RECV_FILE_222
-	PUSH	AF
-	CALL	INP_WAIT_RELEASE
-	CALL	NET.CLOSE				; also restores CIPRECVMODE=0
-	POP		AF
-	JR		C, .p_stream
-	CALL	FILE.CLOSE
-	JP		C, .e_close
-	OR		A
-	RET
-
-.p_stream
-	CALL	INVALIDATE_NET
-	LD		A, (WCOMMON.CANCELLED)
-	OR		A
-	JR		NZ, .p_discard
-	LD		A, (dl_disk_err)
-	OR		A
-	JR		NZ, .p_discard
-	; A clean prefix is already on disk. Keep the established retry/keep choice.
-	LD		A, (recv_lo)
-	LD		D, A
-	LD		A, (recv_lo + 1)
-	OR		D
-	LD		D, A
-	LD		A, (recv_hi)
-	OR		D
-	LD		D, A
-	LD		A, (recv_hi + 1)
-	OR		D
-	JR		Z, .p_discard
-	CALL	CONFIRM_KEEP
-	JR		C, .p_keep
-	CALL	FILE.CLOSE
-	LD		HL, DL_PATH
-	CALL	FILE.DELETE
-	JP		DOWNLOAD
-.p_keep
-	LD		A, 1
-	LD		(dl_partial), A
-	CALL	FILE.CLOSE
-	JP		C, .e_close
-	OR		A
-	RET
-
-.p_send
-	CALL	NET.CLOSE
-	LD		A, 3
-	LD		(dl_disk_err), A
-.p_discard
-	CALL	FILE.CLOSE
-	LD		HL, DL_PATH
-	CALL	FILE.DELETE
-	LD		A, (WCOMMON.CANCELLED)
-	OR		A
-	JP		NZ, .e_cancel
-	LD		A, (dl_disk_err)
-	CP		1
-	JP		Z, .e_disk
-	CP		2
-	JP		Z, .e_uart
-	CP		3
-	JR		Z, .p_send_msg
-	LD		HL, ERR_INCOMPLETE
-	JP		.fail
-.p_send_msg
-	LD		HL, ERR_SEND
-	JP		.fail
-
 .e_wr
 	LD		A, 1
 	LD		(dl_disk_err), A
 .e_stream
 	CALL	INVALIDATE_NET			; parser/socket may be desynchronised; re-init next op
-	LD		A, (WCOMMON.CANCELLED)
+	LD		A, (NET.net_cancelled)
 	OR		A
 	JR		NZ, .discard			; user aborted: the partial is unwanted
 	LD		A, (dl_disk_err)
@@ -2379,7 +2193,7 @@ DOWNLOAD
 	CALL	FILE.CLOSE
 	LD		HL, DL_PATH
 	CALL	FILE.DELETE				; never leave an untrusted partial file behind
-	LD		A, (WCOMMON.CANCELLED)
+	LD		A, (NET.net_cancelled)
 	OR		A
 	JR		NZ, .e_cancel
 	LD		A, (dl_disk_err)
@@ -2401,10 +2215,10 @@ DOWNLOAD
 	LD		HL, MSG_MEM_ERR
 	JR		.fail
 .e_init
-	LD		HL, ERR_INIT
+	CALL	INIT_ERR_TEXT			; ERR_INIT + the NET.INIT breadcrumb tail
 	JP		FETCH_ERR
 .e_conn
-	LD		HL, ERR_CONN			; RAW_CONNECT already restored command mode on fail
+	LD		HL, ERR_CONN
 	JR		.fail
 .e_mem
 	CALL	NET.CLOSE
@@ -2444,45 +2258,20 @@ DL_RESTORE_DOC
 	POP		AF
 	RET
 
-; Receive the whole body into the download page chain over the ACTIVE +IPD pipe
-; (CIPMODE=0). EOF is the kit's RES_NOT_CONN - a genuine peer CLOSED and the same
-; close signal wget relies on. (Transparent CIPMODE=1 was a regression: its
-; byte-scanned "\r\nCLOSED" token often never arrived on this firmware, so the
-; download hung then failed as "incomplete"; active +IPD framing restores a
-; dependable close - the user confirmed downloads were more stable without it.)
-;
-; TAIL PROTECTION (the ESP-AT V2.2.1 FIN-drop). This firmware discards up to
-; ~1-2 KB of un-relayed +IPD data when the peer's FIN is processed WHILE RTS is
-; deasserted - i.e. during a slow append. The kit's own wget documents the same
-; drop and beats it by holding the last 8 KB in RAM with RTS asserted across the
-; close (it knows the end from Content-Length; gopher has none). We get the same
-; "RTS asserted across the close" without a length: bursts ACCUMULATE in DL_BUF
-; with RTS held, and DOC.APPEND (the only RTS-deasserting step) runs ONLY when a
-; short DL_CONT_TIMEOUT read finds no next frame - the ESP is momentarily DRAINED,
-; so that gap has nothing to drop - or mid-stream when the buffer fills (safe:
-; data still flowing, FIN not yet pending). A standard gopher server sends the
-; whole body then closes, so the last bytes always drain before the FIN and the
-; RES_NOT_CONN is then read gap-free. A confirmed close is thus always byte-exact;
-; a stall fails visibly (incomplete -> retry/keep), never silent corruption.
-; Each read is capped below TCP_ACTIVE_IPD_MAX so the kit returns after one frame
-; without its multi-frame peek - the following read then observes CLOSED cleanly.
-; Progress is drawn per burst (VRAM, no gap) so it advances < every KB.
-; Out: CF=0 + raw_closed=1 on a clean close; CF=1 on timeout/cancel/UART/mem error.
-DL_RECV_CAP		EQU 1499				; < TCP_ACTIVE_IPD_MAX: one +IPD frame per read
-DL_CONT_TIMEOUT	EQU 250					; ms silence that proves the ESP is drained
-DL_ACC_HIGH		EQU DL_BUF_SIZE - DL_RECV_CAP	; flush before the next frame can't fit
+; Receive the whole body into the download page chain. NET.RECV is length-
+; framed with a reliable NERR_CLOSED (any trailing bytes on close are
+; included) - the UNET DLL owns tail/backpressure protection internally, so
+; unlike the old ESP-AT-kit version each received chunk is simply appended
+; immediately; no accumulate/drain-gate of our own is needed.
+; Out: CF=0 on a clean close; CF=1 on timeout/cancel/lost-data/mem error
+; (dl_disk_err set for the latter two; NET.net_cancelled set on cancel).
+DL_IDLE_TICKS	EQU 15					; ~15 x 1 s of pure silence -> incomplete
 DL_RECV_LOOP
 	XOR		A
-	LD		(raw_closed), A
-	LD		(TCP.LSR_ACCUM), A		; own the receive's UART-error accounting
-	LD		HL, (WCOMMON.IDLE_CB)
-	LD		(recv_idle_cb), HL
-	LD		HL, 0
-	LD		(WCOMMON.IDLE_CB), HL	; no DSS/BIOS calls inside the kit's byte waits
+	LD		(dl_idle_count), A
 .l
 	; Over the 256 KB page-chain cap? Flush whole sectors to disk and continue
-	; (unbounded file size). RX is paused for the write; the ESP backpressures the
-	; server via the TCP window - mid-stream, so no FIN is pending.
+	; (unbounded file size) - mid-stream, well clear of any close.
 	LD		A, (DOC.doc_npages)
 	CP		DOC_MAX_PAGES
 	JR		C, .roomok
@@ -2494,110 +2283,52 @@ DL_RECV_LOOP
 	CALL	DL_MIDFLUSH				; sets dl_disk_err itself on failure
 	JP		C, .fail
 .roomok
-	LD		HL, 0
-	LD		(dl_comb), HL			; fill = 0
-	LD		A, 1
-	LD		(dl_first), A			; first read of the window waits the full timeout
-.acc
-	CALL	NET.RX_RESUME			; RTS asserted throughout the accumulation
-	LD		DE, (dl_comb)			; fill
 	LD		HL, DL_BUF
-	ADD		HL, DE					; HL = DL_BUF + fill = receive dest
-	PUSH	HL
-	LD		HL, DL_BUF_SIZE
-	OR		A
-	SBC		HL, DE					; HL = free = SIZE - fill
-	LD		DE, DL_RECV_CAP
-	OR		A
-	SBC		HL, DE					; free - CAP
-	JR		NC, .usecap				; free >= CAP -> read a whole CAP
-	ADD		HL, DE					; free < CAP (defensive) -> take the remaining free
-	JR		.haveroom
-.usecap
-	LD		HL, DL_RECV_CAP
-.haveroom
-	LD		B, H
-	LD		C, L					; BC = room (<= CAP, never overruns DL_BUF)
-	POP		HL						; HL = dest
-	LD		A, (dl_first)
-	OR		A
-	LD		DE, RECV_TIMEOUT		; first: wait the whole timeout for the response
-	JR		NZ, .have_to
-	LD		DE, DL_CONT_TIMEOUT		; continuation: short - a miss proves drained
-.have_to
-	CALL	NET.RECV				; active TCP.RECEIVE; polls Esc/Ctrl+Z internally
-	PUSH	AF
-	CALL	NET.RX_PAUSE			; drop RTS immediately after the read (wget order)
-	POP		AF
-	JR		C, .rx_end				; CF=1: CLOSED / timeout / cancel
-	LD		HL, (dl_comb)
-	ADD		HL, BC
-	LD		(dl_comb), HL			; fill += received
+	LD		BC, DL_BUF_SIZE
+	LD		DE, 1000				; 1 s per NET.RECV poll
+	CALL	NET.RECV
+	JR		C, .rx_end
+	PUSH	AF						; A = 0 (NERR_OK) or NERR_CLOSED
+	LD		A, B
+	OR		C
+	JR		Z, .idle
 	XOR		A
-	LD		(dl_first), A			; subsequent reads are continuations
-	CALL	DL_PROGRESS_ACC			; per-burst VRAM progress (no append, no gap)
-	LD		HL, DL_ACC_HIGH
-	LD		DE, (dl_comb)
-	OR		A
-	SBC		HL, DE
-	JR		C, .flush				; accumulator near full -> flush now
-	JR		.acc					; room remains -> keep the pipe draining
-.rx_end
-	; NET.RECV returned CF=1: A = result code.
-	CP		RES_NOT_CONN
-	JR		Z, .closed				; genuine peer CLOSED = reliable EOF
-	LD		A, (WCOMMON.CANCELLED)
-	OR		A
-	JR		NZ, .silent				; Esc/Ctrl+Z
-	; Genuine silence (RES_RS_TIMEOUT). New data this window means the ESP just
-	; drained: flush it (safe - nothing queued to drop) and wait for more or the
-	; close. Nothing new means the stream stalled with no CLOSED -> incomplete.
-	LD		HL, (dl_comb)
-	LD		A, H
-	OR		L
-	JR		Z, .silent
-	LD		BC, (dl_comb)
-	CALL	DL_APPEND_RUN
+	LD		(dl_idle_count), A		; data arrived -> reset the idle budget
+	CALL	DL_APPEND_RUN			; BC = received length (unchanged since NET.RECV)
 	JR		C, .nomem
-	JP		.l						; new window; its first read waits the full timeout
-.closed
-	; A latched UART RX error taints the whole stream (LSR accumulates) -> reject.
-	LD		A, (TCP.LSR_ACCUM)
-	AND		LSR_OE | LSR_PE | LSR_FE | LSR_BI | LSR_RCVE
-	JR		NZ, .uart_fail
-	LD		BC, (dl_comb)
-	CALL	DL_APPEND_RUN			; append the final accumulated bytes
-	JR		C, .nomem
-	LD		A, 1
-	LD		(raw_closed), A			; clean EOF -> byte-exact
-	JR		.done
-.flush
-	LD		BC, (dl_comb)
-	CALL	DL_APPEND_RUN
-	JR		C, .nomem
+	POP		AF
+	CP		NERR_CLOSED
+	JR		Z, .closed
 	JP		.l
+.idle
+	POP		AF
+	CP		NERR_CLOSED
+	JR		Z, .closed				; closed with nothing further to deliver
+	CALL	CLOCK_TICK
+	LD		HL, dl_idle_count
+	INC		(HL)
+	LD		A, (HL)
+	CP		DL_IDLE_TICKS
+	JR		C, .l
+	JR		.fail					; too long silent -> incomplete
+.rx_end
+	; CF=1: A = NET.NERR_CANCEL / NET.NERR_RXLOST / a dispatch failure
+	CP		NET.NERR_RXLOST
+	JR		Z, .uart_fail
+	JR		.fail
+.closed
+	OR		A						; CF=0
+	RET
 .nomem
+	POP		AF						; discard the NET.RECV status pushed above
 	LD		A, 4
 	LD		(dl_disk_err), A
 	JR		.fail
 .uart_fail
 	LD		A, 2
 	LD		(dl_disk_err), A
-	JR		.fail
-.silent
-	LD		A, RES_RS_TIMEOUT
-	LD		(dl_net_err), A
 .fail
-	CALL	NET.RX_RESUME			; leave RTS asserted: NET.CLOSE's CIPCLOSE needs a
-	LD		HL, (recv_idle_cb)		; reply, and the next connect (RAW or active) too
-	LD		(WCOMMON.IDLE_CB), HL
 	SCF
-	RET
-.done
-	CALL	NET.RX_RESUME			; the loop's last act was RX_PAUSE; restore RTS so
-	LD		HL, (recv_idle_cb)		; the ESP can answer NET.CLOSE and the next fetch
-	LD		(WCOMMON.IDLE_CB), HL
-	OR		A						; CF=0
 	RET
 
 ; Append BC bytes from DL_BUF to the document (map WIN3 + LDIR), advance the
@@ -2616,9 +2347,8 @@ DL_APPEND_RUN
 	SCF
 	RET		NZ						; page cap / GetMem failure
 	CALL	DL_ADD					; received total += BC
-	; Progress DURING receive is VRAM-only: a DSS draw here runs with RTS
-	; asserted and, like the page loop's deferred drawing, could expose the
-	; stream to a mid-draw close. The VRAM paint is DI-guarded and sub-ms.
+	; Progress DURING receive is VRAM-only (no DSS/BIOS call): a DSS draw here
+	; would cost tens of ms mid-stream. The VRAM paint is DI-guarded and sub-ms.
 	LD		HL, 0
 	LD		(dl_pending), HL		; appended now -> counted in recv_lo, no pending
 	CALL	DL_PROGRESS_RX
@@ -2628,8 +2358,8 @@ DL_APPEND_RUN
 ; Mid-transfer chain flush for files larger than the 256 KB page chain: write
 ; the chain's WHOLE SECTORS out, carry the sub-sector tail (0..511 bytes) into
 ; a fresh chain, and keep receiving - so every mid-file FAT write stays
-; 512-aligned. RX is paused for the whole write - the ESP's TCP window closes
-; and the server simply waits.
+; 512-aligned. RX is paused for the whole write (a no-op unless the backend
+; advertises UNET_CAP_RXFLOW) and resumed once the write completes.
 ; Out: CF=1 on failure (dl_disk_err: 1 = write error, 4 = no memory).
 DL_MIDFLUSH
 	CALL	NET.RX_PAUSE
@@ -2647,6 +2377,7 @@ DL_MIDFLUSH
 	LD		(dw_rem), HL			; ...the tail carries over (0..511)
 	CALL	DL_WRITE_DOC
 	JR		C, .werr
+	CALL	NET.RX_RESUME			; balance the RX_PAUSE above before receiving resumes
 	LD		BC, (dw_rem)
 	LD		A, B
 	OR		C
@@ -2756,21 +2487,11 @@ DL_ADD
 	LD		(recv_hi), HL
 	RET
 
-; Per-burst progress during accumulation: show recv_lo (appended) plus the
-; bytes accumulated this window but not yet appended (the whole fill). VRAM only
-; (no gap). Clobbers A/BC/DE/HL.
-DL_PROGRESS_ACC
-	LD		HL, (dl_comb)			; fill = un-appended bytes this window
-	LD		(dl_pending), HL
-	CALL	DL_PROGRESS_RX
-	LD		HL, 0
-	LD		(dl_pending), HL		; leave it zeroed for the flush/final draw
-	RET
-
 ; In-stream progress. Paints "Receiving <n> KB" straight into text VRAM: no
-; DSS/BIOS call and no RTS pause. The displayed byte total is recv_lo/recv_hi
-; (appended) + dl_pending (accumulated-but-not-appended). The ~0.2 ms VRAM
-; burst is covered by the TL16C550 auto-RTS (AFE). Clobbers A/BC/DE/HL.
+; DSS/BIOS call, sub-ms. The displayed byte total is recv_lo/recv_hi (appended)
+; + dl_pending (always 0 in the current DL_RECV_LOOP, which appends every
+; chunk immediately - the field is kept for a future accumulating caller).
+; Clobbers A/BC/DE/HL.
 DL_PROGRESS_RX
 	LD		HL, (recv_lo)			; total = recv_lo + dl_pending ...
 	LD		DE, (dl_pending)
@@ -2863,7 +2584,7 @@ DLP_DRAW
 	EI
 	RET
 
-; WCOMMON.INIT_VMODE has already selected 80x32. DSS GetVMod returns the active
+; INIT_VMODE has already selected 80x32. DSS GetVMod returns the active
 ; screen in B (0/1). In this mode BIOS H_BEG is #01 for screen 0 and #81 for
 ; screen 1; our status text starts at logical column 1, hence PORT_Y #02/#82.
 ; Store both values once at startup. No probing or DSS call is needed while a
@@ -3109,27 +2830,21 @@ EXEC_PROGRAM
 	LD		A, DSS_VMOD_T80			; re-assert 80x32 text mode
 	LD		C, DSS_SETVMOD
 	RST		DSS
-	; The child ran with the ISA card in an unknown state (DSS/Exec and the viewer
-	; may have touched the ISA window / UART), so drop our cached "card is up"
-	; flag; the next fetch re-runs NET.INIT (re-init UART + AT, drain stale bytes,
-	; no ISA_RESET so the NETUP Wi-Fi session is preserved). Without this the next
-	; TCP.OPEN talks to a disturbed card -> "Connect failed".
+	; The child may have used the network itself (or reprogrammed the card
+	; directly), so drop our cached "session is up" flag; the next fetch
+	; re-runs NET.INIT (best-effort NETDONE + NETINIT on the still-loaded DLL).
 	CALL	INVALIDATE_NET
 	POP		AF
 	RET
 
-; Drop the cached "ESP is initialised" flag so the next fetch re-runs NET.INIT
-; (full UART re-init + AT + drain, no ISA_RESET -> Wi-Fi session preserved). This
-; is a RECOVERY: a cached net_inited=1 makes a fetch skip init and reuse the open
-; UART/ESP session; if that session has gone stale the connect hangs on
-; "Fetching..." and, because the flag stays 1, never recovers ("link dies"). A
-; forced re-init clears any stale UART/ESP state.
-;   NOTE: this is NOT because file I/O corrupts the card. The kit brackets every
-;   UART access with ISA_OPEN/ISA_CLOSE (which save/restore WIN3), so a file
-;   read/write between network ops is safe - that's exactly why a chunked download
-;   (interleaved RECV + FILE.WRITE on one open socket) works. EXEC_PROGRAM re-inits
-;   for a different reason (a child program can reprogram the ISA card directly).
-; Trashes A.
+; Drop the cached "network session is up" flag (net_inited) so the next fetch
+; re-runs NET.INIT: it does not reload/unload the DLL (dll_loaded is untouched
+; and libman.l_free is not called), it just repeats NETDONE + NETINIT on the
+; backend still resident in WIN1. This is a RECOVERY: a cached net_inited=1
+; makes a fetch skip straight to CONNECT and reuse the existing session; if
+; that session has gone stale (idle time on a local page, or a child program
+; touching the card) the connect can hang, and without this it would never
+; recover. Trashes A.
 INVALIDATE_NET
 	XOR		A
 	LD		(net_inited), A
@@ -3284,9 +2999,10 @@ PARSE_ROW
 	LD		(p_port), HL
 	; gopher+ servers (e.g. nihirash.net) append a 5th "\t+" field after the port
 	; to flag gopher+ support. Terminate the port field too so it does not inherit
-	; that "\t+" tail - otherwise PORT_CUR becomes "70\t+", the AT+CIPSTART port is
-	; malformed, and every link on such a menu fails to connect. (For a normal menu
-	; the port is the last field: SCAN_FIELD hits the line NUL and changes nothing.)
+	; that "\t+" tail - otherwise PORT_CUR becomes "70\t+", NET.CONNECT's port
+	; argument is malformed, and every link on such a menu fails to connect. (For
+	; a normal menu the port is the last field: SCAN_FIELD hits the line NUL and
+	; changes nothing.)
 	CALL	SCAN_FIELD
 	RET
 
@@ -3668,21 +3384,6 @@ DRAW_HEADER
 ; loop spin; reads DSS SYSTIME (#21: H=hours, L=minutes, B=seconds, decimal) and
 ; only repaints when the second changes (clk_last holds the last drawn second; the
 ; header redraw sets it to 0xFF to force a refresh).
-; ------------------------------------------------------
-; IDLE_CB entry point. The network kit invokes IDLE_CB from inside its AT/receive
-; byte-waits (CHECK_CANCEL_IN_ISA) and restores only AF/BC/DE/HL around the call,
-; NOT IX/IY - so we preserve IX/IY here in case SYSTIME/PChars in the clock draw
-; clobber a pointer the kit's receive loop relies on. (Stack depth is no longer a
-; concern: the runtime stack lives in the WIN2 page at RUN_STACK_TOP, not under
-; the lib BSS.)
-CLOCK_TICK_CB
-	PUSH	IX
-	PUSH	IY
-	CALL	CLOCK_TICK
-	POP		IY
-	POP		IX
-	RET
-
 CLOCK_TICK
 	LD		C, DSS_SYSTIME
 	RST		DSS						; H=hours, L=minutes, B=seconds
@@ -4016,7 +3717,7 @@ MSG_BANNER		DB "Gopher browser v.", APP_VERSION, 13, 10, 0
 MSG_RUNEXT		DB "Running external viewer:", 13, 10, 0
 MSG_CRLF		DB 13, 10, 0
 MSG_STATUS		DB "Up/Dn move  Enter open  Bksp back  ^G addr  ^B marks  ^D add  Esc/F10 quit", 0
-MSG_NONET		DB "Wi-Fi not up - run NETUP first (you can still browse the home page)", 0
+MSG_NONET		DB "Network not set up - run NETUP (Wi-Fi) or NETCFG -i + IFUP (RTL)", 0
 MSG_CONFIRM_QUIT DB "Quit?  Y = yes,  any other key = no", 0
 MSG_FETCHING	DB "Fetching...", 0
 MSG_ASK_RELOAD	DB "Page incomplete.  R = reload,  any other key = show what loaded", 0
@@ -4053,12 +3754,12 @@ MSG_BM_NONE		DB "Nothing to bookmark (open a gopher page first).", 0
 MSG_BM_FAIL		DB "Could not write the bookmarks file.", 0
 MSG_EXEC_FAIL	DB "Could not launch the associated program.", 0
 MSG_MEM_ERR		DB "Cannot allocate work page.", 0
-ERR_INIT		DB "Network init failed - run NETUP first.", 0
-ERR_CONN		DB "Connect failed (check host / port / Wi-Fi).", 0
+ERR_INIT		DB "Net init failed - run NETUP/NETCFG.", 0
+ERR_CONN		DB "Connect failed (check host / port / network).", 0
 ERR_SEND		DB "Send failed.", 0
 ERR_EMPTY		DB "No data received.", 0
 ERR_DISK		DB "Disk write failed (out of space?).", 0
-ERR_UART		DB "UART receive error; partial file removed. Check cable/baud/flow control.", 0
+ERR_UART		DB "Data lost during receive; partial file removed. Check the link.", 0
 ERR_INCOMPLETE	DB "Transfer ended before the server closed it; partial file removed.", 0
 ERR_CANCEL		DB "Cancelled.", 0
 MSG_WRITING		DB "Writing ", 0
@@ -4091,56 +3792,34 @@ BM_EMPTY_LEN	EQU BM_EMPTY_END - BM_EMPTY_DOC
 	INCLUDE "net.asm"
 	INCLUDE "file.asm"
 	INCLUDE "cfg.asm"
+	INCLUDE "util_local.asm"
 
-; The network kit anchors its BSS chain immediately after the WIN1 image
-; (RS_BUFF = post-image RAM). As this app grew, netcfg's 2 KB CFG_BUFF was pushed
-; PAST 0x8000 (to ~0x85BA), so it straddled the WIN1/WIN2 page boundary AND
-; overlapped STAGE - corrupting the receive buffer and killing the link (the
-; "fetching hangs / connection dies" bug). netcfg reads NET.CFG into CFG_BUFF as
-; one contiguous block, so it must live wholly within a single physical page and
-; not collide with a live buffer. Relocate the whole netcfg BSS into the DL_BUF
-; region (4 KB, entirely in the WIN2 page): netcfg's config load runs once inside
-; NET.INIT, strictly BEFORE any receive/download touches DL_BUF, so their
-; lifetimes are disjoint and aliasing is safe. RS_BUFF stays in WIN1; the small
-; ESP-TCP command/parser scratch overlays STAGE in WIN2. (The kit exposes these
-; overrides for exactly this situation.)
-	DEFINE NETCFG_BSS_BASE_OVERRIDE		; tell netcfg_lib NOT to self-place its BSS
-NETCFG_BSS_BASE		EQU DL_BUF			; ...we place it here (in the WIN2 page) instead
-	INCLUDE "netcfg_lib.asm"			; defines _NETCFG (needed by wcommon)
-	INCLUDE "wcommon.asm"
-	INCLUDE "dss_error.asm"
-	INCLUDE "isa.asm"
-	; TCP command/parser scratch is live only during networking, while STAGE is not
-	; used by DSS file/config streaming. Keep it out of the now-full WIN1 image.
-	DEFINE ESP_TCP_BSS_BASE_OVERRIDE
-ESP_TCP_BSS_BASE	EQU STAGE
-	INCLUDE "esp_tcp.asm"
-	INCLUDE "esplib.asm"				; anchors the lib BSS chain; keep last
-
-; Guard rails against network scratch colliding with code/runtime buffers.
-; RS_BUFF remains after the WIN1 image; TCP and netcfg scratch use disjoint WIN2
-; overlays (STAGE and DL_BUF respectively) and must fit wholly inside them.
-; If the image grows enough to break either, the build fails here instead of at run.
-	ASSERT TCP.TCP_BSS_END <= STAGE + STAGE_SIZE	; TCP scratch fits its WIN2 overlay
-	ASSERT WIFI.RS_BUFF + RS_BUFF_SIZE <= 0x8000	; ESP response BSS remains inside WIN1
-	ASSERT NETCFG.NETCFG_BSS_END <= DL_BUF + DL_BUF_SIZE	; netcfg BSS must fit inside DL_BUF
-	ASSERT NETCFG_BSS_BASE >= 0x8000		; ...and live wholly in the WIN2 page (no boundary split)
 	ASSERT MAIN.HR_SIZE - MAIN.HR_DOCSTATE == DOC.DOC_STATE_SIZE	; history copies the complete DOC descriptor
 	ASSERT HIST_DATA + MAIN.HIST_MAX * MAIN.HR_SIZE <= CFG_LINE	; history must not grow into CFG_LINE / DL_SEL
 
-; End of the emitted image. The EXE header's LOADER field = IMAGE_END - LOAD_ADDR,
-; The passive overlay follows in the file but is not loader-mapped into WIN1;
-; INDEX.GPH is appended after the overlay.
-IMAGE_END
-
-PASSIVE_OVERLAY_FILE
-	DISP LINE_BUF
-PASSIVE_OVERLAY_RUN
-	INCLUDE "passive_overlay.asm"
-PASSIVE_OVERLAY_RUN_END
+; libman (loader + resident state) assembled as if it already sat at its WIN2
+; run address (LIBMAN_W2_BASE) via a DISP block; the bytes are emitted here,
+; inline in the WIN1 image (BEFORE the IMAGE_END label, so the EXE header's
+; LOADER field covers them and DSS loads them like any other code), and START
+; copies them to LIBMAN_W2_BASE with a plain LDIR - no file I/O. See the
+; console.inc LIBMAN_W2_BASE comment and net.asm for why libman itself - not
+; just the DLL - must live outside WIN1.
+LIBMAN_STORE
+	DISP LIBMAN_W2_BASE
+	DEFINE LIBMAN_MAX_LIBS 1			; one DLL loaded at a time (ESP or RTL)
+	DEFINE LIBMAN_NO_LEGACY_API		; keep only LIBMAN.* - no bare l_load/l_call/...
+	DEFINE LIBMAN_DIAGNOSTICS			; l_load_stage/l_init_status for NET.INIT errors
+	DEFINE LIBMAN_APP_DIR EXE_DIR		; reuse our own EXE-dir buffer (filled by INIT_PATHS)
+	INCLUDE "libman.asm"
+LIBMAN_STORE_RUN_END
 	ENT
-PASSIVE_OVERLAY_FILE_END
-PASSIVE_OVERLAY_SIZE EQU PASSIVE_OVERLAY_RUN_END - PASSIVE_OVERLAY_RUN
-	ASSERT PASSIVE_OVERLAY_SIZE <= 0x280	; LINE_BUF through 0x9FFF (640 B)
+LIBMAN_STORE_SIZE EQU LIBMAN_STORE_RUN_END - LIBMAN_W2_BASE
+	ASSERT LIBMAN_STORE_SIZE <= (LIBMAN_W2_END - LIBMAN_W2_BASE)
+
+; End of the DSS-loaded image. The EXE header's LOADER field = IMAGE_END -
+; LOAD_ADDR (which includes LIBMAN_STORE above); INDEX.GPH is appended in the
+; file right after this point (HOME_OFFSET) and is read at startup through the
+; still-open loader-EXE handle, never loaded into WIN1 by DSS.
+IMAGE_END
 
 	END MAIN.START

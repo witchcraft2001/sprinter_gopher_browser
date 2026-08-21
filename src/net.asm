@@ -1,610 +1,447 @@
 ; ======================================================
-; NET - network HAL. Backend selected at build time.
-; Phase 2: ESP-AT (Sprinter-WiFi) backend, wrapping the network-kit libs.
-; The NE2000/RTL8019A backend (Phase 4) will provide the same NET.* entries.
+; NET - network HAL, v0.2.0: runtime UNET-ABI DLL (UNETESP.DLL / UNETRTL.DLL)
+; loaded via libman instead of a statically-linked ESP-AT kit. The backend is
+; chosen at runtime by the env var NET (WIFI -> UNETESP.DLL, RTL ->
+; UNETRTL.DLL), exactly like sources/weather-forecast and sources/ftpclient.
+;
+; Window discipline: the DLL is loaded into WIN1 (l_load A=1) - WIN1 holds all
+; of gopher's own code, but it is displaced only for the narrow span inside a
+; single l_call/l_load, and libman restores it (raw OUT of the saved physical
+; page) before returning - see console.inc's LIBMAN_W2_BASE comment. libman
+; itself (the thing actually executing while WIN1 is displaced) is therefore
+; WIN2-resident: LIBMAN_STORE, assembled via a DISP block in main.asm, is
+; LDIR'd to LIBMAN_W2_BASE once at startup.
 ; ======================================================
+
+	INCLUDE "unet.inc"
 
 	MODULE NET
 
-	IFDEF BACKEND_ESP
+; Local result codes (returned in A when CF=1), distinct from the UNET
+; NERR_* range (0..15) so callers can tell a libman/config-level failure
+; apart from a UNET-level one.
+NERR_DLL_LOAD		EQU 32		; libman could not load the DLL (see LIBMAN.l_reason)
+NERR_DLL_ABI		EQU 33		; DLL loaded but ABI major/caps are incompatible
+NERR_DLL_CALL		EQU 34		; libman dispatch failure (bad handle/window)
+NERR_NOCONFIG		EQU 35		; env NET missing/not WIFI or RTL
+NERR_SHORT_SEND	EQU 36		; DLL confirmed fewer bytes sent than requested
 
-TCP_OPEN_RETRY_DELAY	EQU 500			; ms settle before the second TCP.OPEN attempt
-RAW_RX_SPIN_BUDGET	EQU 200			; bridge gaps between raw UART FIFO bursts
+; INIT failure stages, recorded in init_stage and shown by DIAG_TEXT. A bring-up
+; failure is otherwise indistinguishable from the outside ("init failed" covers
+; a missing DLL, an ABI mismatch and a dead link alike), so the status bar gets
+; the stage plus libman's own reason/DSS-error breadcrumbs.
+IST_ENV			EQU 1		; env NET unset or not WIFI/RTL
+IST_LOAD		EQU 2		; LIBMAN.l_load failed (see lr/ls/dss in DIAG_TEXT)
+IST_GETCAPS		EQU 3		; GETCAPS dispatch/status failure
+IST_ABI			EQU 4		; ABI major mismatch (code = the major byte seen)
+IST_CAPS		EQU 5		; no UNET_CAP_TCP (code = caps low byte seen)
+IST_STATUS		EQU 6		; STATUS(0xFF) env probe failed
+IST_NETINIT		EQU 7		; NETINIT failed (link/hardware not up)
 
-; Bring the link up once. Out: CF=0 ok, CF=1 fail (A=ESP result code).
-; Mirrors the kit's wget init (NO ISA_RESET - that resets the card and breaks the
-; ESP session NETUP set up; it was the main cause of flaky "init failed"). Drains
-; stale UART bytes, recovers a flaky first AT, and enables hardware RTS/CTS flow
-; control (SETUP_UART_FLOW) so the ESP holds its TX while we do slow work.
+init_stage			DB 0		; IST_* of the last INIT failure
+init_code			DB 0		; result code that accompanied it
+
+dll_handle			DW 0
+dll_loaded			DB 0		; DLL loaded into WIN1 (stays loaded until SHUTDOWN)
+net_caps			DW 0		; cached GETCAPS bitmask (valid once dll_loaded=1)
+
+NET_ERRBUF_SIZE		EQU 128
+NET_ERRBUF			DS NET_ERRBUF_SIZE, 0
+
+; Latched whenever any UNET call returns NERR_CANCEL (SETOPT CANCELKEYS=1
+; makes the DLL poll Esc/Ctrl+Z during its own blocking UART waits, same as
+; the old kit's WCOMMON.CANCELLED). Callers clear it before starting a fetch
+; or download and read it to tell a cancel apart from other failures.
+net_cancelled		DB 0
+
+; ------------------------------------------------------
+; Bring the network layer up. First call for a process loads the DLL,
+; validates its ABI/caps, and applies SETOPT/STATUS; every call (cached or
+; not) then does a best-effort NETDONE followed by NETINIT, so a session left
+; stale by INVALIDATE_NET (net_inited=0, dll_loaded still 1) recovers without
+; a full reload. Out: CF=0 ok; CF=1, A=result code.
+; ------------------------------------------------------
 INIT
-	CALL	WIFI.UART_FIND
-	RET		C
-	CALL	CHECK_NET_UP				; env: NET / NET_ESP_HW / NET_ESP_FW -> RX profile
-	RET		C
-	CALL	LOAD_BAUD					; NET_BAUD env -> CFG_BAUD (never opens NET.CFG)
-	RET		C
-	CALL	NETCFG.APPLY_UART_BAUD
-	CALL	WIFI.UART_INIT
-	CALL	WIFI.UART_EMPTY_RS			; drop stale boot / +IPD bytes before talking
-	LD		HL, CMD_AT
-	CALL	AT_RECOVER					; AT, with one drain+settle retry (no ESP reset)
-	RET		C
-	LD		HL, CMD_ECHO_OFF
-	CALL	TX_CMD
-	RET		C
-	; ESP-AT 2.2.1: do NOT re-run SETUP_UART_FLOW. NETUP already established the
-	; ESP-side flow contract, CHECK_NET_UP restored the matching local mode (or
-	; legacy flow=3), and UART_INIT above applied it to the 16550. Reconfiguring
-	; the ESP UART again disturbed working 2.2.1 sessions. 2.2.2 keeps its
-	; established verification call after restoring the same published mode.
-	LD		A, (WIFI.UART_RX_PROFILE)
-	CP		UART_RX_PROFILE_221
-	JR		Z, .flow_ok					; 221: keep NETUP's config untouched
-	CALL	WCOMMON.SETUP_UART_FLOW
-	AND		A
-	JR		Z, .flow_ok
+	XOR		A
+	LD		(init_stage), A
+	LD		(init_code), A
+	LD		A, (dll_loaded)
+	OR		A
+	JR		NZ, .have_dll
+	CALL	SELECT_DLL				; -> HL=DLL filename; CF=1/A=NERR_NOCONFIG
+	JR		NC, .got_name
+	LD		B, IST_ENV
+	JR		.fail
+.got_name
+	LD		A, 1					; target window 1
+	CALL	LIBMAN.l_load
+	JR		NC, .loaded
+	LD		A, NERR_DLL_LOAD		; libman's own l_reason/l_dss_error say why
+	LD		B, IST_LOAD
+	JR		.fail
+.loaded
+	LD		(dll_handle), HL
+	LD		A, 1
+	LD		(dll_loaded), A
+	XOR		A
+	LD		B, UNET_FN_GETCAPS
+	CALL	CALL_UNET
+	JR		C, .caps_fail
+	OR		A
+	JR		NZ, .caps_fail
+	LD		(net_caps), DE
+	BIT		0, E					; UNET_CAP_TCP - gopher is useless without it
+	JR		NZ, .have_tcp
+	LD		A, E					; report the caps low byte we actually saw
+	LD		B, IST_CAPS
+	JR		.unload
+.have_tcp
+	PUSH	IX
+	POP		HL
+	LD		A, H
+	CP		HIGH UNET_ABI_VERSION
+	JR		Z, .abi_ok
+	LD		B, IST_ABI				; A = the ABI major byte we saw
+	JR		.unload
+.abi_ok
+	LD		A, UNET_OPT_CANCELKEYS
+	LD		DE, 1
+	LD		B, UNET_FN_SETOPT
+	CALL	CALL_UNET				; best-effort; ignore result
+	LD		A, 0xFF					; STATUS(0xFF): env-only probe, no hardware
+	LD		B, UNET_FN_STATUS
+	CALL	CALL_UNET
+	JR		C, .status_fail
+	CP		NERR_OK
+	JR		Z, .have_dll
+	CP		NERR_NONET
+	JR		Z, .have_dll
+.status_fail
+	LD		B, IST_STATUS
+	JR		.fail
+.have_dll
+	XOR		A
+	LD		B, UNET_FN_NETDONE
+	CALL	CALL_UNET				; best-effort; ignore result
+	XOR		A
+	LD		B, UNET_FN_NETINIT
+	CALL	CALL_UNET
+	JR		C, .netinit_fail
+	OR		A
+	RET		Z
+.netinit_fail
+	LD		B, IST_NETINIT
+.fail
+	; In: A = result code, B = stage. Records both and returns CF=1, A=code.
+	LD		(init_code), A
+	LD		A, B
+	LD		(init_stage), A
+	LD		A, (init_code)
 	SCF
 	RET
-.flow_ok
-	LD		HL, CMD_CIPMUX_0
-	CALL	TX_CMD
-	RET		C
+.caps_fail
+	LD		B, IST_GETCAPS
+.unload
+	; An unusable DLL must not stay resident: free it so a later retry (after
+	; the user fixes the setup) starts from a clean l_load.
+	LD		(init_code), A
+	LD		A, B
+	LD		(init_stage), A
+	LD		HL, (dll_handle)
+	CALL	LIBMAN.l_free
 	XOR		A
+	LD		(dll_loaded), A
+	LD		A, NERR_DLL_ABI
+	SCF
 	RET
 
-; Send AT command at HL (ASCIIZ). Out: CF=0 ok, CF=1 on UART error.
-TX_CMD
-	LD		DE, WIFI.RS_BUFF
-	LD		BC, DEFAULT_TIMEOUT
-	CALL	WIFI.UART_TX_CMD
-	AND		A
+; Read env NET (WIFI/RTL) and map it to a DLL filename. Out: CF=0, HL=name;
+; CF=1, A=NERR_NOCONFIG. No hardware/DLL access - safe as a cheap UI probe.
+SELECT_DLL
+	LD		HL, env_key_net
+	LD		DE, env_val
+	LD		B, ENV_GET
+	LD		C, DSS_ENVIRON
+	RST		DSS
+	OR		A
+	JR		Z, .noconfig
+	LD		HL, env_val
+	LD		DE, str_wifi
+	CALL	STREQ
+	JR		Z, .wifi
+	LD		HL, env_val
+	LD		DE, str_rtl
+	CALL	STREQ
+	JR		Z, .rtl
+.noconfig
+	LD		A, NERR_NOCONFIG
+	SCF
+	RET
+.wifi
+	LD		HL, dll_esp
+	OR		A
+	RET
+.rtl
+	LD		HL, dll_rtl
+	OR		A
+	RET
+
+; Fast env-only check for the status bar (no DLL/hardware access). CF=0 if
+; env NET selects a recognised backend.
+CHECK_NET_UP
+	PUSH	HL
+	CALL	SELECT_DLL
+	POP		HL
+	RET
+
+; In: HL=host ASCIIZ, DE=port ASCIIZ. Out: CF=0 connected; CF=1, A=result.
+CONNECT
+	PUSH	DE
+	EX		DE, HL					; DE = host
+	POP		IX						; IX = port
+	XOR		A						; channel 0
+	LD		B, UNET_FN_CONNECT
+	CALL	CALL_UNET
+	RET		C
+	OR		A
 	RET		Z
 	SCF
 	RET
 
-; Send AT command HL; on failure drain + settle + retry ONCE (no ESP reset, no
-; baud change). A user cancel (Esc/Ctrl+Z, kit sets WCOMMON.CANCELLED) aborts.
-;
-; NEVER reset the ESP or force the default divisor here: WIFI.ESP_RESET reverts the
-; module to its flash 115200 and destroys NETUP's volatile session (Wi-Fi join AND
-; the negotiated baud), and UART_SET_DEFAULT_DIVISOR pins the host at 115200 - both
-; permanently break any non-115200 link. A stalled first AT is far more often a bit
-; of stale RX than a wedged module, so just clear the FIFO, settle, and retry; if it
-; still fails, propagate CF=1 and let NET.INIT report "run NETUP first".
-AT_RECOVER_SETTLE	EQU 300				; ms to settle before the single AT retry
-AT_RECOVER
-	PUSH	HL
-	CALL	TX_CMD
-	POP		HL
-	RET		NC
-	LD		A, (WCOMMON.CANCELLED)
-	OR		A
-	SCF
-	RET		NZ						; cancelled -> abort
-	CALL	WIFI.UART_EMPTY_RS		; drop stale bytes that desynced the first AT
-	PUSH	HL
-	LD		HL, AT_RECOVER_SETTLE
-	CALL	UTIL.DELAY
-	POP		HL
-	JP		TX_CMD
-
-; In: HL=host ASCIIZ, DE=port ASCIIZ. CF=0 connected. Prepares the socket (drops
-; any stale connection, drains RX) and retries the open once - the first open
-; after an idle/closed socket often needs a settle, which is the "Send failed" /
-; connect flakiness.
-CONNECT
-	LD		(c_host), HL
-	LD		(c_port), DE
-	CALL	.prep
-	LD		HL, (c_host)
-	LD		DE, (c_port)
-	CALL	TCP.OPEN
-	RET		NC
-	LD		A, (WCOMMON.CANCELLED)
-	OR		A
-	SCF
-	RET		NZ						; cancelled during open -> abort, no retry
-	CALL	.prep
-	LD		HL, TCP_OPEN_RETRY_DELAY
-	CALL	UTIL.DELAY
-	LD		HL, CMD_AT
-	CALL	TX_CMD
-	LD		HL, CMD_CIPMUX_0
-	CALL	TX_CMD
-	LD		HL, (c_host)
-	LD		DE, (c_port)
-	JP		TCP.OPEN
-.prep
-	CALL	RX_RESUME_COMPAT			; do not rewrite FCR with queued UART bytes
-	CALL	TCP.CLOSE					; drop any stale single-connection socket
-	; Force active mode. AT+CIPMODE is a GLOBAL flag: a preceding page fetch runs
-	; transparent (CIPMODE=1) and RAW_FINISH only "requests" CIPMODE=0 best-effort
-	; (it can silently fail, especially on 2.2.2). If it lingers at 1, the active
-	; AT+CIPSEND=<len> below never gets its '>' prompt -> "Send failed". Setting it
-	; here (socket already closed, so the flag is writable) makes the download robust
-	; to whatever mode the previous operation left. Idempotent when already 0.
-	LD		HL, CMD_CIPMODE_0
-	CALL	TX_CMD
-	; Passive receive is used only by 2.2.2 downloads. Always return the ESP to
-	; active receive before opening a fresh socket; page fetches and 2.2.1 keep
-	; their historical transports.
-	LD		A, (WIFI.UART_RX_PROFILE)
-	CP		UART_RX_PROFILE_222
-	JR		NZ, .active_ready
-	LD		HL, CMD_CIPRECVMODE_0
-	CALL	TX_CMD
-.active_ready
-	CALL	WIFI.UART_EMPTY_RS
-	RET
-c_host	DW 0
-c_port	DW 0
-
-; Active ESP-AT transport. Binary downloads deliberately use CIPMODE=0: every
-; +IPD frame carries an explicit payload length and TCP.RECEIVE consumes exactly
-; that many bytes. This avoids transparent mode's silent FIN-tail loss.
+; In: HL=buffer, BC=len. Out: CF=0 the whole buffer was confirmed sent;
+; CF=1, A=result (a short send is reported as NERR_SHORT_SEND).
 SEND
-	JP		TCP.SEND_BUFFER_NO_WAIT
-
-RECV
-	LD		A, (WIFI.UART_RX_PROFILE)
-	CP		UART_RX_PROFILE_222
-	JP		Z, RECV_PASSIVE_222
-	; 2.2.1 remains on the active +IPD path from ff7c910. In that profile the
-	; kit's UART_SET_DATA_RX_MODE is a no-op, so its receive algorithm and TR8
-	; flow are unchanged.
-	JP		TCP.RECEIVE
-
-CLOSE
-	CALL	TCP.CLOSE
-	PUSH	AF						; preserve CLOSE result while restoring global mode
-	LD		A, (WIFI.UART_RX_PROFILE)
-	CP		UART_RX_PROFILE_222
-	JR		NZ, .restore_done
-	LD		HL, CMD_CIPRECVMODE_0
-	CALL	TX_CMD					; best-effort: next CONNECT also forces active mode
-.restore_done
-	POP		AF
-	RET
-
-; Prepare diagnostics/parser state immediately before a new active-mode request.
-; Finish with RTS asserted because START_SEND_BUFFER must receive the '>' prompt.
-ACTIVE_PREP
-	CALL	WIFI.UART_RX_PAUSE
-	XOR		A
-	LD		(TCP.LSR_ACCUM), A
-	LD		(TCP.LAST_LSR), A
-	LD		(TCP.IPD_BAD_CHAR), A
-	LD		HL, 0
-	LD		(TCP.PAYLOAD_LEFT), HL
-	CALL	RX_RESUME_COMPAT
-	LD		A, (WIFI.UART_RX_PROFILE)
-	CP		UART_RX_PROFILE_222
-	JP		Z, PASSIVE_SETUP_222
-	OR		A						; 2.2.1: active mode, CF=0, unchanged
-	RET
-
-; ------------------------------------------------------
-; Transparent/raw TCP transport for gopher page fetches only.
-;
-; jesperl's active +IPD mode can discard a repeatable ~2 KB tail when the peer
-; closes (clean CLOSED, no UART error). CIPMODE=1 bypasses that queue: after
-; AT+CIPSEND the TCP stream is a raw UART pipe, as proven by the kit's telnet.
-; ------------------------------------------------------
-
-; HL=host, DE=port. Enter transparent mode and the raw pipe. CF=1 on failure;
-; failure cleanup restores CIPMODE=0 so the next request/program is safe.
-RAW_CONNECT
-	LD		(raw_host), HL
-	LD		(raw_port), DE
-	LD		HL, CMD_CIPMODE_1
-	CALL	TX_CMD
-	JR		C, .fail_mode
-	LD		HL, (raw_host)
-	LD		DE, (raw_port)
-	; Normal raw fetches finish on the peer's CLOSED and therefore have no stale
-	; socket. Open directly: CONNECT's unconditional pre-CIPCLOSE costs the full
-	; 5 s timeout when the socket is already gone. Only fall back to that slower
-	; stale-link recovery path after a real OPEN failure.
-	CALL	TCP.OPEN
-	JR		NC, .enter
-	LD		A, (WCOMMON.CANCELLED)
+	LD		(send_len), BC
+	PUSH	BC
+	POP		IX						; IX = length
+	EX		DE, HL					; DE = buffer
+	XOR		A						; channel 0
+	LD		B, UNET_FN_SEND
+	CALL	CALL_UNET
+	RET		C
 	OR		A
 	JR		NZ, .fail
-	LD		HL, (raw_host)
-	LD		DE, (raw_port)
-	CALL	CONNECT
-	JR		C, .fail
-.enter
-	CALL	RAW_ENTER
-	RET		NC
+	LD		HL, (send_len)
+	OR		A
+	SBC		HL, DE					; DE = bytes sent (from the DLL)
+	RET		Z						; equal -> CF=0
+	LD		A, NERR_SHORT_SEND
 .fail
-	LD		(raw_err), A
-	CALL	TCP.CLOSE
-	LD		HL, CMD_CIPMODE_0
-	CALL	TX_CMD
-	LD		A, (raw_err)
 	SCF
 	RET
-.fail_mode
-	SCF
-	RET
+send_len	DW 0
 
-; AT+CIPSEND -> wait for the '>' prompt. The first server byte remains queued
-; for RAW_RECV because we stop exactly at the prompt.
-RAW_ENTER
-	CALL	WIFI.UART_RX_RESUME
-	CALL	WIFI.UART_EMPTY_RS
-	LD		HL, CMD_CIPSEND_RAW
-	CALL	WIFI.UART_TX_STRING
+; In: HL=dest, BC=max, DE=timeout_ms. Out: CF=0, A=0|NERR_CLOSED, BC=received
+; (trailing bytes on a close are included and must be consumed); CF=1,
+; A=NERR_CANCEL / NERR_RXLOST(local, see below) / a dispatch failure, or a
+; UNET-level error that should not occur mid-stream.
+NERR_RXLOST			EQU 37		; local: UNET_RXF_LOST was set on the reply
+RECV
+	PUSH	DE						; timeout_ms
+	EX		DE, HL					; DE = dest buffer
+	PUSH	BC
+	POP		IX						; IX = max
+	POP		IY						; IY = timeout_ms
+	XOR		A						; channel 0
+	LD		B, UNET_FN_RECV
+	CALL	CALL_UNET
 	RET		C
-.wp
-	LD		BC, 3000
-	CALL	WIFI.UART_WAIT_RS
-	JR		C, .timeout
-	LD		HL, REG_RBR
-	CALL	WIFI.UART_READ
-	CP		'>'
-	JR		NZ, .wp
-	OR		A
-	RET
-.timeout
-	LD		A, RES_RS_TIMEOUT
-	SCF
-	RET
-
-; Send selector+CRLF directly into the transparent TCP pipe.
-RAW_SEND
-	JP		WIFI.UART_TX_BUFFER
-
-; Blocking wait for at least one raw byte, then drain the current burst into
-; HL (max BC). DE=wait ms. Out: BC=count/CF=0; CF=1/A=RES_RS_TIMEOUT on silence.
-RAW_RECV
-	PUSH	HL
-	PUSH	BC
-	LD		B, D
-	LD		C, E
-	CALL	ISA.ISA_OPEN
-	CALL	WIFI.UART_WAIT_RS_INT	; polls Esc/Ctrl+Z through CHECK_CANCEL_IN_ISA
-	PUSH	AF
-	CALL	ISA.ISA_CLOSE
-	POP		AF
-	POP		BC
+	CP		NERR_CANCEL				; a user cancel outranks the LOST flag (the
+	JR		Z, .cancel				; flags reply may be stale on an error return)
+	PUSH	IX
 	POP		HL
-	JR		C, .timeout
-	JP		RAW_DRAIN
-.timeout
-	LD		A, RES_RS_TIMEOUT
-	SCF
+	BIT		2, L					; UNET_RXF_LOST
+	JR		NZ, .lost
+	CP		NERR_OK
+	JR		Z, .ok
+	CP		NERR_CLOSED
+	JR		Z, .ok					; DE trailing bytes are valid on close too
+	SCF							; unexpected UNET-level error mid-stream
 	RET
-
-; Non-blocking raw UART burst drain. In HL=buffer, BC=max; out BC=count, CF=0.
-RAW_DRAIN
-	PUSH	BC
-	CALL	ISA.ISA_OPEN
-	POP		BC
-	LD		DE, 0					; count
-.l
-	LD		A, D
-	CP		B
-	JR		C, .room
-	JR		NZ, .done
-	LD		A, E
-	CP		C
-	JR		NC, .done
-.room
-	LD		A, RAW_RX_SPIN_BUDGET
-	LD		(raw_spin), A
-.spin
-	LD		A, (REG_LSR)
-	LD		(raw_last_lsr), A
-	AND	LSR_OE | LSR_PE | LSR_FE | LSR_BI | LSR_RCVE
-	JR		Z, .lsr_ok
-	LD		(raw_lsr_err), A		; any hardware RX error invalidates binary data
-.lsr_ok
-	LD		A, (raw_last_lsr)
-	AND	LSR_DR
-	JR		NZ, .got
-	LD		A, (raw_spin)
-	DEC		A
-	LD		(raw_spin), A
-	JR		NZ, .spin
-	JR		.done
-.got
-	LD		A, (REG_RBR)
-	LD		(HL), A
-	INC		HL
-	INC		DE
-	JR		.l
-.done
-	CALL	ISA.ISA_CLOSE
-	LD		B, D
-	LD		C, E
-	XOR		A
-	RET
-
-; Receive setup for opaque binary data. The FIFO trigger follows the firmware RX
-; profile (RAW_FCR_VALUE): 2.2.1 keeps TR8 - a later RTS fall shortens the ESP
-; back-pressure window, so on peer FIN ESP-AT is less likely to discard a clean but
-; still-queued tail (the 2.2.1 tail-drop guard); 2.2.2 uses TR4 to match the kit's
-; own UART_INIT for that firmware (which does not exhibit the drop). We still clear
-; and latch LSR diagnostics so genuine UART corruption is rejected.
-RAW_SAFE_RX
-	CALL	WIFI.UART_RX_PAUSE
-	CALL	RAW_FCR_VALUE			; E = FCR for the active RX profile
-	LD		HL, REG_FCR
-	CALL	WIFI.UART_WRITE
-	XOR		A
-	LD		(raw_lsr_err), A
-	LD		(raw_last_lsr), A
-	RET
-
-RAW_NORMAL_RX
-	CALL	RAW_FCR_VALUE
-	LD		HL, REG_FCR
-	JP		WIFI.UART_WRITE
-
-; E = FIFO control byte for the active RX profile (2.2.1 -> TR8, 2.2.2 -> TR4).
-; Trashes A.
-RAW_FCR_VALUE
-	LD		A, (WIFI.UART_RX_PROFILE)
-	CP		UART_RX_PROFILE_221
-	LD		E, FCR_FIFO | FCR_TR4
-	RET		NZ						; not 2.2.1 -> TR4
-	LD		E, FCR_FIFO | FCR_TR8
-	RET
-
-; Out: ZF=1 if no UART receive error was observed, ZF=0/A=LSR error bits.
-RAW_ERRORS
-	LD		A, (raw_lsr_err)
-	OR		A
-	RET
-
-; Leave transparent mode. A=1 means CLOSED was received (or page terminator plus
-; quiet grace): probe AT mode first. A=3 means a binary stream already observed
-; two seconds of post-data silence, satisfying the pre-+++ guard; start at +++.
-; A=0 uses the complete guarded escape.
-; Best effort; always returns CF=0 with CIPMODE=0 requested.
-RAW_FINISH
-	CP		3
-	JR		Z, .escape_prequiet
-	OR		A
-	JR		NZ, .probe_cmd
-.escape
-	CALL	WIFI.UART_RX_RESUME
-	CALL	RAW_QUIET_GUARD
-.escape_prequiet
-	LD		HL, STR_PLUS3
-	CALL	WIFI.UART_TX_STRING
-	CALL	RAW_QUIET_GUARD
-	LD		HL, STR_CRLF
-	CALL	WIFI.UART_TX_STRING
-	LD		HL, CMD_ECHO_OFF
-	CALL	TX_CMD
-	CALL	TCP.CLOSE
-	JR		.mode0
-.probe_cmd
-	LD		HL, CMD_AT
-	CALL	TX_CMD					; immediate OK if CLOSED already restored AT mode
-	JR		C, .escape				; still transparent -> use the guarded escape
-	; CLOSED already destroyed the socket. Do not issue CIPCLOSE: some firmware
-	; waits out its full timeout for an already-gone socket.
-	LD		HL, CMD_ECHO_OFF
-	CALL	TX_CMD
-.mode0
-	LD		HL, CMD_CIPMODE_0
-	CALL	TX_CMD
-	CALL	RAW_NORMAL_RX
-	OR		A
-	RET
-
-; Guard time for the transparent-mode +++ escape. ESP requires >=1 s of TX
-; silence; use 1.2 s on each side and discard any remaining raw RX meanwhile.
-RAW_QUIET_GUARD
-	LD		B, 12
-.l
-	PUSH	BC
-	LD		HL, WIFI.RS_BUFF
-	LD		BC, RS_BUFF_SIZE
-	CALL	RAW_DRAIN
-	LD		HL, 100
-	CALL	UTIL.DELAY
-	POP		BC
-	DJNZ	.l
-	RET
-
-; Hardware RX flow control (RTS via the TL16C550 AFE). Drop RTS around slow work
-; so the ESP holds its TX (no UART FIFO overrun); raise it before receiving.
-RX_PAUSE
-	JP		WIFI.UART_RX_PAUSE
-RX_RESUME
-	JP		RX_RESUME_COMPAT
-
-; Pre-UART_SET_DATA_RX_MODE UART_RX_RESUME. Only restore MCR/RTS; never touch
-; FCR after UART_INIT selected the firmware profile's trigger.
-RX_RESUME_COMPAT
-	PUSH	DE, HL
-	LD		A, (WIFI.UART_FLOW_MODE)
-	LD		E, MCR_RTS
-	AND		A
-	JR		Z, .write
-	LD		E, MCR_AFE | MCR_RTS
-.write
-	LD		HL, REG_MCR
-	CALL	WIFI.UART_WRITE
-	POP		HL, DE
-	RET
-
-; Hand the ESP back in AT command mode for the next program: close any lingering
-; socket (AT+CIPCLOSE) and re-assert echo-off. Best-effort; ignores errors. Call
-; on program exit if the UART was ever initialised. Page fetch cleanup restores
-; CIPMODE=0 before returning, so shutdown itself stays in AT command mode.
-SHUTDOWN
-	CALL	TCP.CLOSE
-	LD		HL, CMD_ECHO_OFF
-	CALL	TX_CMD
-	RET
-
-CMD_AT			DB "AT", 13, 10, 0
-CMD_ECHO_OFF	DB "ATE0", 13, 10, 0
-CMD_CIPMUX_0	DB "AT+CIPMUX=0", 13, 10, 0
-CMD_CIPMODE_1	DB "AT+CIPMODE=1", 13, 10, 0
-CMD_CIPMODE_0	DB "AT+CIPMODE=0", 13, 10, 0
-CMD_CIPRECVMODE_1 DB "AT+CIPRECVMODE=1", 13, 10, 0
-CMD_CIPRECVMODE_0 DB "AT+CIPRECVMODE=0", 13, 10, 0
-CMD_CIPDINFO_0	DB "AT+CIPDINFO=0", 13, 10, 0
-CMD_CIPRECVDATA_PREFIX DB "AT+CIPRECVDATA=", 0
-CMD_CIPSEND_RAW DB "AT+CIPSEND", 13, 10, 0
-STR_PLUS3		DB "+++", 0
-STR_CRLF		DB 13, 10, 0
-raw_host		DW 0
-raw_port		DW 0
-raw_err			DB 0
-raw_spin		DB 0
-raw_last_lsr	DB 0
-raw_lsr_err		DB 0
-
-; Load the UART baud from the NET_BAUD environment variable NETUP published - the
-; authoritative link speed for this session. We deliberately do NOT read NET.CFG:
-; that file lives beside NETUP.EXE (not the browser's dir), and re-parsing it here
-; would (a) silently fall back to 115200 when absent, and (b) let SETUP_UART_FLOW's
-; AT+UART_CUR reprogram the ESP to the wrong speed. Copies the ASCIIZ value into
-; NETCFG.CFG_BAUD (read by APPLY_UART_BAUD + BUILD_UART_FLOW_CMD).
-; Out: CF=0 filled; CF=1 if NET_BAUD is unset/empty (NET.INIT -> "run NETUP first").
-KEY_NET_BAUD	DB "NET_BAUD", 0
-KEY_NET_ESP_FLOW DB "NET_ESP_FLOW", 0
-LOAD_BAUD
-	LD		HL, KEY_NET_BAUD
-	LD		DE, WCOMMON.ENV_VAL_BUF
-	LD		B, ENV_GET
-	LD		C, DSS_ENVIRON
-	RST		DSS
-	OR		A
-	JR		Z, .fail					; NET_BAUD not set
-	LD		A, (WCOMMON.ENV_VAL_BUF)
-	OR		A
-	JR		Z, .fail					; NET_BAUD empty
-	LD		HL, WCOMMON.ENV_VAL_BUF
-	LD		DE, NETCFG.CFG_BAUD
-	LD		B, NETCFG.CFG_BAUD_SIZE - 1	; max digits; always leave room for the NUL
-.cpy
-	LD		A, (HL)
-	OR		A
-	JR		Z, .term
-	LD		(DE), A
-	INC		HL
-	INC		DE
-	DJNZ	.cpy
-.term
-	XOR		A
-	LD		(DE), A						; NUL-terminate CFG_BAUD
-	OR		A							; CF=0
-	RET
-.fail
-	SCF
-	RET
-
-; Verify NETUP joined Wi-Fi (env NET=WIFI, NET_ESP_HW set) and select the ESP-AT
-; firmware RX profile from NET_ESP_FW. Older NETUP versions did not publish that
-; variable, so absence selects 2.2.1; an unknown published value is still an error.
-; Returns CF=1 on failure instead of exiting the program (unlike
-; WCOMMON.REQUIRE_NET_UP), so the browser can report the error and stay running.
-; Reuses the kit's env strings and profile setter.
-CHECK_NET_UP
-	LD		HL, WCOMMON.N_NET_KEY
-	LD		DE, WCOMMON.ENV_VAL_BUF
-	LD		B, ENV_GET
-	LD		C, DSS_ENVIRON
-	RST		DSS
-	OR		A
-	JR		Z, .fail					; NET not set
-	LD		HL, WCOMMON.ENV_VAL_BUF
-	LD		DE, WCOMMON.V_WIFI
-	CALL	.strmatch
-	JR		NZ, .fail					; NET != WIFI
-	LD		HL, WCOMMON.N_ESP_HW_KEY
-	LD		DE, WCOMMON.ENV_VAL_BUF
-	LD		B, ENV_GET
-	LD		C, DSS_ENVIRON
-	RST		DSS
-	OR		A
-	JR		Z, .fail					; NET_ESP_HW not set
-	LD		A, (WCOMMON.ENV_VAL_BUF)
-	OR		A
-	JR		Z, .fail					; NET_ESP_HW empty
-	; Firmware RX profile (NET_ESP_FW): selects the kit's UART receive algorithm
-	; (2.2.1 = FCR TR8; 2.2.2 = FCR TR4). Set both WCOMMON.UART_ESP_PROFILE and
-	; WIFI.UART_RX_PROFILE (read by UART_INIT/EMPTY_RS/receive).
-	LD		HL, WCOMMON.N_ESP_FW_KEY
-	LD		DE, WCOMMON.ENV_VAL_BUF
-	LD		B, ENV_GET
-	LD		C, DSS_ENVIRON
-	RST		DSS
-	OR		A
-	JR		Z, .fw221					; old NETUP did not publish NET_ESP_FW
-	LD		HL, WCOMMON.ENV_VAL_BUF
-	LD		DE, WCOMMON.V_ESP_FW_221
-	CALL	.strmatch
-	JR		Z, .fw221
-	LD		HL, WCOMMON.ENV_VAL_BUF
-	LD		DE, WCOMMON.V_ESP_FW_222
-	CALL	.strmatch
-	JR		NZ, .fail					; unknown firmware string
-	LD		A, UART_RX_PROFILE_222
-	JR		.set_profile
-.fw221
-	LD		A, UART_RX_PROFILE_221
-.set_profile
-	LD		(WCOMMON.UART_ESP_PROFILE), A
-	CALL	WIFI.UART_SET_RX_PROFILE
-	; Restore the exact UART flow contract NETUP established for BOTH profiles.
-	; NETUP and gopher are separate processes: gopher's UART_FLOW_MODE starts at
-	; zero, then its UART_INIT would overwrite NETUP's local MCR state. The current
-	; client contract is to reload NET_ESP_FLOW first; SETUP_UART_FLOW then verifies
-	; the already-matched link. Otherwise ESP flow=3 + a manual local 16550 can
-	; overrun/desynchronise active +IPD at "Receiving 0 KB". Pre-flow-variable
-	; packages used flow=3 unconditionally.
-	LD		HL, KEY_NET_ESP_FLOW
-	LD		DE, WCOMMON.ENV_VAL_BUF
-	LD		B, ENV_GET
-	LD		C, DSS_ENVIRON
-	RST		DSS
-	OR		A
-	JR		NZ, .have_flow
-	JR		.flow3					; legacy NETUP: FLOW_MODE=3 was unconditional
-.have_flow
-	LD		A, (WCOMMON.ENV_VAL_BUF)
-	CP		'0'
-	JR		Z, .flow0
-	CP		'3'
-	JR		NZ, .fail					; invalid published flow contract
-.flow3
-	LD		A, 1
-	JR		.store_flow
-.flow0
-	XOR		A
-.store_flow
-	; CHECK_NET_UP is also used as a fast pre-init status probe. Seed only the
-	; library state here; WIFI.UART_INIT applies it to MCR after UART_FIND.
-	LD		(WIFI.UART_FLOW_MODE), A
 .ok
-	OR		A							; CF=0 ok
+	LD		B, D
+	LD		C, E					; BC = received length
+	OR		A						; CF=0, A already 0 or NERR_CLOSED
 	RET
-.fail
+.cancel
+	LD		A, NERR_CANCEL
 	SCF
 	RET
-; Compare ASCIIZ at HL and DE. Out: ZF=1 if equal. Trashes A, C, HL, DE.
-.strmatch
-	LD		A, (DE)
-	LD		C, A
+.lost
+	LD		A, NERR_RXLOST
+	SCF
+	RET
+
+; Close the active channel. Idempotent; a no-op (CF=0) if the DLL was never
+; loaded this run.
+CLOSE
+	LD		A, (dll_loaded)
+	OR		A
+	RET		Z
+	XOR		A
+	LD		B, UNET_FN_CLOSE
+	CALL	CALL_UNET
+	RET		C
+	OR		A
+	RET		Z
+	SCF
+	RET
+
+; Hand the network back at program exit: NETDONE (best-effort) + l_free the
+; DLL. Call only if the DLL was ever loaded this run (main.asm's net_inited).
+SHUTDOWN
+	LD		A, (dll_loaded)
+	OR		A
+	RET		Z
+	XOR		A
+	LD		B, UNET_FN_NETDONE
+	CALL	CALL_UNET				; best-effort; ignore result
+	LD		HL, (dll_handle)
+	CALL	LIBMAN.l_free
+	XOR		A
+	LD		(dll_loaded), A
+	RET
+
+; Hardware RX flow control (fn 13/14), only meaningful when the backend
+; advertises UNET_CAP_RXFLOW; a no-op (CF=0) otherwise.
+RX_PAUSE
+	LD		A, (net_caps + 1)
+	AND		HIGH UNET_CAP_RXFLOW
+	RET		Z
+	XOR		A
+	LD		B, UNET_FN_RXPAUSE
+	CALL	CALL_UNET
+	RET		C
+	OR		A
+	RET		Z
+	SCF
+	RET
+RX_RESUME
+	LD		A, (net_caps + 1)
+	AND		HIGH UNET_CAP_RXFLOW
+	RET		Z
+	XOR		A
+	LD		B, UNET_FN_RXRESUME
+	CALL	CALL_UNET
+	RET		C
+	OR		A
+	RET		Z
+	SCF
+	RET
+
+; Fetch the DLL's last diagnostic tail into NET_ERRBUF (NUL-terminated, may
+; be empty). Out: CF=0 filled (possibly empty); CF=1 on a dispatch failure.
+LAST_ERROR
+	LD		DE, NET_ERRBUF
+	LD		IX, NET_ERRBUF_SIZE
+	XOR		A
+	LD		B, UNET_FN_LASTERR
+	CALL	CALL_UNET
+	RET		C
+	XOR		A
+	RET
+
+; In: B = UNET function number; A/DE/IX/IY = that function's arguments.
+; Out: CF=0, A = UNET NERR_* status; CF=1, A=NERR_DLL_CALL (libman dispatch
+; failure - bad handle/window, not a UNET-level error).
+;
+; CF is the whole contract here, so the success path must clear it EXPLICITLY:
+; the CP below sets CF for every status under NERR_CANCEL (NERR_OK included),
+; and every caller tests CF first. Returning that borrow made a successful DLL
+; call indistinguishable from a dispatch failure.
+CALL_UNET
+	EI								; a DLL call entered with interrupts off
+									; can hang (mirrors ftpclient's ede8c46 fix)
+	LD		HL, (dll_handle)
+	CALL	LIBMAN.l_call
+	JR		C, .dispatch_fail
+	CP		NERR_CANCEL
+	JR		NZ, .done
+	LD		(net_cancelled), A		; A=NERR_CANCEL (nonzero) -> latch it
+.done
+	OR		A						; CF=0, A preserved (see above)
+	RET
+.dispatch_fail
+	LD		A, NERR_DLL_CALL
+	SCF
+	RET
+
+; Append a compact breadcrumb tail for the last INIT failure to the ASCIIZ
+; buffer HL points into: " st=<stage> e=<code> lr=<libman reason> ls=<libman
+; load stage> dss=<DSS error> is=<DLL INIT status>". Writes at most 40 bytes.
+; In: HL = destination (where the NUL should go). Out: buffer NUL-terminated.
+DIAG_TEXT
+	EX		DE, HL					; DE = write cursor
+	LD		HL, diag_tbl
+.next
 	LD		A, (HL)
-	CP		C
+	OR		A
+	JR		Z, .done
+.label
+	LD		A, (HL)
+	INC		HL
+	OR		A
+	JR		Z, .value
+	LD		(DE), A
+	INC		DE
+	JR		.label
+.value
+	LD		C, (HL)
+	INC		HL
+	LD		B, (HL)
+	INC		HL						; BC = address of the byte to print
+	PUSH	HL
+	LD		A, (BC)
+	LD		L, A
+	LD		H, 0
+	CALL	UTIL.UTOA				; HL=value, DE=dest -> DE past the written NUL
+	DEC		DE						; step back onto it: the next label overwrites it
+	POP		HL
+	JR		.next
+.done
+	XOR		A
+	LD		(DE), A
+	RET
+
+; label (ASCIIZ) + address of the byte to print after it; 0 ends the table.
+; The LIBMAN.* fields resolve to their WIN2 run addresses (libman is assembled
+; via the DISP block in main.asm), which is where they actually live at runtime.
+diag_tbl
+	DB " st=", 0
+	DW init_stage
+	DB " e=", 0
+	DW init_code
+	DB " lr=", 0
+	DW LIBMAN.l_reason
+	DB " ls=", 0
+	DW LIBMAN.l_load_stage
+	DB " dss=", 0
+	DW LIBMAN.l_dss_error
+	DB " is=", 0
+	DW LIBMAN.l_init_status
+	DB 0
+
+; Compare ASCIIZ at HL and DE. Out: ZF=1 if equal. Trashes A, HL, DE.
+STREQ
+	LD		A, (DE)
+	CP		(HL)
 	RET		NZ
 	OR		A
 	RET		Z
 	INC		HL
 	INC		DE
-	JR		.strmatch
+	JR		STREQ
 
-	ENDIF
+env_key_net		DB "NET", 0
+; DSS ENV_GET has no destination-capacity argument, and ENV_SET allows a
+; NAME=VALUE string up to 255 bytes - so the value buffer must hold 256 bytes
+; or an oversized NET value would overrun it. Overlaid on DL_BUF: env NET is
+; only ever read outside a transfer (INIT before CONNECT; CHECK_NET_UP from
+; the home-page status redraw), when DL_BUF holds nothing live.
+env_val			EQU DL_BUF
+str_wifi		DB "WIFI", 0
+str_rtl			DB "RTL", 0
+dll_esp			DB "UNETESP.DLL", 0
+dll_rtl			DB "UNETRTL.DLL", 0
 
 	ENDMODULE

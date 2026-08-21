@@ -70,20 +70,14 @@ dw_off				EQU 0x89C6			; word
 dw_n				EQU 0x89C8			; word
 dw_last				EQU 0x89CA			; word
 dw_rem				EQU 0x89CC			; word
-dl_comb				EQU 0x89CE			; word
-dl_first			EQU 0x89D0			; byte
 dl_pending			EQU 0x89D1			; word
 dl_partial			EQU 0x89D3			; byte
 dl_last_kb			EQU 0x89D4			; word
 video_page			EQU 0x89D6			; byte
 dlp_base			EQU 0x89D7			; byte
 dl_disk_err			EQU 0x89D8			; byte
-dl_net_err			EQU 0x89D9			; byte
-recv_line_state		EQU 0x89DA			; byte
-recv_term_seen		EQU 0x89DB			; byte
-recv_idle_cb			EQU 0x89DC			; word
-raw_closed			EQU 0x89DE			; byte
-raw_close_state		EQU 0x89DF			; byte
+recv_line_state		EQU 0x89DA			; byte: gopher "." terminator scan state
+recv_term_seen		EQU 0x89DB			; byte: terminator already seen this fetch
 recv_lo				EQU 0x89E0			; word
 recv_hi				EQU 0x89E2			; word
 prog_suffix			EQU 0x89E4			; word
@@ -98,18 +92,8 @@ url_full			EQU 0x89F2			; word
 last_err			EQU 0x89F4			; word; ends 0x89F5
 open_addr_active	EQU 0x89F6			; Ctrl+G fetch in flight; enables edit-on-error
 fetch_conn_retry	EQU 0x89F7			; one full page-connect retry already used
-; ESP-AT 2.2.2 passive-receive state. Kept here rather than inside the overlay
-; itself so the overlay budget (LINE_BUF..0x9FFF) stays code-only. pv_closed /
-; pv_first / pv_live persist across NET.RECV calls and are (re)initialised by
-; PASSIVE_SETUP_222; the rest are per-call scratch.
-pv_closed			EQU 0x89F8			; CLOSED seen on this connection
-pv_first			EQU 0x89F9			; first receive must wait out AT+CIPSEND
-pv_live				EQU 0x89FA			; a probe is outstanding (no terminal yet)
-pv_poll				EQU 0x89FB			; remaining quiet ticks this call
-pv_wake				EQU 0x89FC			; PASSIVE_RESPONSE mode: 1 = idle wake
-pv_lch				EQU 0x89FD			; first char of the line being scanned
-pv_llen				EQU 0x89FE			; its length so far
-pv_started			EQU 0x89FF			; first payload byte of the transfer seen
+; 0x89F8..0x89FF: free (formerly the ESP-AT 2.2.2 passive-receive overlay state,
+; removed with the UNET DLL migration - the DLL owns all transport framing now).
 REQ_BUF				EQU 0x8A00			; outgoing selector + CRLF (<=256 B: SEL_CUR 200 + CRLF)
 ; Runtime buffers relocated out of the WIN1 image (into the unused upper half of
 ; REQ_BUF's 512 B slot, 0x8B00..0x8BFF) so the code image + network-lib BSS stay
@@ -151,24 +135,36 @@ DL_PATH				EQU BM_LINE + 16		; 32 B: "DOWNLOAD\<name>"
 ; PChars'd from WIN2 (verified safe); disjoint from any download. Fills the gap
 ; between DL_PATH and DL_BUF (0x9FB0..0x9FFF = 80 B).
 WEBLINK_BUF			EQU 0x9FB0			; 80 B; overwritten only during binary download
-; Shared network accumulator. Page fetches append it to DOC. ESP-AT 2.2.1
-; binary downloads use it as the active-RX accumulator before appending to DOC;
-; 2.2.2 passive downloads fill it and write exact 4 KB chunks straight to FAT
-; (only the final write may be shorter).
-; It also overlays NETCFG BSS, whose lifetime ends before either transfer.
-; Sits above the small buffers and below the stack (0xA000..0xAFFF); never a
-; PChars source (raw bytes only).
-DL_BUF				EQU 0xA000			; 4 KB download buffer (ends 0xAFFF)
+; Shared network receive buffer: every NET.RECV call (page fetch and binary
+; download alike) lands here before being appended to the DOC page chain, and
+; DL_WRITE_DOC stages its 4 KB FAT chunks through it. Outside transfers it also
+; hosts NET's env-value buffer (net.asm's env_val - DSS ENV_GET has no capacity
+; argument, so it needs a full 256 B). Sits above the small buffers and below
+; libman (0xA000..0xAFFF); never a PChars source (raw bytes only).
+DL_BUF				EQU 0xA000			; 4 KB network recv buffer (ends 0xAFFF; NET.RECV target)
 DL_BUF_SIZE			EQU 0x1000			; 4096
-; Runtime stack: the top 4 KB of our WIN2 GetMem page (0xB000..0xBFFF, top
-; 0xC000, grows down). The code image fits entirely in WIN1 (< 16 KB), so the
-; whole WIN2 page is ours and the stack lives here - far from the network lib's
-; BSS (which sits just under 0x8000 in WIN1). This replaces the old "stack in
-; WIN1 under the BSS" model whose ~1.8 KB margin overflowed into the BSS during a
-; deep receive + clock draw ("Network init failed"). START switches SP here once
-; the page is mapped; it survives Dss.Exec unchanged (DSS saves/restores the
-; parent's window registers, and this GetMem page is tagged to our task so the
-; child can't allocate over it). 0xB000 > DL_BUF end (0xAFFF).
+; The UNET DLL (UNETESP.DLL / UNETRTL.DLL) is loaded into WIN1 (l_load A=1) -
+; WIN1 holds all of gopher's own code, so it is displaced only for the narrow
+; span inside a single l_call/l_load, and libman itself restores it before
+; returning (verified in libman_core13.asm: lc4_ self-modifies an OUT of the
+; saved physical page before ret). That means libman's OWN code/state - the
+; thing actually running while WIN1 is displaced - must live somewhere that is
+; NOT WIN1: our WIN2 GetMem page. LIBMAN_STORE (near IMAGE_END) is assembled
+; for this address via a DISP block and LDIR'd here once at startup, right
+; after INIT_RUNTIME_PAGE maps the page. Measured size (LIBMAN_MAX_LIBS=1,
+; NO_LEGACY_API, DIAGNOSTICS, default L0/L1/L2 support): 2092 B; budget below
+; leaves headroom for the submodule to grow. LIBMAN_APP_DIR points at our own
+; EXE_DIR (0x9900, same WIN2 page) - no separate copy needed.
+LIBMAN_W2_BASE		EQU 0xB000
+LIBMAN_W2_END		EQU 0xB900			; 2304 B budget (ASSERT in main.asm)
+; Runtime stack: the remainder of our WIN2 GetMem page (0xB900..0xBFFF, top
+; 0xC000, grows down) - 1792 B. Shrunk from the earlier 4 KB now that the deep
+; ESP-AT kit call chains and IDLE_CB draws inside its byte-waits are gone (the
+; UNET DLL owns the receive loop internally; our own RECV loop is a flat,
+; shallow poll). Still far more than the DLL's documented "~256 B free stack"
+; requirement. START switches SP here once the page is mapped; it survives
+; Dss.Exec unchanged (DSS saves/restores the parent's window registers, and
+; this GetMem page is tagged to our task so the child can't allocate over it).
 RUN_STACK_TOP		EQU 0xC000
 ; LINE_BUF is also in this WIN2 page. DSS PChars prints correctly from WIN2
 ; (verified on target); a row is copied out only so a doc page need not remain
