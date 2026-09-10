@@ -143,7 +143,7 @@ WEBLINK_BUF			EQU 0x9FB0			; 80 B; overwritten only during binary download
 ; libman (0xA000..0xAFFF); never a PChars source (raw bytes only).
 DL_BUF				EQU 0xA000			; 4 KB network recv buffer (ends 0xAFFF; NET.RECV target)
 DL_BUF_SIZE			EQU 0x1000			; 4096
-; The UNET DLL (UNETESP.DLL / UNETRTL.DLL) is loaded into WIN1 (l_load A=1) -
+; The selected UNET<TAG>.DLL is loaded into WIN1 (l_load A=1) -
 ; WIN1 holds all of gopher's own code, so it is displaced only for the narrow
 ; span inside a single l_call/l_load, and libman itself restores it before
 ; returning (verified in libman_core13.asm: lc4_ self-modifies an OUT of the

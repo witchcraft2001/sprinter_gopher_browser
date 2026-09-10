@@ -15,9 +15,9 @@
 ;   * Network errors are classified and shown on the status bar (no program
 ;     exit, no blocking "press a key"); NET.INIT runs once and is reused.
 ;
-;   Networking (src/net.asm) is a runtime-loaded UNET-ABI DLL (UNETESP.DLL for
-;   Wi-Fi, UNETRTL.DLL for NE2000/RTL8019A), selected by env NET (WIFI/RTL) and
-;   loaded via libman (extern/libman). The DLL loads into WIN1 (gopher's own
+;   Networking (src/net.asm) is a runtime-loaded UNET-ABI DLL selected by env
+;   NET and resolved by UNETLD (WIFI aliases to UNETESP.DLL; ordinary tags map
+;   to UNET<TAG>.DLL), loaded via libman (extern/unet_libs_asm). The DLL loads into WIN1 (gopher's own
 ;   code window - libman restores it before returning from every call); libman
 ;   itself, which must survive while WIN1 is displaced, is copied into the
 ;   WIN2 GetMem page at LIBMAN_W2_BASE once at startup (see console.inc). The
@@ -113,6 +113,7 @@ START
 	CALL	INIT_DLP_TXT				; seed the WIN2 "Receiving " progress prefix
 	CALL	INIT_PATHS					; resolve the EXE dir for DOWNLOAD\ (AppInfo #47);
 										; also LIBMAN_APP_DIR (net.asm DLL search path)
+	CALL	INIT_HEADER_DLL				; resolve NET once so the header names the selected DLL
 	CALL	CFG.LOAD					; read GOPHER.CFG (viewers + settings); ignore if absent
 	CALL	DOC.RESET
 	CALL	TERM.CLS
@@ -241,12 +242,10 @@ CONFIRM_QUIT
 	CALL	SHOW_DOC_STATUS			; restore the normal status line
 	JP		MAINLOOP
 
+	; UNET.SHUTDOWN is idempotent and also frees a DLL left resident after a
+	; partially failed NET.INIT, so do not gate cleanup on net_inited.
 QUIT
-	LD		A, (net_inited)			; if we ever brought the ESP up, hand it back
-	OR		A						; in command mode (socket closed) for the next program
-	JR		Z, .noesp
 	CALL	NET.SHUTDOWN
-.noesp
 	CALL	TERM.CLS				; leave a clean screen for the next program
 	LD		D, 0
 	LD		E, 0
@@ -278,6 +277,20 @@ INIT_RUNTIME_PAGE
 	LD		B, 0
 	LD		C, DSS_SETWIN2			; A = handle from GetMem
 	RST		DSS
+	RET
+
+; Resolve the configured UNET DLL for the startup header. CHECK_NET_UP only
+; reads the NET environment variable; it does not load the DLL or touch the
+; network, so startup remains usable before the card is brought up.
+INIT_HEADER_DLL
+	CALL	NET.CHECK_NET_UP
+	JR		C, .none
+	LD		A, 1
+	LD		(header_dll_ok), A
+	RET
+.none
+	XOR		A
+	LD		(header_dll_ok), A
 	RET
 
 ; Re-enter the EXE directory (cwd may have changed, e.g. a launched child CHDIR'd),
@@ -1913,7 +1926,7 @@ SHOW_DOC_STATUS
 	OR		A
 	JP		NZ, SHOW_LOADED
 	; home page: warn up front if the network is not configured (env NET unset
-	; or not WIFI/RTL), so the user knows before clicking a link - otherwise
+	; or not a valid NET tag), so the user knows before clicking a link - otherwise
 	; show the key help.
 	CALL	NET.CHECK_NET_UP		; fast env check, no DLL/hardware access
 	JR		C, .nonet
@@ -2816,8 +2829,8 @@ EXEC_PROGRAM
 	RET
 
 ; Drop the cached "network session is up" flag (net_inited) so the next fetch
-; re-runs NET.INIT: it does not reload/unload the DLL (dll_loaded is untouched
-; and libman.l_free is not called), it just repeats NETDONE + NETINIT on the
+; re-runs NET.INIT: it does not reload/unload the DLL (UNETLD loaded state is
+; untouched and l_free is not called), it just repeats NETDONE + NETINIT on the
 ; backend still resident in WIN1. This is a RECOVERY: a cached net_inited=1
 ; makes a fetch skip straight to CONNECT and reuse the existing session; if
 ; that session has gone stale (idle time on a local page, or a child program
@@ -3353,6 +3366,21 @@ DRAW_HEADER
 	CALL	TERM.LOCATE
 	LD		HL, DOC_TITLE			; current page title (clicked link / home)
 	CALL	TERM.PUTS
+	LD		D, HEADER_ROW
+	LD		E, 52					; leave the clock field (cols 71..79) untouched
+	CALL	TERM.LOCATE
+	LD		HL, MSG_HEADER_DLL
+	CALL	TERM.PUTS
+	LD		A, (header_dll_ok)
+	OR		A
+	JR		Z, .no_dll
+	LD		HL, UNETLD.DLL_NAME
+	CALL	TERM.PUTS
+	JR		.dll_done
+.no_dll
+	LD		HL, MSG_DLL_NONE
+	CALL	TERM.PUTS
+.dll_done
 	LD		A, 0xFF					; the full-row fill wiped the clock - force a redraw
 	LD		(clk_last), A
 	RET
@@ -3661,6 +3689,7 @@ hist_sp			DB 0
 cur_kind		DB 0					; 0=home, 1=network
 DOC_TYPE_CUR	DB '1'
 net_inited		DB 0
+header_dll_ok	DB 0				; NET environment resolved to a UNET DLL at startup
 home_fm			DB 0xFF					; open EXE file handle (from (IX-3) at START)
 EMPTYSTR		DB 0
 
@@ -3692,10 +3721,12 @@ LINE_BUF_END	EQU LINE_BUF + 510
 ; ------------------------------------------------------
 MSG_TITLE		DB "Gopher browser v.", APP_VERSION, 0
 MSG_BANNER		DB "Gopher browser v.", APP_VERSION, 13, 10, 0
+MSG_HEADER_DLL	DB "DLL:", 0
+MSG_DLL_NONE	DB "---", 0
 MSG_RUNEXT		DB "Running external viewer:", 13, 10, 0
 MSG_CRLF		DB 13, 10, 0
 MSG_STATUS		DB "Up/Dn move  Enter open  Bksp back  ^G addr  ^B marks  ^D add  Esc/F10 quit", 0
-MSG_NONET		DB "Network not set up - run NETUP (Wi-Fi) or NETCFG -i + IFUP (RTL)", 0
+MSG_NONET		DB "Network not configured - run the card's bring-up tool", 0
 MSG_CONFIRM_QUIT DB "Quit?  Y = yes,  any other key = no", 0
 MSG_FETCHING	DB "Fetching...", 0
 MSG_ASK_RELOAD	DB "Page incomplete.  R = reload,  any other key = show what loaded", 0
@@ -3732,7 +3763,7 @@ MSG_BM_NONE		DB "Nothing to bookmark (open a gopher page first).", 0
 MSG_BM_FAIL		DB "Could not write the bookmarks file.", 0
 MSG_EXEC_FAIL	DB "Could not launch the associated program.", 0
 MSG_MEM_ERR		DB "Cannot allocate work page.", 0
-ERR_INIT		DB "Network init failed (no DLL, bad link, or NETUP/NETCFG not run).", 0
+ERR_INIT		DB "Network init failed (missing UNET DLL or link is down).", 0
 ERR_CONN		DB "Connect failed (check host / port / network).", 0
 ERR_SEND		DB "Send failed.", 0
 ERR_EMPTY		DB "No data received.", 0
@@ -3793,6 +3824,8 @@ LIBMAN_STORE_RUN_END
 	ENT
 LIBMAN_STORE_SIZE EQU LIBMAN_STORE_RUN_END - LIBMAN_W2_BASE
 	ASSERT LIBMAN_STORE_SIZE <= (LIBMAN_W2_END - LIBMAN_W2_BASE)
+	; UNETLD's simple-mode state and all application code must remain in WIN1.
+	ASSERT $ <= 0x8000
 
 ; End of the DSS-loaded image. The EXE header's LOADER field = IMAGE_END -
 ; LOAD_ADDR (which includes LIBMAN_STORE above); INDEX.GPH is appended in the

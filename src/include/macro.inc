@@ -1,5 +1,5 @@
 ; ======================================================
-; Local macro shims (v0.2.0 UNET migration). Replaces the ESP-AT kit's
+; Local macro shims (v0.2.2 UNETLD migration). Replaces the ESP-AT kit's
 ; macro.inc now that the kit is no longer statically linked; keeps only what
 ; main.asm actually uses (PRINTLN, DSS_EXEC).
 ; ======================================================

@@ -1,5 +1,5 @@
 ; ======================================================
-; UTIL - small local utility routines (v0.2.0 UNET migration).
+; UTIL - small local utility routines (v0.2.2 UNETLD migration).
 ; Replaces the ESP-AT kit's src/lib/util.asm + wcommon.asm INIT_VMODE/EXIT,
 ; which are no longer statically linked. DELAY/STRLEN/UTOA are ports of Roman
 ; Boykov's sprinter_wifi/network util.asm (BSD 3-Clause), kept under the same

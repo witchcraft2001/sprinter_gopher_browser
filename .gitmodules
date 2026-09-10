@@ -1,9 +1,3 @@
-[submodule "extern/wifi"]
-	path = extern/wifi
-	url = git@github.com:witchcraft2001/sprinter_net.git
-[submodule "extern/rtl"]
-	path = extern/rtl
-	url = https://github.com/witchcraft2001/sprinter-rtl8019a.git
-[submodule "extern/libman"]
-	path = extern/libman
-	url = git@github.com:witchcraft2001/sprinter-libman.git
+[submodule "extern/unet_libs_asm"]
+	path = extern/unet_libs_asm
+	url = https://github.com/witchcraft2001/sprinter_unet_libs_asm.git

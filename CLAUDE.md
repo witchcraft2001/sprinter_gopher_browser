@@ -16,41 +16,37 @@ license headers.
 
 Toolchain: **sjasmplus**, output is a **DSS `.EXE`** (assembly, not C).
 
-### v0.2.0 — networking is a runtime-loaded UNET DLL (current architecture)
+### v0.2.2 — networking uses the generic runtime-loaded UNETLD selector
 
-Both network cards are served by the same **UNET ABI**, a small (24-function)
-Z80 calling convention frozen and shared by two DLLs:
+Network cards are served by the same **UNET ABI**, a frozen Z80 calling
+convention. The standard distribution currently includes:
 
-- **`UNETESP.DLL`** — ESP12-F/ESP8266 Wi-Fi (ESP-AT), from `extern/wifi`
-  (submodule of `sprinter_net`, Roman Boykov / Dmitry Mikhalchenkov).
-- **`UNETRTL.DLL`** — NE2000/RTL8019AS ISA Ethernet, from `extern/rtl`
-  (submodule of `sprinter-rtl8019a`).
+- **`UNETESP.DLL`** — ESP12-F/ESP8266 Wi-Fi (ESP-AT).
+- **`UNETRTL.DLL`** — NE2000/RTL8019AS ISA Ethernet.
+- **`UNET509B.DLL`** — 3Com 3C509B ISA Ethernet.
 
 The browser itself never talks to either card directly (no ESP-AT commands, no
-ISA register pokes): it loads the right DLL at **runtime**, via
-**libman** (`extern/libman`, a Sprinter dynamic-library loader/manager), and
-drives it through `src/net.asm`'s `NET.*` facade. Which DLL to load is chosen
-by the environment variable **`NET`** (`WIFI` → `UNETESP.DLL`, `RTL` →
-`UNETRTL.DLL`), exactly like the sibling projects `sources/weather-forecast`
-and `sources/ftpclient`. There is a **single build** — no more `BACKEND_ESP`/
+ISA register pokes): it loads the right DLL at **runtime**, via **UNETLD** from
+`extern/unet_libs_asm` (which includes libman), and drives it through
+`src/net.asm`'s `NET.*` facade. `NET=WIFI` selects `UNETESP.DLL`; otherwise a
+validated 3–4 character tag maps directly to `UNET<TAG>.DLL`. There is a
+**single build** — no more `BACKEND_ESP`/
 `BACKEND_NE2000` compile-time switch, no statically-linked ESP-AT kit code,
 and (as a deliberate consequence) **no more support for ESP-AT 2.2.1
 specifically** — the DLL owns firmware-version differences internally.
 
-`extern/wifi`, `extern/rtl` and `extern/libman` are **git submodules**, pinned
-to specific commits and verified by `make deps` (`tools/check_deps.py`) before
-every build — see §5 and §7.
+`extern/unet_libs_asm` is a recursive **git submodule**; its core and libman
+pins plus every manifest-listed DLL are verified by `make deps`.
 
 ## 2. Status
 
-**v0.2.0 shipped: full migration from a statically-linked ESP-AT kit to the
-runtime UNET-DLL architecture described above.** `make` / `make deploy` /
-`make dist` all build and package cleanly (0 errors). The ESP/Wi-Fi backend
-has been confirmed working on-target (NETUP, home page, and a network fetch
-all succeed). RTL on-target verification (`NETCFG -i; IFUP` per `extern/rtl`'s
-docs) is still outstanding. See §7's `CALL_UNET` note for a bug that blocked
-every UNET call until fixed — worth knowing if a future symptom looks similar
-(a network op fails with a "clean" but impossible-looking error).
+**v0.2.2 adds the 3Com 3C509B backend to the generic UNETLD consumer.**
+`make`,
+`make deploy` and `make dist` use the DLL manifest from the recursive binding;
+adding a normally named compatible DLL does not require rebuilding the browser.
+ESP/Wi-Fi is confirmed working on-target; RTL and 3C509B smoke verification
+remain follow-ups. See §7's `CALL_UNET` note for the carry-flag failure that previously
+made every successful UNET call look like a dispatch error.
 
 Everything from menu parsing, the paged document buffer, history/back-cache,
 downloads, bookmarks, config file, and the appended-home-page loader-EXE trick
@@ -146,7 +142,7 @@ finish reading/copying out of a mapped page before touching the network layer)
 — in practice this already falls out naturally since fetch/download code paths
 don't hold a raw WIN3 pointer across a `NET.*` call.
 
-## 4a. Memory budget & layout (current, v0.2.0)
+## 4a. Memory budget & layout (current, v0.2.2)
 
 Z80 sees four 16 KB windows. WIN1 holds the whole program image (code + small
 state); WIN2 is one `GetMem`'d 16 KB page, mapped once at startup and never
@@ -160,7 +156,7 @@ a *loader EXE*: DSS loads exactly that many bytes and leaves the file **open**
 (handle at `(IX-3)`, captured into `home_fm` as `START`'s first instruction),
 so the program can seek past the image and read what's appended in the file
 tail. Two special blocks sit at the end of the file:
-1. **`LIBMAN_STORE`** — libman (`extern/libman/libman/libman.asm`, core +
+1. **`LIBMAN_STORE`** — libman (`extern/unet_libs_asm/extern/libman/libman/libman.asm`, core +
    state, default build understanding L0/L1/L2 DLL formats) assembled via a
    sjasmplus `DISP LIBMAN_W2_BASE ... ENT` block, so its *code* is written as
    if it already ran at `LIBMAN_W2_BASE` while its *bytes* are emitted at the
@@ -200,7 +196,7 @@ Why libman has to be WIN2-resident even though the *DLL itself* loads into
 WIN1: `l_call`/`l_load` map the DLL/loader into whichever window the caller
 requested (WIN1 here — see §5) and **restore the previously-resident physical
 page there before returning** (verified directly in
-`extern/libman/libman/libman_core13.asm`: self-modifying code stores the old
+`extern/unet_libs_asm/extern/libman/libman/libman_core13.asm`: self-modifying code stores the old
 page and `OUT`s it back just before `ret`). That means WIN1 — all of gopher's
 own code — is displaced only for the narrow span *inside* one `l_call`/
 `l_load`; nothing outside libman's own runtime code (`libman_state.inc`,
@@ -231,12 +227,12 @@ crash). `EMM_FN5 #C5` resolves each block's physical page once at alloc time;
 ## 5. Network HAL — UNET ABI via libman
 
 `src/net.asm` (`MODULE NET`) is a thin facade over the UNET ABI
-(`extern/wifi/src/include/unet.inc`, byte-identical in `extern/rtl` and
-verified so by `make deps`). Read `unet.inc` itself for the authoritative
+(`extern/unet_libs_asm/extern/core/bindings/asm/unet.inc`). Read `unet.inc`
+itself for the authoritative
 function numbers/register contracts/error codes/capability bits — it is
 short, thoroughly commented, and the single source of truth. Summary:
 
-- **Calling convention:** `HL=handle` (cached in `net.asm`'s `dll_handle`),
+- **Calling convention:** `HL=handle` (owned by `UNETLD`),
   `B=function number`, arguments **only** in `A`/`DE`/`IX`/`IY` (never
   `HL`/`BC` — those are consumed by the libman dispatcher), via
   `LIBMAN.l_call`. Status comes back in `A` (`0`=`NERR_OK`, else `NERR_*`);
@@ -249,9 +245,8 @@ short, thoroughly commented, and the single source of truth. Summary:
   whenever the DLL itself reports `NERR_CANCEL`).
 - **Window:** the DLL is loaded into **window 1** (`l_load A=1`) — see §4a for
   why libman itself must then be WIN2-resident, not WIN1.
-- **`NET.INIT`** (cached by `main.asm`'s `net_inited` flag, same pattern as
-  before the migration): first call reads env `NET`, `l_load`s the matching
-  DLL, checks `GETCAPS`' ABI major byte and caches its capability bitmask,
+- **`NET.INIT`** (cached by `main.asm`'s `net_inited` flag): first call uses
+  `UNETLD.SELECT/LOAD`, checks the DLL name, ABI major and TCP capability,
   `SETOPT`s `CANCELKEYS=1` (so the DLL polls Esc/Ctrl+Z during its own
   blocking waits), probes `STATUS(0xFF)` (env-only, no hardware). Every call
   (cached DLL or not) then does a best-effort `NETDONE` followed by `NETINIT`
@@ -274,19 +269,18 @@ short, thoroughly commented, and the single source of truth. Summary:
   the cached caps bitmask and are a no-op otherwise; the only remaining call
   site is `DL_MIDFLUSH` (pausing across a mid-download FAT write on backends
   that need explicit flow control, resuming once the write completes).
-- **`NET.SHUTDOWN`** (`main.asm`'s `QUIT`, only if `net_inited` was ever set):
-  `NETDONE` + `l_free` the DLL, so the next program (or the next run of this
-  one) starts clean.
-- **`NET.CHECK_NET_UP`**: env-only (`NET`=`WIFI`/`RTL`), no DLL/hardware touch
-  — cheap enough to call on every home-page status-bar redraw.
+- **`NET.SHUTDOWN`** (`main.asm`'s `QUIT`): idempotent `UNETLD.UNLOAD`, so
+  even a partially failed initialisation releases its handle.
+- **`NET.CHECK_NET_UP`**: env-only `UNETLD.SELECT`, no DLL/hardware touch;
+  generic valid tags are accepted.
 - **`NET.LAST_ERROR`** (fn 16) fills a 128-byte `NET_ERRBUF` with the DLL's own
   diagnostic tail; available for richer error messages but not yet wired into
   every status-bar error path (a reasonable follow-up, not required for
   correctness).
 
 **Config contract with the user:** the browser reads `NET` and nothing else —
-Wi-Fi join / RTL bring-up is entirely the DLL + `NETUP`/`NETCFG -i`+`IFUP`'s
-job, run once beforehand. There is no `NET.CFG` parsing in this codebase.
+card bring-up is entirely the backend utility's job, run once beforehand.
+There is no `NET.CFG` parsing in this codebase.
 
 ## 6. Build
 
@@ -294,23 +288,21 @@ job, run once beforehand. There is no `NET.CFG` parsing in this codebase.
 git submodule update --init          # first checkout only
 make deps                            # verify submodule pins + DLL checksums
 make                                  # -> build/GOPHER.EXE
-make deploy                          # -> distr/gopher.img (DSS floppy, GOPHER.EXE + both DLLs)
-make dist                            # -> distr/gopher.zip (EXE + both DLLs + cfg + home page + readmes)
+make deploy                          # -> distr/gopher.img (EXE + manifest-listed DLLs)
+make dist                            # -> distr/gopher.zip (EXE + manifest-listed DLLs + cfg/home/readmes)
 ```
 
 `tools/check_deps.py` (run automatically by `make`/`make deploy`/`make dist`
-via the `deps` target) pins each submodule's remote URL + commit hash, and
-each shipped DLL's exact size + SHA-256, plus byte-comparing `unet.inc`
-between `extern/wifi` and `extern/rtl`. A stale `git submodule update` or a
-locally-edited DLL fails the build loudly instead of silently shipping the
-wrong thing. **Bumping a submodule pin is deliberate**: update the commit in
-`tools/check_deps.py` (and the DLL size/hash if it changed) in the same change
-that runs `git -C extern/<kit> checkout <new-commit>`.
+via the `deps` target) pins the recursive `unet_libs_asm`/core/libman commits,
+checks generated ABI bindings, and verifies every manifest DLL's exact size +
+SHA-256 and libman structure. A stale recursive checkout or locally-edited DLL
+fails the build loudly. **Bumping a pin is deliberate**: update the expected
+commit in `tools/check_deps.py` in the same change.
 
 **Include-path precedence — non-obvious sjasmplus behavior:** `sjasmplus`
 searches `-I` directories in **reverse** of the order given on the command
 line (the *last* `-I` is searched *first*). The Makefile's `INCDIRS` lists the
-extern kit dirs first and `src/include`/`src/lib` **last** specifically so a
+universal binding/core/libman dirs first and `src/include`/`src/lib` **last** specifically so a
 same-named local file (e.g. `macro.inc`, which this project vendors its own
 trimmed copy of instead of the kit's) always shadows the kit's copy. If you
 add another `-I`, keep this ordering in mind — getting it backwards produces
@@ -332,9 +324,8 @@ shown in the load/exit banner (`MSG_BANNER`).
   for content is a known future improvement (see `SpecTalkZX/sprinter/src/recode.c`
   for the table approach), not yet implemented.
 - **This project's own `src/include/dss.inc`/`sprinter.inc`/`macro.inc` are
-  authoritative** — do not assume a network-kit include of the same name
-  defines the same thing; the include-path ordering in §6 is what keeps this
-  project's copies in effect even though the kits are on the search path too.
+  authoritative** — the include-path ordering in §6 keeps these copies ahead
+  of the universal binding's support includes.
 - NEXTplorer/Moon Rabbit ship under *Nihirash's Coffeeware License* — preserve
   attribution and license headers from base files.
 - **`MAINLOOP` dispatch is `JP`-based** (`JP Z, ON_x`), so a key handler runs
@@ -344,11 +335,11 @@ shown in the load/exit banner (`MSG_BANNER`).
   above the WIN2 page and hangs. Use `CALL SET_STATUS` + `JP MAINLOOP`. A bare
   `JP SET_STATUS` is only OK as a tail-call inside a routine that was itself
   `CALL`ed (e.g. `SHOW_ERROR`, `SHOW_DOC_STATUS`).
-- **`net_inited` (main.asm) vs `NET.dll_loaded` (net.asm) are different
-  flags** — `net_inited` gates whether `DO_FETCH`/`DOWNLOAD` call `NET.INIT`
-  at all (cleared by `INVALIDATE_NET` to force a cheap NETDONE+NETINIT
-  recovery); `NET.dll_loaded` gates whether the DLL itself needs `l_load`ing
-  (cleared only by `NET.SHUTDOWN`, i.e. program exit). Don't conflate them.
+- **`net_inited` (main.asm) vs `UNETLD.FLAGS` are different state** —
+  `net_inited` gates whether `DO_FETCH`/`DOWNLOAD` call `NET.INIT` at all
+  (cleared by `INVALIDATE_NET` to force a cheap NETDONE+NETINIT recovery);
+  `UNETLD.FLAGS` owns DLL/session lifetime and is reset only by `UNLOAD`.
+  Don't conflate them.
 - **CF is the error contract — clear it explicitly on success paths.** `CP n`
   sets CF whenever `A < n`, so a comparison used only for branching still
   leaks its borrow into the caller's `RET C`/`JR C`. End a "CF=0 ok / CF=1
@@ -362,10 +353,9 @@ shown in the load/exit banner (`MSG_BANNER`).
 
 ## 8. Reference index (local paths)
 
-- **This project's submodules** (pinned, see `.gitmodules` + `tools/check_deps.py`):
-  - `extern/wifi` — ESP-AT/Wi-Fi kit + `UNETESP.DLL` (upstream `sprinter_net`)
-  - `extern/rtl` — NE2000/RTL8019A kit + `UNETRTL.DLL` (upstream `sprinter-rtl8019a`)
-  - `extern/libman` — the DLL loader/manager (upstream `sprinter-libman`)
+- **Universal network binding** (pinned recursively, see `.gitmodules` +
+  `tools/check_deps.py`): `extern/unet_libs_asm` — UNETLD selector, generated
+  ABI, manifest-listed DLLs and nested libman.
 - **Sibling projects using the same UNET-DLL-via-libman pattern** (read these
   first for any networking question — they are the working reference
   implementations this project's `net.asm` was modeled on):
@@ -378,14 +368,16 @@ shown in the load/exit banner (`MSG_BANNER`).
     `net.asm` also carries; uses a different window split (`LIBMAN_WIN0`,
     DLL→WIN2) because its own code occupies WIN0+WIN1 — **not** directly
     applicable to this project's WIN1-code/WIN2-scratch layout, see §4a.
-- **libman docs:** `extern/libman/libman/README.md` (ASM-level API — this is
-  the one to read, **not** the top-level `extern/libman/README.md`, which
+- **libman docs:** `extern/unet_libs_asm/extern/libman/libman/README.md`
+  (ASM-level API — this is the one to read, **not** the top-level
+  `extern/unet_libs_asm/README.md`, which
   documents the unrelated `sprinter-mkdll` Python DLL-packaging tool).
 - **Platform manual:** `/Users/dmitry/dev/zx/sprinter/sprinter_ai_doc/manual`
   (`01_architecture`, `02_memory`, `03_bios`, `04_dss`, `05_graphics`, `08_peripherals`)
 - **DSS source:** `/Users/dmitry/dev/zx/sprinter/Estex-DSS/DSS`
 - **BIOS includes:** `/Users/dmitry/dev/zx/sprinter/sprinter_bios/Shared_Includes/constants`
-- **Emulator:** MAME Sprinter; `extern/rtl`'s docs cover its `NETCFG -i; IFUP`
+- **Emulator:** MAME Sprinter; the RTL backend docs in the universal binding
+  cover its `NETCFG -i; IFUP`
   MAME bring-up flow for RTL testing (no real hardware needed for that path).
 
 Worked example apps (idiomatic sjasmplus DSS programs — copy patterns for EXE
