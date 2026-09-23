@@ -7,48 +7,84 @@
   ███    ███ ███    ███   ███          ███    ███     ███    █▄  ▀███████████ 
   ███    ███ ███    ███   ███          ███    ███     ███    ███   ███    ███ 
   ████████▀   ▀██████▀   ▄████▀        ███    █▀      ██████████   ███    ███ 
-  Browser v.0.1.18                                                 ███    ███ 
+  Browser v.0.2.3                                                  ███    ███
 ```
 
-# Gopher browser for Sprinter — quick start (ESP Wi-Fi)
+# Gopher browser for Sprinter — quick start
 
 A Gopher-protocol browser for the Sprinter, running under DSS in the native
 80×32 text mode. Based on nihirash's Moon Rabbit / Internet NEXTplorer.
 
 Author: Dmitry Mikhalchenkov, SprinterTeam. FidoNet: 2:5030/1997.10
 
-This build uses the **ESP Wi-Fi** network backend (SprinterWiFi, ESP8266 /
-ESP-AT). For Wi-Fi it relies on the SprinterWiFi network kit.
+The browser talks to the network through a small runtime-loaded UNETLD DLL,
+so a single `GOPHER.EXE` can support any compatible Sprinter network card,
+for example:
+
+- **SprinterWiFi** (ESP8266 / ESP-AT) via `UNETESP.DLL`.
+- **NE2000 / RTL8019A** ISA Ethernet via `UNETRTL.DLL`.
+- **3Com 3C509B** ISA Ethernet via `UNET509B.DLL`.
+
+The `NET` environment value published by a card's bring-up utility is mapped
+to `UNET<TAG>.DLL`; `WIFI` is the compatibility alias for `UNETESP.DLL`.
+Backends using the normal 3–4 character tag convention can be added beside
+the executable without rebuilding `GOPHER.EXE`.
+
+Which one is used is decided automatically, per session, by whichever network
+kit you brought the link up with beforehand — the browser itself never talks
+to the card directly.
 
 ## What you need
 
-- A Sprinter with the **SprinterWiFi** Wi-Fi card.
-- The **SprinterWiFi network kit** installed (it provides `NETUP` and `NET.CFG`).
-- `GOPHER.EXE` (this program) on disk, e.g. in `C:\GOPHER\`.
-
-Supported ESP-AT firmware: **v2.2.1** and **v2.2.2.0**. For the best user
-experience, **v2.2.2.0** together with the **Sprinter ESP Network Kit v0.2.1 or
-newer** is recommended.
+- A Sprinter with a **SprinterWiFi**, **NE2000/RTL8019A**, or **3Com 3C509B**
+  card.
+- The matching network kit installed:
+  - Wi-Fi: the **SprinterWiFi network kit** (provides `NETUP` and `NET.CFG`).
+  - RTL: the **sprinter-rtl8019a kit** (provides `NETCFG` and `IFUP`).
+  - 3C509B: the **sprinter-3C509B kit** (provides `NETCFG` and `IFUP`).
+- `GOPHER.EXE` together with the matching `UNET<TAG>.DLL` in the same
+  directory, e.g. `C:\GOPHER\`. The standard distribution includes the
+  currently manifest-listed backends.
 
 ## Quick start
 
-1. **Configure Wi-Fi.** This is handled entirely by the SprinterWiFi network kit
-   (its `NET.CFG`); see that package's documentation for how to set your network.
+1. **Bring exactly one link up before starting the browser** (once per
+   session) — pick whichever card you have:
 
-2. **Bring the link up** (once per session), before starting the browser:
+   - **Wi-Fi:** configure `NET.CFG` once (see the SprinterWiFi kit's own
+     docs), then
 
-       NETUP
+         NETUP
 
-   This joins Wi-Fi and publishes the link state so programs can open TCP.
+   - **RTL8019A:** configure `NET.CFG` once (see the Sprinter RTL8019A kit's own
+     docs), then
 
-3. **Run the browser:**
+         NETCFG -i
+         IFUP
+
+   - **3Com 3C509B:** configure the card with the **sprinter-3C509B** kit,
+     then
+
+         NETCFG -i
+         IFUP
+
+   Either command publishes which backend is active; the browser reads that
+   automatically the next time it needs the network — there is nothing to
+   select inside the browser itself.
+
+2. **Run the browser:**
 
        GOPHER\GOPHER.EXE
 
    It opens on a built-in home page (no network needed) with a few starter
    links. Select one and press Enter to fetch it.
 
-If the status line shows `Wi-Fi not up - run NETUP first`, repeat step 2.
+If the status line shows `Network not configured`, repeat the bring-up step —
+no network utility has published a link yet.
+
+If a fetch instead shows `Network init failed`, check that the matching
+`UNET<TAG>.DLL` is present next to `GOPHER.EXE`, that it implements the frozen
+UNET ABI, and that the link is actually up.
 
 ## Keys
 
@@ -63,7 +99,9 @@ If the status line shows `Wi-Fi not up - run NETUP first`, repeat step 2.
 | Ctrl+B                    | open bookmarks                                  |
 | Esc / F10                 | quit (also cancels a running fetch/download)    |
 
-The clock (top-right of the header) reads the Sprinter's CMOS time.
+The header also shows the selected DLL (`DLL:UNETESP.DLL`, `DLL:UNETRTL.DLL`,
+or `DLL:UNET509B.DLL`) before the clock. The clock (top-right) reads the
+Sprinter's CMOS time.
 
 **Ctrl+G** opens a gopher address directly. Enter `host`, `host:port`, or
 `host[:port]/selector`; port 70 is the default and a bare host opens its root
@@ -92,6 +130,9 @@ it to another Sprinter.
 
 - **`BOOKMARK.GPH`** — the bookmarks file (created by Ctrl+D, opened by Ctrl+B).
   See the "Bookmarks" section above.
+
+- **`UNET*.DLL`** — network backends. Keep the DLL whose tag matches the
+  active `NET` value next to `GOPHER.EXE`; only that file is loaded.
 
 - **`GOPHER.CFG`** — settings and program associations. Three sections:
 
@@ -131,4 +172,6 @@ only through a `[viewers]` association above, on your confirmation.
 
 ## Notes
 
-- The browser only opens TCP connections; joining Wi-Fi is done once by `NETUP`.
+- The browser only opens TCP connections; bringing the link up is entirely the
+  job of the network card's own utility, run once per session before the
+  browser needs the network.
