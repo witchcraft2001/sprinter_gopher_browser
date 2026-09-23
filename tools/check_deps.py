@@ -18,13 +18,13 @@ MANIFEST = CORE / "dll/manifest.json"
 SUBMODULES = {
     "extern/unet_libs_asm": (
         "https://github.com/witchcraft2001/sprinter_unet_libs_asm.git",
-        "eab04c24400e05c12b137ac3cd29de500a15ca8b",
+        "8406c602b642868fbfe74cd3759ba9b758366104",
         ROOT,
         "extern/unet_libs_asm",
     ),
     "extern/unet_libs_asm/extern/core": (
         "https://github.com/witchcraft2001/unet_libs_core.git",
-        "68f1bceb9cda04a623f574f61cd52c7c0004887c",
+        "8566311a53ed17f4f703d48b6aa3ec40256558a7",
         UNET_KIT,
         "extern/core",
     ),
